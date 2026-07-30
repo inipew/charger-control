@@ -1,0 +1,9 @@
+[package]
+name = "charger-ctl"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+charger-core.workspace = true
+clap.workspace = true
+libc = "0.2"

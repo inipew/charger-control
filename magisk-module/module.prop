@@ -1,0 +1,7 @@
+id=charger-control-rs
+name=ChargerControl (Rust)
+version=v1.0.0
+versionCode=100
+author=Java_nih_deks
+description=Advanced battery charging control daemon — pure Rust, zero-overhead
+minMagisk=20400

@@ -1,0 +1,6 @@
+[target.aarch64-linux-android]
+ar = "C:/Users/dhima/AppData/Local/Android/Sdk/ndk/30.0.15729638/toolchains/llvm/prebuilt/windows-x86_64/bin/llvm-ar.exe"
+linker = "C:/Users/dhima/AppData/Local/Android/Sdk/ndk/30.0.15729638/toolchains/llvm/prebuilt/windows-x86_64/bin/aarch64-linux-android36-clang.cmd"
+rustflags = [
+    "-C", "link-arg=-Wl,--hash-style=both"
+]
