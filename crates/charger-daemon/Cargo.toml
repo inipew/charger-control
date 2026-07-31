@@ -5,6 +5,6 @@ edition = "2021"
 
 [dependencies]
 charger-core.workspace = true
-tokio.workspace = true
+libc = "0.2"
 tracing.workspace = true
 tracing-subscriber.workspace = true
