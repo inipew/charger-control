@@ -6,5 +6,6 @@ edition = "2021"
 [dependencies]
 charger-core.workspace = true
 libc = "0.2"
+signal-hook.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true

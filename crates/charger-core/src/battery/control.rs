@@ -18,15 +18,17 @@ pub fn set_charging(enable: bool) -> Result<(), ChargerError> {
     for node in CHARGING_NODES {
         let path = Path::new(node);
         if path.exists() {
-            write_sysfs(path, charge_val)?;
-            any_written = true;
+            if write_sysfs(path, charge_val).is_ok() {
+                any_written = true;
+            }
         }
     }
     for node in SUSPEND_NODES {
         let path = Path::new(node);
         if path.exists() {
-            write_sysfs(path, suspend_val)?;
-            any_written = true;
+            if write_sysfs(path, suspend_val).is_ok() {
+                any_written = true;
+            }
         }
     }
 
@@ -46,7 +48,7 @@ pub fn enter_bypass_mode() -> Result<(), ChargerError> {
     ];
     for (path, val) in &nodes {
         let p = Path::new(path);
-        if p.exists() { write_sysfs(p, val)?; }
+        if p.exists() { let _ = write_sysfs(p, val); }
     }
     Ok(())
 }
@@ -60,7 +62,7 @@ pub fn exit_bypass_mode() -> Result<(), ChargerError> {
     ];
     for (path, val) in &nodes {
         let p = Path::new(path);
-        if p.exists() { write_sysfs(p, val)?; }
+        if p.exists() { let _ = write_sysfs(p, val); }
     }
     Ok(())
 }

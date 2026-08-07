@@ -39,6 +39,7 @@ enum Commands {
 #[derive(Subcommand)]
 enum SetTarget {
     Limit { value: u8 },
+    Resume { value: u8 },
     Thermal { state: String },
     MaxTemp { value: i32 },
 }
@@ -50,6 +51,7 @@ fn main() -> Result<(), ChargerError> {
         Commands::Status => cmd::status::run()?,
         Commands::Set { target } => match target {
             SetTarget::Limit { value } => cmd::set::limit(*value)?,
+            SetTarget::Resume { value } => cmd::set::resume(*value)?,
             SetTarget::Thermal { state } => cmd::set::thermal(state == "on")?,
             SetTarget::MaxTemp { value } => cmd::set::max_temp(*value)?,
         },

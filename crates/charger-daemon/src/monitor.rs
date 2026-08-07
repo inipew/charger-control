@@ -57,6 +57,12 @@ pub fn run_monitor_loop(config: Arc<RwLock<Config>>, rx: Receiver<DaemonMessage>
         let limit = cfg.charge_limit;
         let max_temp_dc = cfg.max_temp_dc;
 
+        let effective_resume = if cfg.resume_limit > 0 && cfg.resume_limit < limit {
+            cfg.resume_limit
+        } else {
+            limit.saturating_sub(2)
+        };
+
         if cfg.thermal_cutoff && temp_dc >= max_temp_dc {
             if stop_reason != StopReason::ThermalCutoff {
                 if let Err(e) = control::set_charging(false) {
@@ -83,12 +89,12 @@ pub fn run_monitor_loop(config: Arc<RwLock<Config>>, rx: Receiver<DaemonMessage>
                 stop_reason = StopReason::LimitReached;
                 tracing::info!("🔋 Limit reached — Charging stopped at {}%", limit);
             }
-        } else if level <= limit.saturating_sub(2) && stop_reason == StopReason::LimitReached {
+        } else if level <= effective_resume && stop_reason == StopReason::LimitReached {
             if let Err(e) = control::set_charging(true) {
                 tracing::error!("resume from limit: set_charging(true) failed: {e}");
             }
             stop_reason = StopReason::None;
-            tracing::info!("⚡ Charging resumed — Level: {}% | Limit: {}%", level, limit);
+            tracing::info!("⚡ Charging resumed — Level: {}% | Resume Threshold: {}% (Limit: {}%)", level, effective_resume, limit);
         }
 
         // Wait for shutdown/reload or sleep (timeout)

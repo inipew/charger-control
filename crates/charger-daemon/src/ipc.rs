@@ -180,6 +180,7 @@ fn handle_client(stream: &mut std::os::unix::net::UnixStream, config: &Arc<RwLoc
                                  \n\
                                  [ CURRENT CONFIG ]\n\
                                  • Charge Limit : {}%\n\
+                                 • Resume Limit : {}%\n\
                                  • Thermal Cut  : {}\n\
                                  • Power Save   : {}",
                                  if cfg.enabled { "Active (Monitoring)" } else { "Standby (Disabled)" },
@@ -187,6 +188,7 @@ fn handle_client(stream: &mut std::os::unix::net::UnixStream, config: &Arc<RwLoc
                                  rss,
                                  cpu,
                                  cfg.charge_limit,
+                                 cfg.resume_limit,
                                  if cfg.thermal_cutoff { "ON" } else { "OFF" },
                                  if cfg.cpu_power_save { "ON" } else { "OFF" }
                             )

@@ -100,6 +100,6 @@ pub fn read_technology() -> Result<String, ChargerError> {
     Ok("Li-ion".to_string())
 }
 
-pub fn calc_wattage_w(voltage_mv: u32, current_ma: f32) -> f32 {
-    (voltage_mv as f32 / 1000.0) * (current_ma / 1000.0)
+pub fn calc_wattage_w(voltage_uv: u32, current_ma: f32) -> f32 {
+    (voltage_uv as f32 / 1_000_000.0) * (current_ma / 1000.0)
 }

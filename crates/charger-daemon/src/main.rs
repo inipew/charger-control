@@ -78,6 +78,22 @@ fn main() {
 
     let (tx, rx) = std::sync::mpsc::channel();
     
+    // Spawn Background Thread for SIGTERM / SIGINT Signal Handling
+    if let Ok(mut signals) = signal_hook::iterator::Signals::new(&[
+        signal_hook::consts::signal::SIGTERM,
+        signal_hook::consts::signal::SIGINT,
+    ]) {
+        std::thread::spawn(move || {
+            for sig in signals.forever() {
+                tracing::info!("Received signal {}, restoring charging state and exiting...", sig);
+                let _ = charger_core::battery::control::set_charging(true);
+                let _ = std::fs::remove_file(ipc::SOCKET_PATH);
+                let _ = std::fs::remove_file("/data/adb/charger-control/daemon.lock");
+                std::process::exit(0);
+            }
+        });
+    }
+
     // Spawn Background Thread for IPC Server
     let config_for_ipc = Arc::clone(&shared_config);
     std::thread::spawn(move || {

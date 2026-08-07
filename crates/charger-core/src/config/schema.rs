@@ -12,6 +12,9 @@ pub struct Config {
     /// Batas pengisian (50–100%)
     pub charge_limit: u8,
 
+    /// Batas resume pengisian (misal: 75% untuk resume saat limit 80%)
+    pub resume_limit: u8,
+
     /// Aktifkan thermal cutoff
     pub thermal_cutoff: bool,
 
@@ -33,6 +36,7 @@ impl Default for Config {
         Self {
             enabled: true,
             charge_limit: 100,
+            resume_limit: 95,
             thermal_cutoff: false,
             max_temp_dc: 420, // 42.0°C
             cpu_power_save: false,

@@ -19,6 +19,26 @@ pub fn limit(value: u8) -> Result<(), ChargerError> {
     Ok(())
 }
 
+pub fn resume(value: u8) -> Result<(), ChargerError> {
+    if value < 40 || value > 99 {
+        display::error("Resume limit must be between 40 and 99%");
+        return Ok(());
+    }
+
+    let path = Path::new(DEFAULT_CONFIG_PATH).to_path_buf();
+    let mut cfg = Config::load(&path).unwrap_or_default();
+    if value >= cfg.charge_limit {
+        display::error(&format!("Resume limit ({}%) must be less than charge limit ({}%)", value, cfg.charge_limit));
+        return Ok(());
+    }
+    cfg.resume_limit = value;
+    cfg.save(&path)?;
+
+    display::success(&format!("Resume limit set to {}%", value));
+    notify_daemon();
+    Ok(())
+}
+
 pub fn thermal(enabled: bool) -> Result<(), ChargerError> {
     let path = Path::new(DEFAULT_CONFIG_PATH).to_path_buf();
     let mut cfg = Config::load(&path).unwrap_or_default();
