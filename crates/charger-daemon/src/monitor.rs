@@ -42,6 +42,11 @@ impl SensorSnapshot {
     fn is_charging(&self) -> bool {
         matches!(self.status, Some(BatteryStatus::Charging))
     }
+
+    fn charging_state(&self) -> Option<bool> {
+        self.status
+            .map(|status| matches!(status, BatteryStatus::Charging))
+    }
 }
 
 // Sensor criticality policy:
@@ -266,6 +271,7 @@ impl DecisionEngine {
     fn new() -> Self {
         Self {
             state: ChargeState::Charging,
+            fault_recovery_reads: 0,
         }
     }
 
@@ -298,7 +304,7 @@ impl DecisionEngine {
             self.fault_recovery_reads = 0;
             self.state = ChargeState::Disabled;
             return Decision {
-                command: ChargeCommand::ReleaseControl,
+                command: ChargeCommand::RestoreCharging,
                 state: ChargeState::Disabled,
                 reason: DecisionReason::DaemonDisabled,
             };
@@ -315,9 +321,8 @@ impl DecisionEngine {
         }
 
         if snapshot.temp_dc.is_none() {
-            self.state = ChargeState::Fault {
-                retry_count: FAULT_RECOVERY_READS,
-            };
+            self.fault_recovery_reads = FAULT_RECOVERY_READS;
+            self.state = ChargeState::Fault;
             return Decision {
                 command: ChargeCommand::Disable,
                 state: self.state,
@@ -325,24 +330,21 @@ impl DecisionEngine {
             };
         }
 
-        if let ChargeState::Fault { retry_count } = self.state {
-            if retry_count > 0 {
-                self.state = ChargeState::Fault {
-                    retry_count: retry_count - 1,
-                };
-                return Decision {
-                    command: ChargeCommand::Disable,
-                    state: self.state,
-                    reason: DecisionReason::SensorFault,
-                };
-            } else {
-                tracing::info!("Sensor recovered completely, exiting Fault state.");
-                self.state = ChargeState::Charging;
+        if self.state == ChargeState::Fault {
+            if self.fault_recovery_reads > 0 {
+                self.fault_recovery_reads -= 1;
+                if self.fault_recovery_reads > 0 {
+                    return Decision {
+                        command: ChargeCommand::Disable,
+                        state: self.state,
+                        reason: DecisionReason::FaultRecovering,
+                    };
+                }
             }
 
             tracing::info!(
                 "Sensor recovered for {} consecutive reads, exiting Fault state.",
-                self.fault_recovery_reads
+                FAULT_RECOVERY_READS
             );
             self.fault_recovery_reads = 0;
             self.state = ChargeState::Charging;
@@ -377,7 +379,7 @@ impl DecisionEngine {
                 self.state = ChargeState::Charging;
                 self.evaluate(snapshot, cfg)
             }
-            ChargeState::Fault { .. } => Decision {
+            ChargeState::Fault => Decision {
                 command: ChargeCommand::Noop,
                 state: self.state,
                 reason: DecisionReason::SensorFault,
@@ -532,12 +534,15 @@ pub fn run_monitor_loop(config: Arc<RwLock<Config>>, rx: UnixDatagram) {
             if Instant::now() >= deadline {
                 verification_deadline = None;
                 if let Some(state) = pending_verification_state {
-                    match state {
+                    let verification_mismatch = match state {
                         ChargeState::Charging => {
                             if !snapshot.is_charging() && snapshot.online == Some(true) {
                                 tracing::warn!(
                                     "Verification: Hardware is NOT charging, but state is Charging"
                                 );
+                                true
+                            } else {
+                                false
                             }
                         }
                         ChargeState::Disabled
@@ -548,17 +553,36 @@ pub fn run_monitor_loop(config: Arc<RwLock<Config>>, rx: UnixDatagram) {
                                     "Verification: Hardware is STILL charging, but state is {:?}",
                                     state
                                 );
+                                true
+                            } else {
+                                false
                             }
                         }
-                        verification_deadline = Some(Instant::now() + VERIFY_DELAY);
+                        ChargeState::Offline | ChargeState::Fault => false,
+                    };
+
+                    if verification_mismatch {
+                        verification_failures = verification_failures.saturating_add(1);
+                        if verification_failures < MAX_VERIFICATION_FAILURES {
+                            verification_deadline = Some(Instant::now() + VERIFY_DELAY);
+                        } else {
+                            tracing::error!(
+                                "Verification failed after {} attempts for state {:?}",
+                                verification_failures,
+                                state
+                            );
+                            verification_failures = 0;
+                            pending_verification_state = None;
+                        }
+                    } else {
+                        verification_failures = 0;
+                        pending_verification_state = None;
                     }
                 } else {
                     verification_failures = 0;
                     pending_verification_state = None;
                 }
             }
-        } else {
-            scheduler.push_sample(snapshot.clone());
         }
 
         engine.reconfigure(&cfg, Some(&snapshot));
