@@ -21,6 +21,9 @@ pub struct Config {
     /// Suhu maksimum sebelum charging dihentikan (°C × 10 = decidegree)
     pub max_temp_dc: i32,
 
+    /// Hysteresis suhu untuk resume charging (default: 30 = 3°C di bawah max)
+    pub thermal_resume_hysteresis_dc: i32,
+
     /// Path log file
     pub log_path: PathBuf,
 }
@@ -33,6 +36,7 @@ impl Default for Config {
             resume_limit: 95,
             thermal_cutoff: false,
             max_temp_dc: 420, // 42.0°C
+            thermal_resume_hysteresis_dc: 30, // 3.0°C
             log_path: PathBuf::from("/data/adb/charger-control/charger-control.log"),
         }
     }

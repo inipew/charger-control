@@ -24,6 +24,7 @@ enabled = true
 charge_limit = 100
 thermal_cutoff = false
 max_temp_dc = 400
+thermal_resume_hysteresis_dc = 30
 log_path = "$DATA_DIR/charger-control.log"
 EOF
 fi

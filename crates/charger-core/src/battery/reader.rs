@@ -159,47 +159,51 @@ impl CachedReader {
         }
     }
 
-    fn read_fd_to_str<'a>(fd: &mut Option<File>, buf: &'a mut [u8]) -> Option<&'a str> {
+    fn read_fd_to_str<'a>(fd: &mut Option<File>, buf: &'a mut [u8], node_name: &'static str) -> Result<&'a str, ChargerError> {
         if let Some(f) = fd {
             let _ = f.seek(SeekFrom::Start(0));
             if let Ok(n) = f.read(buf) {
                 if let Ok(s) = std::str::from_utf8(&buf[..n]) {
-                    return Some(s.trim());
+                    return Ok(s.trim());
                 }
             }
+            Err(ChargerError::ParseError(node_name))
+        } else {
+            Err(ChargerError::SysfsRead { 
+                path: std::path::PathBuf::from(node_name), 
+                source: std::io::Error::new(std::io::ErrorKind::NotFound, "FD not open") 
+            })
         }
-        None
     }
 
-    pub fn read_capacity(&mut self) -> Option<u8> {
-        Self::read_fd_to_str(&mut self.capacity_fd, &mut self.buf).and_then(|s| s.parse().ok())
+    pub fn read_capacity(&mut self) -> Result<u8, ChargerError> {
+        let s = Self::read_fd_to_str(&mut self.capacity_fd, &mut self.buf, "capacity")?;
+        s.parse().map_err(|_| ChargerError::ParseError("capacity"))
     }
 
-    pub fn read_temperature_dc(&mut self) -> Option<i32> {
-        Self::read_fd_to_str(&mut self.temp_fd, &mut self.buf).and_then(|s| s.parse().ok())
+    pub fn read_temperature_dc(&mut self) -> Result<i32, ChargerError> {
+        let s = Self::read_fd_to_str(&mut self.temp_fd, &mut self.buf, "temp")?;
+        s.parse().map_err(|_| ChargerError::ParseError("temp"))
     }
 
-    pub fn read_current_ma(&mut self) -> Option<f32> {
-        if let Some(s) = Self::read_fd_to_str(&mut self.current_fd, &mut self.buf) {
-            if let Ok(val) = s.parse::<i64>() {
-                if val != 0 {
-                    let mut ua = val as f32;
-                    if ua.abs() > 10_000.0 { ua /= 1000.0; }
-                    return Some(ua);
-                }
+    pub fn read_current_ma(&mut self) -> Result<f32, ChargerError> {
+        let s = Self::read_fd_to_str(&mut self.current_fd, &mut self.buf, "current_now")?;
+        if let Ok(val) = s.parse::<i64>() {
+            if val != 0 {
+                let mut ua = val as f32;
+                if ua.abs() > 10_000.0 { ua /= 1000.0; }
+                return Ok(ua);
             }
         }
-        Some(0.0)
+        Ok(0.0)
     }
 
-    pub fn is_plugged_in(&mut self) -> Option<bool> {
-        if let Some(s) = Self::read_fd_to_str(&mut self.status_fd, &mut self.buf) {
-            let s_lower = s.to_lowercase();
-            if s_lower.contains("discharging") {
-                return Some(false);
-            }
-            return Some(true); // Charging, Full, Not charging
+    pub fn is_plugged_in(&mut self) -> Result<bool, ChargerError> {
+        let s = Self::read_fd_to_str(&mut self.status_fd, &mut self.buf, "status")?;
+        let s_lower = s.to_lowercase();
+        if s_lower.contains("discharging") {
+            return Ok(false);
         }
-        Some(true)
+        Ok(true) // Charging, Full, Not charging
     }
 }
