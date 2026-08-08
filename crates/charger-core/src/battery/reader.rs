@@ -1,6 +1,16 @@
 use std::{fs, path::Path};
 use crate::{battery::nodes::*, error::ChargerError};
 
+/// Status of the battery from sysfs
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BatteryStatus {
+    Charging,
+    Discharging,
+    NotCharging,
+    Full,
+    Unknown,
+}
+
 /// Read a sysfs node as a raw String, trimmed.
 pub fn read_sysfs(path: &Path) -> Result<String, ChargerError> {
     fs::read_to_string(path)
@@ -198,12 +208,26 @@ impl CachedReader {
         Ok(0.0)
     }
 
-    pub fn is_plugged_in(&mut self) -> Result<bool, ChargerError> {
+    pub fn read_status(&mut self) -> Result<BatteryStatus, ChargerError> {
         let s = Self::read_fd_to_str(&mut self.status_fd, &mut self.buf, "status")?;
         let s_lower = s.to_lowercase();
         if s_lower.contains("discharging") {
-            return Ok(false);
+            Ok(BatteryStatus::Discharging)
+        } else if s_lower.contains("charging") && !s_lower.contains("not charging") {
+            Ok(BatteryStatus::Charging)
+        } else if s_lower.contains("full") {
+            Ok(BatteryStatus::Full)
+        } else if s_lower.contains("not charging") {
+            Ok(BatteryStatus::NotCharging)
+        } else {
+            Ok(BatteryStatus::Unknown)
         }
-        Ok(true) // Charging, Full, Not charging
+    }
+
+    pub fn is_plugged_in(&mut self) -> Result<bool, ChargerError> {
+        match self.read_status()? {
+            BatteryStatus::Discharging => Ok(false),
+            _ => Ok(true),
+        }
     }
 }

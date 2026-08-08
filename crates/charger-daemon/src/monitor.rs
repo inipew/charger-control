@@ -1,5 +1,5 @@
 use charger_core::{
-    battery::{control, reader::CachedReader},
+    battery::{control, reader::CachedReader, reader::BatteryStatus},
     config::schema::Config,
 };
 use std::collections::VecDeque;
@@ -7,25 +7,41 @@ use std::os::unix::io::{AsRawFd, FromRawFd, OwnedFd};
 use std::os::unix::net::UnixDatagram;
 use std::sync::{Arc, RwLock};
 use std::time::{Duration, Instant};
+use std::fmt;
 
 const MIN_INTERVAL: Duration = Duration::from_secs(2);
 const MAX_INTERVAL: Duration = Duration::from_secs(90);
 const UNPLUGGED_HEARTBEAT: Duration = Duration::from_secs(600); // 10 minutes
 
-const CURRENT_DEADBAND_MA: i32 = 50;
 const DANGER_TEMP_MARGIN: f32 = 3.0;
 const DANGER_CAP_MARGIN: f32 = 2.0;
 const EMA_ALPHA: f32 = 0.3;
 const NETLINK_DEBOUNCE: Duration = Duration::from_millis(250);
+const FAULT_RECOVERY_READS: u8 = 3;
+
+const PREDICTION_SAFETY_FACTOR: f32 = 0.5;
+const TEMP_RATE_DANGER: f32 = 0.15;
+const EMA_HISTORY_LEN: usize = 5;
+const VERIFY_DELAY: Duration = Duration::from_millis(500);
 
 #[derive(Clone, Debug)]
 struct SensorSnapshot {
-    capacity_pct: u8,
-    temp_dc: i32,
-    _current_ma: i32,
-    online: bool,
-    _charging: bool, // derived from current_ma > CURRENT_DEADBAND_MA
+    capacity_pct: Option<u8>,
+    temp_dc: Option<i32>,
+    #[allow(dead_code)]
+    current_ma: Option<i32>,
+    status: Option<BatteryStatus>,
+    online: Option<bool>,
     ts: Instant,
+}
+
+impl SensorSnapshot {
+    fn is_charging(&self) -> bool {
+        match self.status {
+            Some(BatteryStatus::Charging) => true,
+            _ => false,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -35,21 +51,50 @@ enum ChargeState {
     Charging,
     LimitReached,
     ThermalCutoff,
-    Fault,
+    Fault { retry_count: u8 },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ChargeCommand {
     Enable,
     Disable,
+    ReleaseControl,
     Noop,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DecisionReason {
+    DaemonDisabled,
+    ChargerOffline,
+    NormalCharging,
+    ChargeLimitReached,
+    WaitingForLimitResume,
+    ThermalLimitReached,
+    WaitingForThermalResume,
+    SensorFault,
+}
+
+impl fmt::Display for DecisionReason {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let s = match self {
+            DecisionReason::DaemonDisabled => "daemon_disabled",
+            DecisionReason::ChargerOffline => "charger_offline",
+            DecisionReason::NormalCharging => "normal_charging",
+            DecisionReason::ChargeLimitReached => "charge_limit_reached",
+            DecisionReason::WaitingForLimitResume => "waiting_for_limit_resume",
+            DecisionReason::ThermalLimitReached => "thermal_limit_reached",
+            DecisionReason::WaitingForThermalResume => "waiting_for_thermal_resume",
+            DecisionReason::SensorFault => "sensor_fault",
+        };
+        write!(f, "{}", s)
+    }
 }
 
 #[derive(Debug)]
 struct Decision {
     command: ChargeCommand,
     state: ChargeState,
-    reason: &'static str,
+    reason: DecisionReason,
 }
 
 struct AdaptiveScheduler {
@@ -77,50 +122,53 @@ impl AdaptiveScheduler {
 
     fn push_sample(&mut self, s: SensorSnapshot) {
         if let Some(prev) = self.history.back() {
-            if prev._charging != s._charging {
-                // Reset EMA on charging state flip to avoid mixing negative/positive trends
+            if prev.is_charging() != s.is_charging() {
                 self.ema_cap_rate = 0.0;
-                self.ema_temp_rate = 0.0;
             }
 
             let dt = (s.ts - prev.ts).as_secs_f32().max(0.5);
-            self.ema_cap_rate =
-                EMA_ALPHA * ((s.capacity_pct as f32 - prev.capacity_pct as f32) / dt) + (1.0 - EMA_ALPHA) * self.ema_cap_rate;
-            self.ema_temp_rate =
-                EMA_ALPHA * ((s.temp_dc as f32 / 10.0 - prev.temp_dc as f32 / 10.0) / dt) + (1.0 - EMA_ALPHA) * self.ema_temp_rate;
+            
+            if let (Some(cap), Some(prev_cap)) = (s.capacity_pct, prev.capacity_pct) {
+                self.ema_cap_rate =
+                    EMA_ALPHA * ((cap as f32 - prev_cap as f32) / dt) + (1.0 - EMA_ALPHA) * self.ema_cap_rate;
+            }
+            if let (Some(temp), Some(prev_temp)) = (s.temp_dc, prev.temp_dc) {
+                self.ema_temp_rate =
+                    EMA_ALPHA * ((temp as f32 / 10.0 - prev_temp as f32 / 10.0) / dt) + (1.0 - EMA_ALPHA) * self.ema_temp_rate;
+            }
         }
         self.history.push_back(s);
-        if self.history.len() > 5 {
+        if self.history.len() > EMA_HISTORY_LEN {
             self.history.pop_front();
         }
     }
 
-    fn next_interval(&mut self, is_charging: bool) -> Duration {
-        let s = self.history.back().expect("At least 1 sample needed");
-
-        if !s.online {
+    fn next_interval(&mut self, s: &SensorSnapshot) -> Duration {
+        if s.online == Some(false) {
             self.last_interval = UNPLUGGED_HEARTBEAT;
             return self.last_interval;
         }
 
-        let cap = s.capacity_pct as f32;
-        let temp = s.temp_dc as f32 / 10.0;
+        let cap = s.capacity_pct.unwrap_or(0) as f32;
+        let temp = s.temp_dc.unwrap_or(0) as f32 / 10.0;
+        let is_charging = s.is_charging();
+
         let dist_to_limit = (self.limit - cap).max(0.0);
         let dist_to_thermal = (self.thermal_cutoff - temp).max(0.0);
         let dist_to_resume = (cap - self.resume_limit).max(0.0);
 
-        let danger_high = dist_to_limit < DANGER_CAP_MARGIN || dist_to_thermal < DANGER_TEMP_MARGIN || self.ema_temp_rate > 0.15;
+        let danger_high = dist_to_limit < DANGER_CAP_MARGIN || dist_to_thermal < DANGER_TEMP_MARGIN || self.ema_temp_rate > TEMP_RATE_DANGER;
         let danger_low = !is_charging && dist_to_resume < DANGER_CAP_MARGIN;
 
-        if danger_high || danger_low {
+        if danger_high || danger_low || s.capacity_pct.is_none() || s.temp_dc.is_none() {
             self.last_interval = MIN_INTERVAL;
             return self.last_interval;
         }
 
         let predicted = if is_charging && self.ema_cap_rate > 0.01 {
-            Duration::from_secs_f32((dist_to_limit / self.ema_cap_rate * 0.5).max(0.0))
+            Duration::from_secs_f32((dist_to_limit / self.ema_cap_rate * PREDICTION_SAFETY_FACTOR).max(0.0))
         } else if !is_charging && self.ema_cap_rate < -0.01 {
-            Duration::from_secs_f32((dist_to_resume / (-self.ema_cap_rate) * 0.5).max(0.0))
+            Duration::from_secs_f32((dist_to_resume / (-self.ema_cap_rate) * PREDICTION_SAFETY_FACTOR).max(0.0))
         } else {
             MAX_INTERVAL
         };
@@ -138,19 +186,22 @@ impl AdaptiveScheduler {
     }
 }
 
-fn create_netlink_socket() -> Option<OwnedFd> {
+fn create_netlink_socket() -> std::io::Result<OwnedFd> {
     let fd = unsafe { libc::socket(libc::AF_NETLINK, libc::SOCK_RAW, libc::NETLINK_KOBJECT_UEVENT) };
-    if fd < 0 { return None; }
+    if fd < 0 { 
+        return Err(std::io::Error::last_os_error());
+    }
     let mut addr: libc::sockaddr_nl = unsafe { std::mem::zeroed() };
     addr.nl_family = libc::AF_NETLINK as libc::sa_family_t;
     addr.nl_pid = 0; // Let kernel assign PID
     addr.nl_groups = 1;
     let ret = unsafe { libc::bind(fd, &addr as *const _ as *const libc::sockaddr, std::mem::size_of::<libc::sockaddr_nl>() as u32) };
     if ret < 0 {
+        let err = std::io::Error::last_os_error();
         unsafe { libc::close(fd); }
-        return None;
+        return Err(err);
     }
-    Some(unsafe { OwnedFd::from_raw_fd(fd) })
+    Ok(unsafe { OwnedFd::from_raw_fd(fd) })
 }
 
 fn contains_subslice(haystack: &[u8], needle: &[u8]) -> bool {
@@ -167,53 +218,93 @@ impl DecisionEngine {
         Self { state: ChargeState::Charging }
     }
 
+    fn reconfigure(&mut self, cfg: &Config) {
+        match self.state {
+            ChargeState::ThermalCutoff if !cfg.thermal_cutoff => {
+                tracing::info!("Reconfigure: Thermal cutoff disabled, recovering to Charging state.");
+                self.state = ChargeState::Charging;
+            }
+            ChargeState::LimitReached if cfg.charge_limit >= 100 => {
+                tracing::info!("Reconfigure: Charge limit removed, recovering to Charging state.");
+                self.state = ChargeState::Charging;
+            }
+            _ => {}
+        }
+    }
+
     fn evaluate(&mut self, snapshot: &SensorSnapshot, cfg: &Config) -> Decision {
         if !cfg.enabled {
             self.state = ChargeState::Disabled;
-            return Decision { command: ChargeCommand::Enable, state: ChargeState::Disabled, reason: "Daemon Disabled" };
+            return Decision { command: ChargeCommand::ReleaseControl, state: ChargeState::Disabled, reason: DecisionReason::DaemonDisabled };
         }
 
-        if !snapshot.online {
+        if snapshot.online == Some(false) {
             self.state = ChargeState::Offline;
-            return Decision { command: ChargeCommand::Noop, state: ChargeState::Offline, reason: "Charger Unplugged" };
+            return Decision { command: ChargeCommand::Noop, state: ChargeState::Offline, reason: DecisionReason::ChargerOffline };
         }
+
+        if snapshot.temp_dc.is_none() {
+            self.state = ChargeState::Fault { retry_count: FAULT_RECOVERY_READS };
+            return Decision { command: ChargeCommand::Disable, state: self.state, reason: DecisionReason::SensorFault };
+        }
+
+        if let ChargeState::Fault { retry_count } = self.state {
+            if retry_count > 0 {
+                self.state = ChargeState::Fault { retry_count: retry_count - 1 };
+                return Decision { command: ChargeCommand::Disable, state: self.state, reason: DecisionReason::SensorFault };
+            } else {
+                tracing::info!("Sensor recovered completely, exiting Fault state.");
+                self.state = ChargeState::Charging;
+            }
+        }
+
+        if snapshot.capacity_pct.is_none() {
+            // Missing capacity is non-critical, we hold current state and take no action.
+            return Decision { command: ChargeCommand::Noop, state: self.state, reason: DecisionReason::SensorFault };
+        }
+
+        let cap = snapshot.capacity_pct.unwrap();
+        let temp = snapshot.temp_dc.unwrap();
 
         let limit = cfg.charge_limit;
         let resume = if cfg.resume_limit > 0 && cfg.resume_limit < limit { cfg.resume_limit } else { limit.saturating_sub(2) };
         let thermal_max = cfg.max_temp_dc;
-        let thermal_resume = thermal_max.saturating_sub(cfg.thermal_resume_hysteresis_dc);
+        let safe_hysteresis = cfg.thermal_resume_hysteresis_dc.clamp(1, thermal_max.saturating_sub(1).max(1));
+        let thermal_resume = thermal_max.saturating_sub(safe_hysteresis);
 
-        // State Machine Transitions
         match self.state {
-            ChargeState::Disabled | ChargeState::Offline | ChargeState::Fault => {
+            ChargeState::Disabled | ChargeState::Offline => {
                 self.state = ChargeState::Charging;
                 self.evaluate(snapshot, cfg)
             }
+            ChargeState::Fault { .. } => {
+                Decision { command: ChargeCommand::Noop, state: self.state, reason: DecisionReason::SensorFault }
+            }
             ChargeState::Charging => {
-                if cfg.thermal_cutoff && snapshot.temp_dc >= thermal_max {
+                if cfg.thermal_cutoff && temp >= thermal_max {
                     self.state = ChargeState::ThermalCutoff;
-                    Decision { command: ChargeCommand::Disable, state: self.state, reason: "Thermal Max Reached" }
-                } else if snapshot.capacity_pct >= limit {
+                    Decision { command: ChargeCommand::Disable, state: self.state, reason: DecisionReason::ThermalLimitReached }
+                } else if cap >= limit {
                     self.state = ChargeState::LimitReached;
-                    Decision { command: ChargeCommand::Disable, state: self.state, reason: "Charge Limit Reached" }
+                    Decision { command: ChargeCommand::Disable, state: self.state, reason: DecisionReason::ChargeLimitReached }
                 } else {
-                    Decision { command: ChargeCommand::Enable, state: self.state, reason: "Normal Charging" }
+                    Decision { command: ChargeCommand::Enable, state: self.state, reason: DecisionReason::NormalCharging }
                 }
             }
             ChargeState::LimitReached => {
-                if snapshot.capacity_pct <= resume {
+                if cap <= resume {
                     self.state = ChargeState::Charging;
                     self.evaluate(snapshot, cfg)
                 } else {
-                    Decision { command: ChargeCommand::Disable, state: self.state, reason: "Waiting for Limit Resume" }
+                    Decision { command: ChargeCommand::Disable, state: self.state, reason: DecisionReason::WaitingForLimitResume }
                 }
             }
             ChargeState::ThermalCutoff => {
-                if snapshot.temp_dc <= thermal_resume {
+                if temp <= thermal_resume {
                     self.state = ChargeState::Charging;
                     self.evaluate(snapshot, cfg)
                 } else {
-                    Decision { command: ChargeCommand::Disable, state: self.state, reason: "Waiting for Thermal Resume" }
+                    Decision { command: ChargeCommand::Disable, state: self.state, reason: DecisionReason::WaitingForThermalResume }
                 }
             }
         }
@@ -221,31 +312,43 @@ impl DecisionEngine {
 }
 
 pub fn run_monitor_loop(config: Arc<RwLock<Config>>, rx: UnixDatagram) {
-    tracing::info!("Monitor loop started (Production-Grade State Machine + P2 Optimized)");
+    tracing::info!("Monitor loop started (Analisa_2.md Final Fixes)");
 
     let mut battery_reader = CachedReader::new();
-    let nl_sock = create_netlink_socket();
-    if nl_sock.is_some() {
-        tracing::info!("Successfully bound to NETLINK_KOBJECT_UEVENT");
-    } else {
-        tracing::warn!("Failed to bind Netlink socket, falling back to pure adaptive timer");
-    }
+    let mut _nl_sock = match create_netlink_socket() {
+        Ok(sock) => {
+            tracing::info!("Successfully bound to NETLINK_KOBJECT_UEVENT");
+            Some(sock)
+        },
+        Err(e) => {
+            tracing::warn!("Failed to bind Netlink socket ({}). Falling back to pure adaptive timer", e);
+            None
+        }
+    };
 
     let initial_cfg = config.read().unwrap_or_else(|e| e.into_inner()).clone();
-    let mut scheduler = AdaptiveScheduler::new(initial_cfg.charge_limit, 95, 420);
+    let effective_resume = if initial_cfg.resume_limit > 0 && initial_cfg.resume_limit < initial_cfg.charge_limit { 
+        initial_cfg.resume_limit 
+    } else { 
+        initial_cfg.charge_limit.saturating_sub(2) 
+    };
+    let mut scheduler = AdaptiveScheduler::new(initial_cfg.charge_limit, effective_resume, initial_cfg.max_temp_dc);
     let mut engine = DecisionEngine::new();
+    engine.reconfigure(&initial_cfg);
 
-    // Zero-allocation static array for pollfd
     let mut pfds = [
         libc::pollfd { fd: rx.as_raw_fd(), events: libc::POLLIN, revents: 0 },
         libc::pollfd { fd: -1, events: 0, revents: 0 },
     ];
     let mut num_fds = 1;
-    if let Some(ref nl) = nl_sock {
+    if let Some(ref nl) = _nl_sock {
         pfds[1].fd = nl.as_raw_fd();
         pfds[1].events = libc::POLLIN;
         num_fds = 2;
     }
+
+    let mut verification_deadline: Option<Instant> = None;
+    let mut pending_verification_state: Option<ChargeState> = None;
 
     loop {
         let cfg = config.read().unwrap_or_else(|e| e.into_inner()).clone();
@@ -256,37 +359,39 @@ pub fn run_monitor_loop(config: Arc<RwLock<Config>>, rx: UnixDatagram) {
         scheduler.resume_limit = resume as f32;
         scheduler.thermal_cutoff = cfg.max_temp_dc as f32 / 10.0;
 
-        // 1. Snapshot Sensors
-        let capacity_pct = battery_reader.read_capacity();
-        let temp_dc = battery_reader.read_temperature_dc();
-        let current_ma = battery_reader.read_current_ma();
-        let online = battery_reader.is_plugged_in();
-
-        // 2. Validate Snapshot (Fault State handling)
-        if capacity_pct.is_err() || temp_dc.is_err() {
-            tracing::error!("Sensor failure: cap={:?} temp={:?}", capacity_pct, temp_dc);
-            engine.state = ChargeState::Fault;
-            let _ = control::set_charging(false); // Fail-safe
-            
-            // Sleep and retry later
-            pfds[0].revents = 0;
-            unsafe { libc::poll(pfds.as_mut_ptr(), 1, 5000) };
-            continue;
-        }
-
-        let current = current_ma.unwrap_or(0.0) as i32;
         let snapshot = SensorSnapshot {
-            capacity_pct: capacity_pct.unwrap(),
-            temp_dc: temp_dc.unwrap(),
-            _current_ma: current,
-            online: online.unwrap_or(true),
-            _charging: current > CURRENT_DEADBAND_MA,
+            capacity_pct: battery_reader.read_capacity().ok(),
+            temp_dc: battery_reader.read_temperature_dc().ok(),
+            current_ma: battery_reader.read_current_ma().map(|c| c as i32).ok(),
+            status: battery_reader.read_status().ok(),
+            online: battery_reader.is_plugged_in().ok(),
             ts: Instant::now(),
         };
 
         scheduler.push_sample(snapshot.clone());
 
-        // 3. Evaluate Decision
+        // Perform asynchronous verification if deadline reached
+        if let Some(deadline) = verification_deadline {
+            if Instant::now() >= deadline {
+                verification_deadline = None;
+                if let Some(state) = pending_verification_state {
+                    match state {
+                        ChargeState::Charging => {
+                            if !snapshot.is_charging() && snapshot.online == Some(true) {
+                                tracing::warn!("Verification: Hardware is NOT charging, but state is Charging");
+                            }
+                        }
+                        ChargeState::Disabled | ChargeState::LimitReached | ChargeState::ThermalCutoff => {
+                            if snapshot.is_charging() {
+                                tracing::warn!("Verification: Hardware is STILL charging, but state is {:?}", state);
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+            }
+        }
+
         let prev_state = engine.state;
         let decision = engine.evaluate(&snapshot, &cfg);
         
@@ -294,13 +399,23 @@ pub fn run_monitor_loop(config: Arc<RwLock<Config>>, rx: UnixDatagram) {
             tracing::info!("State transition: {:?} -> {:?} (Reason: {})", prev_state, decision.state, decision.reason);
         }
 
-        // 4. Apply & Verify
         match decision.command {
             ChargeCommand::Enable => {
                 if prev_state != decision.state {
                     if let Err(e) = control::set_charging(true) {
                         tracing::error!("Failed to enable charging: {}", e);
                     }
+                    verification_deadline = Some(Instant::now() + VERIFY_DELAY);
+                    pending_verification_state = Some(decision.state);
+                }
+            }
+            ChargeCommand::ReleaseControl => {
+                if prev_state != decision.state {
+                    if let Err(e) = control::set_charging(true) {
+                        tracing::error!("Failed to release charging control: {}", e);
+                    }
+                    verification_deadline = Some(Instant::now() + VERIFY_DELAY);
+                    pending_verification_state = Some(decision.state);
                 }
             }
             ChargeCommand::Disable => {
@@ -308,37 +423,40 @@ pub fn run_monitor_loop(config: Arc<RwLock<Config>>, rx: UnixDatagram) {
                     if let Err(e) = control::set_charging(false) {
                         tracing::error!("Failed to disable charging: {}", e);
                     }
-                    std::thread::sleep(Duration::from_millis(300));
-                    if let Ok(c) = battery_reader.read_current_ma() {
-                        if c > CURRENT_DEADBAND_MA as f32 {
-                            tracing::warn!("Verified after Disable: Hardware still charging! (Current: {} mA)", c);
-                        }
-                    }
+                    verification_deadline = Some(Instant::now() + VERIFY_DELAY);
+                    pending_verification_state = Some(decision.state);
                 }
             }
             ChargeCommand::Noop => {}
         }
 
-        // 5. Adaptive Sleep (Zero-Allocation Inner Loop)
-        let timeout = scheduler.next_interval(decision.state == ChargeState::Charging);
+        let timeout = scheduler.next_interval(&snapshot);
         let mut should_evaluate = false;
         let mut now = Instant::now();
         let target_wake = now + timeout;
         let mut debounce_target: Option<Instant> = None;
 
         while now < target_wake {
+            // Determine shortest wait time (debounce, verification, or target wake)
+            let mut next_wake = target_wake;
+            
             if let Some(debounce) = debounce_target {
                 if now >= debounce {
                     should_evaluate = true;
                     break;
                 }
+                next_wake = next_wake.min(debounce);
             }
 
-            let remaining = if let Some(debounce) = debounce_target {
-                debounce.saturating_duration_since(now)
-            } else {
-                target_wake.saturating_duration_since(now)
-            };
+            if let Some(vd) = verification_deadline {
+                if now >= vd {
+                    should_evaluate = true;
+                    break;
+                }
+                next_wake = next_wake.min(vd);
+            }
+
+            let remaining = next_wake.saturating_duration_since(now);
 
             pfds[0].revents = 0;
             if num_fds > 1 { pfds[1].revents = 0; }
@@ -370,13 +488,12 @@ pub fn run_monitor_loop(config: Arc<RwLock<Config>>, rx: UnixDatagram) {
                 if rx.recv(&mut buf).is_ok() {
                     if buf[0] == 2 {
                         tracing::info!("Monitor loop shutting down via IPC");
-                        return; // nl_sock is automatically dropped here thanks to RAII!
+                        return; 
                     }
                     if buf[0] == 1 {
                         tracing::info!("Config reloaded");
-                        if engine.state == ChargeState::LimitReached || engine.state == ChargeState::ThermalCutoff {
-                             engine.state = ChargeState::Charging;
-                        }
+                        let latest_cfg = config.read().unwrap_or_else(|e| e.into_inner()).clone();
+                        engine.reconfigure(&latest_cfg);
                         should_evaluate = true;
                         break;
                     }
@@ -385,7 +502,26 @@ pub fn run_monitor_loop(config: Arc<RwLock<Config>>, rx: UnixDatagram) {
 
             if num_fds > 1 {
                 let nl_events = pfds[1].revents;
-                if nl_events & libc::POLLIN != 0 {
+                if nl_events & (libc::POLLERR | libc::POLLHUP | libc::POLLNVAL) != 0 {
+                    tracing::error!("Netlink socket error. Reconnecting...");
+                    _nl_sock = None;
+                    num_fds = 1; // Drop netlink from poll
+                    pfds[1].fd = -1;
+                    
+                    // Attempt reconnect
+                    match create_netlink_socket() {
+                        Ok(new_sock) => {
+                            tracing::info!("Netlink socket reconnected successfully");
+                            pfds[1].fd = new_sock.as_raw_fd();
+                            pfds[1].events = libc::POLLIN;
+                            num_fds = 2;
+                            _nl_sock = Some(new_sock);
+                        },
+                        Err(e) => {
+                            tracing::warn!("Netlink reconnect failed ({}).", e);
+                        }
+                    }
+                } else if nl_events & libc::POLLIN != 0 {
                     let mut buf = [0u8; 4096];
                     let mut found = false;
                     loop {
@@ -394,14 +530,12 @@ pub fn run_monitor_loop(config: Arc<RwLock<Config>>, rx: UnixDatagram) {
                         if n <= 0 { break; }
                         let buf_slice = &buf[..n as usize];
                         
-                        // Byte-level zero-allocation search
                         if contains_subslice(buf_slice, b"SUBSYSTEM=power_supply") && contains_subslice(buf_slice, b"ACTION=change") {
                             found = true;
                         }
                     }
                     if found {
                         if debounce_target.is_none() {
-                            tracing::debug!("Netlink event received, starting debounce timer");
                             debounce_target = Some(now + NETLINK_DEBOUNCE);
                         }
                     }
