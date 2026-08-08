@@ -21,12 +21,6 @@ pub struct Config {
     /// Suhu maksimum sebelum charging dihentikan (°C × 10 = decidegree)
     pub max_temp_dc: i32,
 
-    /// CPU power save mode (governor: powersave vs schedutil)
-    pub cpu_power_save: bool,
-
-    /// Polling interval monitor loop (detik)
-    pub poll_interval_secs: u64,
-
     /// Path log file
     pub log_path: PathBuf,
 }
@@ -39,8 +33,6 @@ impl Default for Config {
             resume_limit: 95,
             thermal_cutoff: false,
             max_temp_dc: 420, // 42.0°C
-            cpu_power_save: false,
-            poll_interval_secs: 10,
             log_path: PathBuf::from("/data/adb/charger-control/charger-control.log"),
         }
     }

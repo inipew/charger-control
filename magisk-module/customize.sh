@@ -24,8 +24,6 @@ enabled = true
 charge_limit = 100
 thermal_cutoff = false
 max_temp_dc = 400
-cpu_power_save = false
-poll_interval_secs = 10
 log_path = "$DATA_DIR/charger-control.log"
 EOF
 fi

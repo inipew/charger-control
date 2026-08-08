@@ -134,3 +134,72 @@ pub fn is_plugged_in() -> Result<bool, ChargerError> {
 
     Ok(true) // Default safe assumption
 }
+
+use std::io::{Read, Seek, SeekFrom};
+use std::fs::File;
+
+/// A stateful reader that holds open File Descriptors for zero-allocation polling.
+pub struct CachedReader {
+    capacity_fd: Option<File>,
+    temp_fd: Option<File>,
+    current_fd: Option<File>,
+    status_fd: Option<File>,
+    buf: [u8; 32],
+}
+
+impl CachedReader {
+    pub fn new() -> Self {
+        let current_path = CURRENT_NODES.iter().find(|&&p| Path::new(p).exists()).copied().unwrap_or("/sys/class/power_supply/battery/current_now");
+        Self {
+            capacity_fd: File::open("/sys/class/power_supply/battery/capacity").ok(),
+            temp_fd: File::open("/sys/class/power_supply/battery/temp").ok(),
+            current_fd: File::open(current_path).ok(),
+            status_fd: File::open("/sys/class/power_supply/battery/status").ok(),
+            buf: [0; 32],
+        }
+    }
+
+    fn read_fd_to_str<'a>(fd: &mut Option<File>, buf: &'a mut [u8]) -> Option<&'a str> {
+        if let Some(f) = fd {
+            let _ = f.seek(SeekFrom::Start(0));
+            if let Ok(n) = f.read(buf) {
+                if let Ok(s) = std::str::from_utf8(&buf[..n]) {
+                    return Some(s.trim());
+                }
+            }
+        }
+        None
+    }
+
+    pub fn read_capacity(&mut self) -> Option<u8> {
+        Self::read_fd_to_str(&mut self.capacity_fd, &mut self.buf).and_then(|s| s.parse().ok())
+    }
+
+    pub fn read_temperature_dc(&mut self) -> Option<i32> {
+        Self::read_fd_to_str(&mut self.temp_fd, &mut self.buf).and_then(|s| s.parse().ok())
+    }
+
+    pub fn read_current_ma(&mut self) -> Option<f32> {
+        if let Some(s) = Self::read_fd_to_str(&mut self.current_fd, &mut self.buf) {
+            if let Ok(val) = s.parse::<i64>() {
+                if val != 0 {
+                    let mut ua = val as f32;
+                    if ua.abs() > 10_000.0 { ua /= 1000.0; }
+                    return Some(ua);
+                }
+            }
+        }
+        Some(0.0)
+    }
+
+    pub fn is_plugged_in(&mut self) -> Option<bool> {
+        if let Some(s) = Self::read_fd_to_str(&mut self.status_fd, &mut self.buf) {
+            let s_lower = s.to_lowercase();
+            if s_lower.contains("discharging") {
+                return Some(false);
+            }
+            return Some(true); // Charging, Full, Not charging
+        }
+        Some(true)
+    }
+}
