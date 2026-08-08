@@ -35,7 +35,7 @@ impl Default for Config {
             charge_limit: 100,
             resume_limit: 95,
             thermal_cutoff: false,
-            max_temp_dc: 420, // 42.0°C
+            max_temp_dc: 420,                 // 42.0°C
             thermal_resume_hysteresis_dc: 30, // 3.0°C
             log_path: PathBuf::from("/data/adb/charger-control/charger-control.log"),
         }
@@ -47,16 +47,20 @@ impl Config {
         if !path.exists() {
             return Ok(Self::default());
         }
-        let raw = std::fs::read_to_string(path)
-            .map_err(|e| crate::error::ChargerError::ConfigRead { path: path.clone(), source: e })?;
-        toml::from_str(&raw)
-            .map_err(|e| crate::error::ChargerError::ConfigParse(e.to_string()))
+        let raw =
+            std::fs::read_to_string(path).map_err(|e| crate::error::ChargerError::ConfigRead {
+                path: path.clone(),
+                source: e,
+            })?;
+        toml::from_str(&raw).map_err(|e| crate::error::ChargerError::ConfigParse(e.to_string()))
     }
 
     pub fn save(&self, path: &PathBuf) -> Result<(), crate::error::ChargerError> {
         let raw = toml::to_string_pretty(self)
             .map_err(|e| crate::error::ChargerError::ConfigSerialize(e.to_string()))?;
-        std::fs::write(path, raw)
-            .map_err(|e| crate::error::ChargerError::ConfigRead { path: path.clone(), source: e })
+        std::fs::write(path, raw).map_err(|e| crate::error::ChargerError::ConfigRead {
+            path: path.clone(),
+            source: e,
+        })
     }
 }

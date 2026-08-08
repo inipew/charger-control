@@ -1,10 +1,12 @@
-use std::{fs, path::Path};
 use crate::{battery::nodes::*, error::ChargerError};
+use std::{fs, path::Path};
 
 /// Write a value to a sysfs node with proper error context.
 pub fn write_sysfs(path: &Path, value: &str) -> Result<(), ChargerError> {
-    fs::write(path, value)
-        .map_err(|e| ChargerError::SysfsWrite { path: path.to_owned(), source: e })
+    fs::write(path, value).map_err(|e| ChargerError::SysfsWrite {
+        path: path.to_owned(),
+        source: e,
+    })
 }
 
 /// Enable or disable charging across all known nodes.
@@ -17,18 +19,14 @@ pub fn set_charging(enable: bool) -> Result<(), ChargerError> {
 
     for node in CHARGING_NODES {
         let path = Path::new(node);
-        if path.exists() {
-            if write_sysfs(path, charge_val).is_ok() {
-                any_written = true;
-            }
+        if path.exists() && write_sysfs(path, charge_val).is_ok() {
+            any_written = true;
         }
     }
     for node in SUSPEND_NODES {
         let path = Path::new(node);
-        if path.exists() {
-            if write_sysfs(path, suspend_val).is_ok() {
-                any_written = true;
-            }
+        if path.exists() && write_sysfs(path, suspend_val).is_ok() {
+            any_written = true;
         }
     }
 
@@ -48,7 +46,9 @@ pub fn enter_bypass_mode() -> Result<(), ChargerError> {
     ];
     for (path, val) in &nodes {
         let p = Path::new(path);
-        if p.exists() { let _ = write_sysfs(p, val); }
+        if p.exists() {
+            let _ = write_sysfs(p, val);
+        }
     }
     Ok(())
 }
@@ -62,7 +62,9 @@ pub fn exit_bypass_mode() -> Result<(), ChargerError> {
     ];
     for (path, val) in &nodes {
         let p = Path::new(path);
-        if p.exists() { let _ = write_sysfs(p, val); }
+        if p.exists() {
+            let _ = write_sysfs(p, val);
+        }
     }
     Ok(())
 }
@@ -70,7 +72,7 @@ pub fn exit_bypass_mode() -> Result<(), ChargerError> {
 #[cfg(unix)]
 pub fn grant_node_permissions() -> Result<(), ChargerError> {
     use std::os::unix::fs::PermissionsExt;
-    
+
     let mut any_found = false;
     for node in CHARGING_NODES.iter().chain(SUSPEND_NODES.iter()) {
         let path = Path::new(node);

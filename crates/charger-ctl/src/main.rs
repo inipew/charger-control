@@ -1,5 +1,5 @@
-use clap::{Parser, Subcommand};
 use charger_core::error::ChargerError;
+use clap::{Parser, Subcommand};
 
 mod cmd;
 mod display;
@@ -58,8 +58,12 @@ fn main() -> Result<(), ChargerError> {
         Commands::Bypass { state } => cmd::bypass::run(state == "on")?,
         Commands::Daemon { action } => cmd::daemon::run(action)?,
         Commands::Nodes => {
-            let chg = charger_core::battery::nodes::detect_node(charger_core::battery::nodes::CHARGING_NODES);
-            let sus = charger_core::battery::nodes::detect_node(charger_core::battery::nodes::SUSPEND_NODES);
+            let chg = charger_core::battery::nodes::detect_node(
+                charger_core::battery::nodes::CHARGING_NODES,
+            );
+            let sus = charger_core::battery::nodes::detect_node(
+                charger_core::battery::nodes::SUSPEND_NODES,
+            );
             println!("Charging node: {:?}", chg);
             println!("Suspend node: {:?}", sus);
         }
