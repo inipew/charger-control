@@ -97,3 +97,24 @@ pub fn grant_node_permissions() -> Result<(), ChargerError> {
 pub fn grant_node_permissions() -> Result<(), ChargerError> {
     Ok(()) // Dummy for windows
 }
+
+/// Read the current physical hardware charging state.
+pub fn is_charging_enabled() -> Result<bool, ChargerError> {
+    for node in CHARGING_NODES {
+        let path = Path::new(node);
+        if path.exists() {
+            if let Ok(content) = fs::read_to_string(path) {
+                return Ok(content.trim() == "1");
+            }
+        }
+    }
+    for node in SUSPEND_NODES {
+        let path = Path::new(node);
+        if path.exists() {
+            if let Ok(content) = fs::read_to_string(path) {
+                return Ok(content.trim() == "0");
+            }
+        }
+    }
+    Err(ChargerError::NoChargingNodeFound)
+}
