@@ -3,7 +3,7 @@ use charger_core::{
     config::schema::Config,
 };
 use std::collections::VecDeque;
-use std::os::unix::io::AsRawFd;
+use std::os::unix::io::{AsRawFd, FromRawFd, OwnedFd};
 use std::os::unix::net::UnixDatagram;
 use std::sync::{Arc, RwLock};
 use std::time::{Duration, Instant};
@@ -24,7 +24,7 @@ struct SensorSnapshot {
     temp_dc: i32,
     _current_ma: i32,
     online: bool,
-    _charging: bool, // derived from current_ma > 50
+    _charging: bool, // derived from current_ma > CURRENT_DEADBAND_MA
     ts: Instant,
 }
 
@@ -77,6 +77,12 @@ impl AdaptiveScheduler {
 
     fn push_sample(&mut self, s: SensorSnapshot) {
         if let Some(prev) = self.history.back() {
+            if prev._charging != s._charging {
+                // Reset EMA on charging state flip to avoid mixing negative/positive trends
+                self.ema_cap_rate = 0.0;
+                self.ema_temp_rate = 0.0;
+            }
+
             let dt = (s.ts - prev.ts).as_secs_f32().max(0.5);
             self.ema_cap_rate =
                 EMA_ALPHA * ((s.capacity_pct as f32 - prev.capacity_pct as f32) / dt) + (1.0 - EMA_ALPHA) * self.ema_cap_rate;
@@ -132,7 +138,7 @@ impl AdaptiveScheduler {
     }
 }
 
-fn create_netlink_socket() -> Option<std::os::unix::io::RawFd> {
+fn create_netlink_socket() -> Option<OwnedFd> {
     let fd = unsafe { libc::socket(libc::AF_NETLINK, libc::SOCK_RAW, libc::NETLINK_KOBJECT_UEVENT) };
     if fd < 0 { return None; }
     let mut addr: libc::sockaddr_nl = unsafe { std::mem::zeroed() };
@@ -144,7 +150,12 @@ fn create_netlink_socket() -> Option<std::os::unix::io::RawFd> {
         unsafe { libc::close(fd); }
         return None;
     }
-    Some(fd)
+    Some(unsafe { OwnedFd::from_raw_fd(fd) })
+}
+
+fn contains_subslice(haystack: &[u8], needle: &[u8]) -> bool {
+    if needle.is_empty() { return true; }
+    haystack.windows(needle.len()).any(|w| w == needle)
 }
 
 struct DecisionEngine {
@@ -175,8 +186,7 @@ impl DecisionEngine {
         // State Machine Transitions
         match self.state {
             ChargeState::Disabled | ChargeState::Offline | ChargeState::Fault => {
-                // Re-evaluate from scratch
-                self.state = ChargeState::Charging; // Assume charging initially to evaluate
+                self.state = ChargeState::Charging;
                 self.evaluate(snapshot, cfg)
             }
             ChargeState::Charging => {
@@ -191,17 +201,14 @@ impl DecisionEngine {
                 }
             }
             ChargeState::LimitReached => {
-                // Hysteresis for limit
                 if snapshot.capacity_pct <= resume {
                     self.state = ChargeState::Charging;
                     self.evaluate(snapshot, cfg)
                 } else {
-                    // Re-assert disable just in case
                     Decision { command: ChargeCommand::Disable, state: self.state, reason: "Waiting for Limit Resume" }
                 }
             }
             ChargeState::ThermalCutoff => {
-                // Hysteresis for thermal
                 if snapshot.temp_dc <= thermal_resume {
                     self.state = ChargeState::Charging;
                     self.evaluate(snapshot, cfg)
@@ -214,11 +221,11 @@ impl DecisionEngine {
 }
 
 pub fn run_monitor_loop(config: Arc<RwLock<Config>>, rx: UnixDatagram) {
-    tracing::info!("Monitor loop started (Production-Grade State Machine)");
+    tracing::info!("Monitor loop started (Production-Grade State Machine + P2 Optimized)");
 
     let mut battery_reader = CachedReader::new();
-    let nl_fd = create_netlink_socket().unwrap_or(-1);
-    if nl_fd >= 0 {
+    let nl_sock = create_netlink_socket();
+    if nl_sock.is_some() {
         tracing::info!("Successfully bound to NETLINK_KOBJECT_UEVENT");
     } else {
         tracing::warn!("Failed to bind Netlink socket, falling back to pure adaptive timer");
@@ -227,6 +234,18 @@ pub fn run_monitor_loop(config: Arc<RwLock<Config>>, rx: UnixDatagram) {
     let initial_cfg = config.read().unwrap_or_else(|e| e.into_inner()).clone();
     let mut scheduler = AdaptiveScheduler::new(initial_cfg.charge_limit, 95, 420);
     let mut engine = DecisionEngine::new();
+
+    // Zero-allocation static array for pollfd
+    let mut pfds = [
+        libc::pollfd { fd: rx.as_raw_fd(), events: libc::POLLIN, revents: 0 },
+        libc::pollfd { fd: -1, events: 0, revents: 0 },
+    ];
+    let mut num_fds = 1;
+    if let Some(ref nl) = nl_sock {
+        pfds[1].fd = nl.as_raw_fd();
+        pfds[1].events = libc::POLLIN;
+        num_fds = 2;
+    }
 
     loop {
         let cfg = config.read().unwrap_or_else(|e| e.into_inner()).clone();
@@ -250,7 +269,7 @@ pub fn run_monitor_loop(config: Arc<RwLock<Config>>, rx: UnixDatagram) {
             let _ = control::set_charging(false); // Fail-safe
             
             // Sleep and retry later
-            let mut pfds = [libc::pollfd { fd: rx.as_raw_fd(), events: libc::POLLIN, revents: 0 }];
+            pfds[0].revents = 0;
             unsafe { libc::poll(pfds.as_mut_ptr(), 1, 5000) };
             continue;
         }
@@ -289,7 +308,6 @@ pub fn run_monitor_loop(config: Arc<RwLock<Config>>, rx: UnixDatagram) {
                     if let Err(e) = control::set_charging(false) {
                         tracing::error!("Failed to disable charging: {}", e);
                     }
-                    // Verify
                     std::thread::sleep(Duration::from_millis(300));
                     if let Ok(c) = battery_reader.read_current_ma() {
                         if c > CURRENT_DEADBAND_MA as f32 {
@@ -301,7 +319,7 @@ pub fn run_monitor_loop(config: Arc<RwLock<Config>>, rx: UnixDatagram) {
             ChargeCommand::Noop => {}
         }
 
-        // 5. Adaptive Sleep
+        // 5. Adaptive Sleep (Zero-Allocation Inner Loop)
         let timeout = scheduler.next_interval(decision.state == ChargeState::Charging);
         let mut should_evaluate = false;
         let mut now = Instant::now();
@@ -322,29 +340,25 @@ pub fn run_monitor_loop(config: Arc<RwLock<Config>>, rx: UnixDatagram) {
                 target_wake.saturating_duration_since(now)
             };
 
-            let mut pfds = vec![libc::pollfd { fd: rx.as_raw_fd(), events: libc::POLLIN, revents: 0 }];
-            if nl_fd >= 0 {
-                pfds.push(libc::pollfd { fd: nl_fd, events: libc::POLLIN, revents: 0 });
-            }
+            pfds[0].revents = 0;
+            if num_fds > 1 { pfds[1].revents = 0; }
 
-            let ret = unsafe { libc::poll(pfds.as_mut_ptr(), pfds.len() as libc::nfds_t, remaining.as_millis() as i32) };
+            let ret = unsafe { libc::poll(pfds.as_mut_ptr(), num_fds as libc::nfds_t, remaining.as_millis() as i32) };
             now = Instant::now();
 
             if ret < 0 {
                 let err = std::io::Error::last_os_error();
                 if err.kind() == std::io::ErrorKind::Interrupted {
-                    continue; // EINTR is safe
+                    continue;
                 }
                 tracing::error!("poll() failed: {}", err);
                 should_evaluate = true;
                 break;
             } else if ret == 0 {
-                // Timeout
                 should_evaluate = true;
                 break;
             }
 
-            // IPC Socket
             let ipc_events = pfds[0].revents;
             if ipc_events & (libc::POLLERR | libc::POLLHUP | libc::POLLNVAL) != 0 {
                 tracing::error!("IPC socket error/hangup. Exiting monitor loop.");
@@ -356,14 +370,12 @@ pub fn run_monitor_loop(config: Arc<RwLock<Config>>, rx: UnixDatagram) {
                 if rx.recv(&mut buf).is_ok() {
                     if buf[0] == 2 {
                         tracing::info!("Monitor loop shutting down via IPC");
-                        if nl_fd >= 0 { unsafe { libc::close(nl_fd); } }
-                        return;
+                        return; // nl_sock is automatically dropped here thanks to RAII!
                     }
                     if buf[0] == 1 {
                         tracing::info!("Config reloaded");
-                        // We must re-evaluate immediately to reconcile state
                         if engine.state == ChargeState::LimitReached || engine.state == ChargeState::ThermalCutoff {
-                             engine.state = ChargeState::Charging; // Reset state machine to force re-eval
+                             engine.state = ChargeState::Charging;
                         }
                         should_evaluate = true;
                         break;
@@ -371,17 +383,19 @@ pub fn run_monitor_loop(config: Arc<RwLock<Config>>, rx: UnixDatagram) {
                 }
             }
 
-            // Netlink Uevent
-            if pfds.len() > 1 {
+            if num_fds > 1 {
                 let nl_events = pfds[1].revents;
                 if nl_events & libc::POLLIN != 0 {
                     let mut buf = [0u8; 4096];
                     let mut found = false;
                     loop {
-                        let n = unsafe { libc::recv(nl_fd, buf.as_mut_ptr() as *mut libc::c_void, buf.len(), libc::MSG_DONTWAIT) };
+                        let raw_fd = pfds[1].fd;
+                        let n = unsafe { libc::recv(raw_fd, buf.as_mut_ptr() as *mut libc::c_void, buf.len(), libc::MSG_DONTWAIT) };
                         if n <= 0 { break; }
-                        let s = String::from_utf8_lossy(&buf[..n as usize]);
-                        if s.contains("SUBSYSTEM=power_supply") && s.contains("ACTION=change") {
+                        let buf_slice = &buf[..n as usize];
+                        
+                        // Byte-level zero-allocation search
+                        if contains_subslice(buf_slice, b"SUBSYSTEM=power_supply") && contains_subslice(buf_slice, b"ACTION=change") {
                             found = true;
                         }
                     }
