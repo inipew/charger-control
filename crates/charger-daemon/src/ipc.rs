@@ -1,18 +1,12 @@
 use std::{
     io::{Read, Write},
-    os::unix::net::UnixListener,
     path::Path,
-    sync::{mpsc::Sender, Arc, RwLock},
+    sync::{Arc, RwLock},
+    os::unix::net::{UnixDatagram, UnixListener},
 };
 use charger_core::config::schema::Config;
 
 pub const SOCKET_PATH: &str = "/data/adb/charger-control/daemon.sock";
-
-#[derive(Debug, PartialEq, Eq)]
-pub enum DaemonMessage {
-    Reload,
-    Shutdown,
-}
 
 #[derive(Debug, PartialEq, Eq)]
 pub enum DaemonCommand {
@@ -84,7 +78,7 @@ fn get_process_stats() -> (u32, f32, f32) {
     (pid, rss_mb, cpu_percent)
 }
 
-pub fn start_ipc_server(config: Arc<RwLock<Config>>, tx: Sender<DaemonMessage>) {
+pub fn start_ipc_server(config: Arc<RwLock<Config>>, tx: UnixDatagram) {
     let socket_path = Path::new(SOCKET_PATH);
     if socket_path.exists() {
         let _ = std::fs::remove_file(socket_path);
@@ -128,7 +122,7 @@ pub fn start_ipc_server(config: Arc<RwLock<Config>>, tx: Sender<DaemonMessage>) 
     let _ = std::fs::remove_file(socket_path);
 }
 
-fn handle_client(stream: &mut std::os::unix::net::UnixStream, config: &Arc<RwLock<Config>>, tx: &Sender<DaemonMessage>) {
+fn handle_client(stream: &mut std::os::unix::net::UnixStream, config: &Arc<RwLock<Config>>, tx: &UnixDatagram) {
     // BUG FIX 1: Set read timeout to prevent infinite blocking on bad clients
     let _ = stream.set_read_timeout(Some(std::time::Duration::from_millis(500)));
     
@@ -159,7 +153,7 @@ fn handle_client(stream: &mut std::os::unix::net::UnixStream, config: &Arc<RwLoc
                                 if let Ok(mut c) = config.write() {
                                     *c = new_cfg;
                                 }
-                                let _ = tx.send(DaemonMessage::Reload);
+                                let _ = tx.send(&[1]); // 1 = Reload
                                 let _ = stream.write_all(b"OK: Config reloaded");
                             }
                             Err(e) => {
@@ -199,7 +193,7 @@ fn handle_client(stream: &mut std::os::unix::net::UnixStream, config: &Arc<RwLoc
                     }
                     DaemonCommand::Shutdown => {
                         let _ = stream.write_all(b"OK: Shutting down");
-                        let _ = tx.send(DaemonMessage::Shutdown);
+                        let _ = tx.send(&[2]); // 2 = Shutdown
                         // BUG FIX 3: Remove socket file before forceful exit
                         let _ = std::fs::remove_file(SOCKET_PATH);
                         // Exit early via process exit to force immediate shutdown across all threads

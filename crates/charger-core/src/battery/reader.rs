@@ -103,3 +103,34 @@ pub fn read_technology() -> Result<String, ChargerError> {
 pub fn calc_wattage_w(voltage_uv: u32, current_ma: f32) -> f32 {
     (voltage_uv as f32 / 1_000_000.0) * (current_ma / 1000.0)
 }
+
+/// Check if the charger is currently plugged in
+/// Defaults to true if status cannot be read to be safe.
+pub fn is_plugged_in() -> Result<bool, ChargerError> {
+    let path = Path::new("/sys/class/power_supply/battery/status");
+    if let Ok(status) = read_sysfs(path) {
+        let s = status.to_lowercase();
+        // If it's discharging or not charging explicitly, it's unplugged (or bypassing).
+        // Wait, if it's bypassing, status might be "Not charging" or "Discharging".
+        // Let's rely on 'Discharging' as the primary indicator of being unplugged.
+        if s.contains("discharging") {
+            return Ok(false);
+        }
+    }
+    
+    // Fallback: check ac/usb online
+    let nodes = [
+        "/sys/class/power_supply/ac/online",
+        "/sys/class/power_supply/usb/online",
+        "/sys/class/power_supply/wireless/online",
+    ];
+    for p in nodes {
+        if let Ok(val) = read_sysfs(Path::new(p)) {
+            if val == "1" {
+                return Ok(true);
+            }
+        }
+    }
+
+    Ok(true) // Default safe assumption
+}
