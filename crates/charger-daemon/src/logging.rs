@@ -5,7 +5,7 @@ pub fn init_logger(log_path: &Path) -> Result<(), std::io::Error> {
     if let Some(parent) = log_path.parent() {
         std::fs::create_dir_all(parent)?;
     }
-    
+
     let file = std::fs::OpenOptions::new()
         .create(true)
         .append(true)
@@ -17,8 +17,7 @@ pub fn init_logger(log_path: &Path) -> Result<(), std::io::Error> {
         .with_ansi(false) // No colors in file
         .finish();
 
-    tracing::subscriber::set_global_default(subscriber)
-        .expect("Failed to set tracing subscriber");
+    tracing::subscriber::set_global_default(subscriber).expect("Failed to set tracing subscriber");
 
     Ok(())
 }

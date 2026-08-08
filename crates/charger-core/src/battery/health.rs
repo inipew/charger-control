@@ -1,5 +1,5 @@
-use std::{fmt, path::Path};
 use crate::{battery::reader::read_sysfs, error::ChargerError};
+use std::{fmt, path::Path};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum BatteryHealth {

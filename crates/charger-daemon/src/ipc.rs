@@ -1,10 +1,10 @@
+use charger_core::config::schema::Config;
 use std::{
     io::{Read, Write},
+    os::unix::net::{UnixDatagram, UnixListener},
     path::Path,
     sync::{Arc, RwLock},
-    os::unix::net::{UnixDatagram, UnixListener},
 };
-use charger_core::config::schema::Config;
 
 pub const SOCKET_PATH: &str = "/data/adb/charger-control/daemon.sock";
 
@@ -122,10 +122,14 @@ pub fn start_ipc_server(config: Arc<RwLock<Config>>, tx: UnixDatagram) {
     let _ = std::fs::remove_file(socket_path);
 }
 
-fn handle_client(stream: &mut std::os::unix::net::UnixStream, config: &Arc<RwLock<Config>>, tx: &UnixDatagram) {
+fn handle_client(
+    stream: &mut std::os::unix::net::UnixStream,
+    config: &Arc<RwLock<Config>>,
+    tx: &UnixDatagram,
+) {
     // BUG FIX 1: Set read timeout to prevent infinite blocking on bad clients
     let _ = stream.set_read_timeout(Some(std::time::Duration::from_millis(500)));
-    
+
     let mut buf = [0u8; 1024];
     match stream.read(&mut buf) {
         Ok(n) if n > 0 => {
@@ -147,7 +151,8 @@ fn handle_client(stream: &mut std::os::unix::net::UnixStream, config: &Arc<RwLoc
                         }
                     }
                     DaemonCommand::Reload => {
-                        let cfg_path = Path::new(charger_core::config::schema::DEFAULT_CONFIG_PATH).to_path_buf();
+                        let cfg_path = Path::new(charger_core::config::schema::DEFAULT_CONFIG_PATH)
+                            .to_path_buf();
                         match Config::load(&cfg_path) {
                             Ok(new_cfg) => {
                                 if let Ok(mut c) = config.write() {
@@ -157,7 +162,8 @@ fn handle_client(stream: &mut std::os::unix::net::UnixStream, config: &Arc<RwLoc
                                 let _ = stream.write_all(b"OK: Config reloaded");
                             }
                             Err(e) => {
-                                let _ = stream.write_all(format!("Error loading config: {e}").as_bytes());
+                                let _ = stream
+                                    .write_all(format!("Error loading config: {e}").as_bytes());
                             }
                         }
                     }
@@ -176,13 +182,17 @@ fn handle_client(stream: &mut std::os::unix::net::UnixStream, config: &Arc<RwLoc
                                  • Charge Limit : {}%\n\
                                  • Resume Limit : {}%\n\
                                  • Thermal Cut  : {}",
-                                 if cfg.enabled { "Active (Monitoring)" } else { "Standby (Disabled)" },
-                                 pid,
-                                 rss,
-                                 cpu,
-                                 cfg.charge_limit,
-                                 cfg.resume_limit,
-                                 if cfg.thermal_cutoff { "ON" } else { "OFF" }
+                                if cfg.enabled {
+                                    "Active (Monitoring)"
+                                } else {
+                                    "Standby (Disabled)"
+                                },
+                                pid,
+                                rss,
+                                cpu,
+                                cfg.charge_limit,
+                                cfg.resume_limit,
+                                if cfg.thermal_cutoff { "ON" } else { "OFF" }
                             )
                         } else {
                             "Error: Failed to lock config".to_string()
@@ -192,7 +202,7 @@ fn handle_client(stream: &mut std::os::unix::net::UnixStream, config: &Arc<RwLoc
                     DaemonCommand::Shutdown => {
                         let _ = stream.write_all(b"OK: Shutting down");
                         let _ = tx.send(&[2]); // 2 = Shutdown
-                        // BUG FIX 3: Remove socket file before forceful exit
+                                               // BUG FIX 3: Remove socket file before forceful exit
                         let _ = std::fs::remove_file(SOCKET_PATH);
                         // Exit early via process exit to force immediate shutdown across all threads
                         std::process::exit(0);
