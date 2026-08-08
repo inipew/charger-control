@@ -12,6 +12,12 @@ const MIN_INTERVAL: Duration = Duration::from_secs(2);
 const MAX_INTERVAL: Duration = Duration::from_secs(90);
 const UNPLUGGED_HEARTBEAT: Duration = Duration::from_secs(600); // 10 minutes
 
+const CURRENT_DEADBAND_MA: i32 = 50;
+const DANGER_TEMP_MARGIN: f32 = 3.0;
+const DANGER_CAP_MARGIN: f32 = 2.0;
+const EMA_ALPHA: f32 = 0.3;
+const NETLINK_DEBOUNCE: Duration = Duration::from_millis(250);
+
 #[derive(Clone, Debug)]
 struct SensorSnapshot {
     capacity_pct: u8,
@@ -72,11 +78,10 @@ impl AdaptiveScheduler {
     fn push_sample(&mut self, s: SensorSnapshot) {
         if let Some(prev) = self.history.back() {
             let dt = (s.ts - prev.ts).as_secs_f32().max(0.5);
-            const ALPHA: f32 = 0.3; // Smoothing factor
             self.ema_cap_rate =
-                ALPHA * ((s.capacity_pct as f32 - prev.capacity_pct as f32) / dt) + (1.0 - ALPHA) * self.ema_cap_rate;
+                EMA_ALPHA * ((s.capacity_pct as f32 - prev.capacity_pct as f32) / dt) + (1.0 - EMA_ALPHA) * self.ema_cap_rate;
             self.ema_temp_rate =
-                ALPHA * ((s.temp_dc as f32 / 10.0 - prev.temp_dc as f32 / 10.0) / dt) + (1.0 - ALPHA) * self.ema_temp_rate;
+                EMA_ALPHA * ((s.temp_dc as f32 / 10.0 - prev.temp_dc as f32 / 10.0) / dt) + (1.0 - EMA_ALPHA) * self.ema_temp_rate;
         }
         self.history.push_back(s);
         if self.history.len() > 5 {
@@ -98,8 +103,8 @@ impl AdaptiveScheduler {
         let dist_to_thermal = (self.thermal_cutoff - temp).max(0.0);
         let dist_to_resume = (cap - self.resume_limit).max(0.0);
 
-        let danger_high = dist_to_limit < 2.0 || dist_to_thermal < 3.0 || self.ema_temp_rate > 0.15;
-        let danger_low = !is_charging && dist_to_resume < 2.0;
+        let danger_high = dist_to_limit < DANGER_CAP_MARGIN || dist_to_thermal < DANGER_TEMP_MARGIN || self.ema_temp_rate > 0.15;
+        let danger_low = !is_charging && dist_to_resume < DANGER_CAP_MARGIN;
 
         if danger_high || danger_low {
             self.last_interval = MIN_INTERVAL;
@@ -256,7 +261,7 @@ pub fn run_monitor_loop(config: Arc<RwLock<Config>>, rx: UnixDatagram) {
             temp_dc: temp_dc.unwrap(),
             _current_ma: current,
             online: online.unwrap_or(true),
-            _charging: current > 50, // Deadband 50mA
+            _charging: current > CURRENT_DEADBAND_MA,
             ts: Instant::now(),
         };
 
@@ -287,7 +292,7 @@ pub fn run_monitor_loop(config: Arc<RwLock<Config>>, rx: UnixDatagram) {
                     // Verify
                     std::thread::sleep(Duration::from_millis(300));
                     if let Ok(c) = battery_reader.read_current_ma() {
-                        if c > 50.0 {
+                        if c > CURRENT_DEADBAND_MA as f32 {
                             tracing::warn!("Verified after Disable: Hardware still charging! (Current: {} mA)", c);
                         }
                     }
@@ -301,9 +306,21 @@ pub fn run_monitor_loop(config: Arc<RwLock<Config>>, rx: UnixDatagram) {
         let mut should_evaluate = false;
         let mut now = Instant::now();
         let target_wake = now + timeout;
+        let mut debounce_target: Option<Instant> = None;
 
         while now < target_wake {
-            let remaining = target_wake.saturating_duration_since(now);
+            if let Some(debounce) = debounce_target {
+                if now >= debounce {
+                    should_evaluate = true;
+                    break;
+                }
+            }
+
+            let remaining = if let Some(debounce) = debounce_target {
+                debounce.saturating_duration_since(now)
+            } else {
+                target_wake.saturating_duration_since(now)
+            };
 
             let mut pfds = vec![libc::pollfd { fd: rx.as_raw_fd(), events: libc::POLLIN, revents: 0 }];
             if nl_fd >= 0 {
@@ -311,11 +328,11 @@ pub fn run_monitor_loop(config: Arc<RwLock<Config>>, rx: UnixDatagram) {
             }
 
             let ret = unsafe { libc::poll(pfds.as_mut_ptr(), pfds.len() as libc::nfds_t, remaining.as_millis() as i32) };
+            now = Instant::now();
 
             if ret < 0 {
                 let err = std::io::Error::last_os_error();
                 if err.kind() == std::io::ErrorKind::Interrupted {
-                    now = Instant::now();
                     continue; // EINTR is safe
                 }
                 tracing::error!("poll() failed: {}", err);
@@ -369,13 +386,13 @@ pub fn run_monitor_loop(config: Arc<RwLock<Config>>, rx: UnixDatagram) {
                         }
                     }
                     if found {
-                        should_evaluate = true;
-                        break;
+                        if debounce_target.is_none() {
+                            tracing::debug!("Netlink event received, starting debounce timer");
+                            debounce_target = Some(now + NETLINK_DEBOUNCE);
+                        }
                     }
                 }
             }
-            
-            now = Instant::now();
         }
 
         if !should_evaluate {
