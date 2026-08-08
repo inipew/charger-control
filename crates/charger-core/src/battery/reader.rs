@@ -1,5 +1,5 @@
-use std::{fs, path::Path};
 use crate::{battery::nodes::*, error::ChargerError};
+use std::{fs, path::Path};
 
 /// Status of the battery from sysfs
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -15,7 +15,10 @@ pub enum BatteryStatus {
 pub fn read_sysfs(path: &Path) -> Result<String, ChargerError> {
     fs::read_to_string(path)
         .map(|s| s.trim().to_owned())
-        .map_err(|e| ChargerError::SysfsRead { path: path.to_owned(), source: e })
+        .map_err(|e| ChargerError::SysfsRead {
+            path: path.to_owned(),
+            source: e,
+        })
 }
 
 /// Read battery level (0..=100) from sysfs capacity node.
@@ -32,7 +35,9 @@ pub fn read_current_ua() -> Result<i64, ChargerError> {
     for path in CURRENT_NODES {
         if let Ok(raw) = read_sysfs(Path::new(path)) {
             if let Ok(val) = raw.parse::<i64>() {
-                if val != 0 { return Ok(val); }
+                if val != 0 {
+                    return Ok(val);
+                }
             }
         }
     }
@@ -43,7 +48,9 @@ pub fn read_current_ua() -> Result<i64, ChargerError> {
 pub fn read_current_ma() -> Result<f32, ChargerError> {
     let mut ua = read_current_ua()? as f32;
     // Normalize: if absolute value > 10_000, it's in µA → convert to mA
-    if ua.abs() > 10_000.0 { ua /= 1000.0; }
+    if ua.abs() > 10_000.0 {
+        ua /= 1000.0;
+    }
     Ok(ua)
 }
 
@@ -89,7 +96,9 @@ pub fn read_cycle_count() -> Result<u32, ChargerError> {
     for p in paths {
         if let Ok(raw) = read_sysfs(Path::new(p)) {
             if let Ok(val) = raw.parse::<u32>() {
-                if val > 0 { return Ok(val); }
+                if val > 0 {
+                    return Ok(val);
+                }
             }
         }
     }
@@ -104,7 +113,9 @@ pub fn read_technology() -> Result<String, ChargerError> {
     ];
     for p in paths {
         if let Ok(raw) = read_sysfs(Path::new(p)) {
-            if !raw.is_empty() { return Ok(raw); }
+            if !raw.is_empty() {
+                return Ok(raw);
+            }
         }
     }
     Ok("Li-ion".to_string())
@@ -127,7 +138,7 @@ pub fn is_plugged_in() -> Result<bool, ChargerError> {
             return Ok(false);
         }
     }
-    
+
     // Fallback: check ac/usb online
     let nodes = [
         "/sys/class/power_supply/ac/online",
@@ -145,8 +156,8 @@ pub fn is_plugged_in() -> Result<bool, ChargerError> {
     Ok(true) // Default safe assumption
 }
 
-use std::io::{Read, Seek, SeekFrom};
 use std::fs::File;
+use std::io::{Read, Seek, SeekFrom};
 
 /// A stateful reader that holds open File Descriptors for zero-allocation polling.
 pub struct CachedReader {
@@ -157,9 +168,19 @@ pub struct CachedReader {
     buf: [u8; 32],
 }
 
+impl Default for CachedReader {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl CachedReader {
     pub fn new() -> Self {
-        let current_path = CURRENT_NODES.iter().find(|&&p| Path::new(p).exists()).copied().unwrap_or("/sys/class/power_supply/battery/current_now");
+        let current_path = CURRENT_NODES
+            .iter()
+            .find(|&&p| Path::new(p).exists())
+            .copied()
+            .unwrap_or("/sys/class/power_supply/battery/current_now");
         Self {
             capacity_fd: File::open("/sys/class/power_supply/battery/capacity").ok(),
             temp_fd: File::open("/sys/class/power_supply/battery/temp").ok(),
@@ -169,7 +190,11 @@ impl CachedReader {
         }
     }
 
-    fn read_fd_to_str<'a>(fd: &mut Option<File>, buf: &'a mut [u8], node_name: &'static str) -> Result<&'a str, ChargerError> {
+    fn read_fd_to_str<'a>(
+        fd: &mut Option<File>,
+        buf: &'a mut [u8],
+        node_name: &'static str,
+    ) -> Result<&'a str, ChargerError> {
         if let Some(f) = fd {
             let _ = f.seek(SeekFrom::Start(0));
             if let Ok(n) = f.read(buf) {
@@ -179,9 +204,9 @@ impl CachedReader {
             }
             Err(ChargerError::ParseError(node_name))
         } else {
-            Err(ChargerError::SysfsRead { 
-                path: std::path::PathBuf::from(node_name), 
-                source: std::io::Error::new(std::io::ErrorKind::NotFound, "FD not open") 
+            Err(ChargerError::SysfsRead {
+                path: std::path::PathBuf::from(node_name),
+                source: std::io::Error::new(std::io::ErrorKind::NotFound, "FD not open"),
             })
         }
     }
@@ -201,7 +226,9 @@ impl CachedReader {
         if let Ok(val) = s.parse::<i64>() {
             if val != 0 {
                 let mut ua = val as f32;
-                if ua.abs() > 10_000.0 { ua /= 1000.0; }
+                if ua.abs() > 10_000.0 {
+                    ua /= 1000.0;
+                }
                 return Ok(ua);
             }
         }

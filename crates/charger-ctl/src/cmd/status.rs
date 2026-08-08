@@ -1,6 +1,6 @@
-use charger_core::error::ChargerError;
-use charger_core::battery::{reader, health};
 use crate::display;
+use charger_core::battery::{health, reader};
+use charger_core::error::ChargerError;
 
 pub fn run() -> Result<(), ChargerError> {
     display::title("Battery Status");
