@@ -39,9 +39,9 @@ pub fn set_charging(enable: bool) -> Result<(), ChargerError> {
         }
     }
 
-    if failed > 0 {
+    if failed > 0 && succeeded > 0 {
         tracing::warn!("Charging state partially applied: {} succeeded, {} failed", succeeded, failed);
-        Err(ChargerError::NoChargingNodeFound)
+        Err(ChargerError::PartialWriteFailure { succeeded, failed })
     } else if succeeded == 0 {
         Err(ChargerError::NoChargingNodeFound)
     } else {
@@ -71,7 +71,9 @@ pub fn enter_bypass_mode() -> Result<(), ChargerError> {
         }
     }
     
-    if failed > 0 || succeeded == 0 {
+    if failed > 0 && succeeded > 0 {
+        Err(ChargerError::PartialWriteFailure { succeeded, failed })
+    } else if succeeded == 0 {
         Err(ChargerError::NoChargingNodeFound)
     } else {
         Ok(())
@@ -100,7 +102,9 @@ pub fn exit_bypass_mode() -> Result<(), ChargerError> {
         }
     }
     
-    if failed > 0 || succeeded == 0 {
+    if failed > 0 && succeeded > 0 {
+        Err(ChargerError::PartialWriteFailure { succeeded, failed })
+    } else if succeeded == 0 {
         Err(ChargerError::NoChargingNodeFound)
     } else {
         Ok(())

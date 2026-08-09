@@ -2,13 +2,10 @@ use std::path::Path;
 
 pub const CHARGING_NODES: &[&str] = &[
     "/sys/class/power_supply/battery/charging_enabled",
-    "/sys/class/power_supply/main/charging_enabled",
-    "/sys/class/power_supply/battery/battery_charging_enabled",
 ];
 
 pub const SUSPEND_NODES: &[&str] = &[
     "/sys/class/power_supply/battery/input_suspend",
-    "/sys/class/power_supply/usb/input_suspend",
 ];
 
 pub const CURRENT_NODES: &[&str] = &[

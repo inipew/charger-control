@@ -58,19 +58,31 @@ impl AdaptiveScheduler {
                 self.history.clear();
             } else {
                 const ALPHA: f32 = 0.3; // Smoothing factor
-                self.ema_cap_rate = ALPHA * ((s.capacity - prev.capacity) / dt) + (1.0 - ALPHA) * self.ema_cap_rate;
-                self.ema_temp_rate = ALPHA * ((s.temp - prev.temp) / dt) + (1.0 - ALPHA) * self.ema_temp_rate;
+                let new_cap_rate = ALPHA * ((s.capacity - prev.capacity) / dt) + (1.0 - ALPHA) * self.ema_cap_rate;
+                let new_temp_rate = ALPHA * ((s.temp - prev.temp) / dt) + (1.0 - ALPHA) * self.ema_temp_rate;
+                if new_cap_rate.is_finite() {
+                    self.ema_cap_rate = new_cap_rate;
+                }
+                if new_temp_rate.is_finite() {
+                    self.ema_temp_rate = new_temp_rate;
+                }
             }
         }
         self.history.push_back(s);
         if self.history.len() > 5 { self.history.pop_front(); }
     }
 
-    fn next_interval(&mut self, stop_reason: StopReason) -> Duration {
-        let s = self.history.back().expect("At least 1 sample needed");
+    fn next_interval(&mut self, limit_blocked: bool, thermal_blocked: bool, operating_mode: OperatingMode) -> Duration {
+        let s = match self.history.back() {
+            Some(sample) => sample,
+            None => return Duration::ZERO,
+        };
 
         if s.power_state == reader::PowerState::Disconnected {
             self.last_interval = UNPLUGGED_HEARTBEAT;
+            return self.last_interval;
+        } else if s.power_state == reader::PowerState::Attached {
+            self.last_interval = Duration::from_secs(2);
             return self.last_interval;
         }
 
@@ -81,17 +93,17 @@ impl AdaptiveScheduler {
         let danger = (dist_to_limit < 2.0
             || dist_to_thermal < 3.0
             || self.ema_temp_rate > 0.15)
-            && stop_reason == StopReason::None;
+            && !limit_blocked && !thermal_blocked && operating_mode == OperatingMode::Normal;
             
         if danger {
             self.last_interval = MIN_INTERVAL;
             return self.last_interval;
         }
 
-        if stop_reason == StopReason::ThermalCutoff {
+        if thermal_blocked {
             self.last_interval = Duration::from_secs(10);
             return self.last_interval;
-        } else if stop_reason != StopReason::None {
+        } else if limit_blocked || operating_mode == OperatingMode::Bypass {
             self.last_interval = Duration::from_secs(60);
             return self.last_interval;
         }
@@ -123,8 +135,13 @@ impl Drop for NetlinkFd {
     }
 }
 
+const THERMAL_HYSTERESIS_DC: i32 = 20;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum StopReason { None, LimitReached, ThermalCutoff, Bypass }
+enum OperatingMode { Normal, Bypass }
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AppliedChargingState { Unknown, Enabled, Disabled }
 
 fn create_netlink_socket() -> Option<std::os::unix::io::RawFd> {
     let fd = unsafe { libc::socket(libc::AF_NETLINK, libc::SOCK_RAW, libc::NETLINK_KOBJECT_UEVENT) };
@@ -204,7 +221,6 @@ fn drain_and_parse_netlink(fd: std::os::unix::io::RawFd) -> NetlinkEvent {
 }
 
 pub fn run_monitor_loop(config: Arc<RwLock<Config>>, rx: UnixDatagram) {
-    let mut stop_reason = StopReason::None;
     tracing::info!("Monitor loop started (Bulletproof Event-Driven Architecture)");
 
     let (_initial_level, initial_limit, _enabled) = {
@@ -226,18 +242,26 @@ pub fn run_monitor_loop(config: Arc<RwLock<Config>>, rx: UnixDatagram) {
 
     let mut force_next_eval = true;
     let mut pending_netlink_eval = false;
-    let mut is_charging_enabled = true; // Track actual hardware state
+    let mut applied_state = AppliedChargingState::Unknown;
+    let mut operating_mode = OperatingMode::Normal;
+    let mut thermal_blocked = false;
+    let mut limit_blocked = false;
 
     loop {
         let cfg = config.read().unwrap_or_else(|e| e.into_inner()).clone();
 
         if !cfg.enabled {
-            if stop_reason != StopReason::None {
-                if let Err(e) = control::set_charging(true) {
-                    tracing::error!("failed to restore charging state on disable: {e}");
+            if applied_state != AppliedChargingState::Enabled {
+                match control::set_charging(true) {
+                    Ok(()) => {
+                        applied_state = AppliedChargingState::Enabled;
+                        tracing::info!("Daemon disabled. Restored hardware charging state to ON.");
+                    }
+                    Err(_) => {
+                        applied_state = AppliedChargingState::Unknown;
+                        tracing::error!("Daemon disabled: failed to fully restore hardware charging state");
+                    }
                 }
-                stop_reason = StopReason::None;
-                tracing::info!("Daemon disabled. Restored charging state to true.");
             }
             
             // Wait for events indefinitely when disabled
@@ -255,7 +279,7 @@ pub fn run_monitor_loop(config: Arc<RwLock<Config>>, rx: UnixDatagram) {
             continue;
         }
 
-        let mut timeout = scheduler.next_interval(stop_reason);
+        let mut timeout = scheduler.next_interval(limit_blocked, thermal_blocked, operating_mode);
         
         // Deferred evaluation handler
         if force_next_eval {
@@ -309,12 +333,12 @@ pub fn run_monitor_loop(config: Arc<RwLock<Config>>, rx: UnixDatagram) {
                     }
                     if buf[0] == 3 {
                         tracing::info!("Bypass mode enabled via IPC");
-                        stop_reason = StopReason::Bypass;
+                        operating_mode = OperatingMode::Bypass;
                         needs_evaluation = true;
                     }
                     if buf[0] == 4 {
                         tracing::info!("Bypass mode disabled via IPC");
-                        stop_reason = StopReason::None;
+                        operating_mode = OperatingMode::Normal;
                         needs_evaluation = true;
                     }
                 }
@@ -394,51 +418,74 @@ pub fn run_monitor_loop(config: Arc<RwLock<Config>>, rx: UnixDatagram) {
         });
 
         // Gate 1: Protect Bypass Mode
-        if stop_reason == StopReason::Bypass {
+        if operating_mode == OperatingMode::Bypass {
+            if applied_state != AppliedChargingState::Disabled {
+                match control::enter_bypass_mode() {
+                    Ok(()) => {
+                        applied_state = AppliedChargingState::Disabled;
+                        tracing::info!("Hardware is now in BYPASS mode");
+                    }
+                    Err(_) => {
+                        applied_state = AppliedChargingState::Unknown;
+                        tracing::error!("Failed to fully apply BYPASS mode");
+                    }
+                }
+            }
             last_eval_time = Instant::now();
             continue;
         }
 
         // Gate 2: Unified Policy Engine (Desired vs Actual)
-        let mut new_stop_reason = stop_reason;
+        let mut new_thermal_blocked = thermal_blocked;
+        let mut new_limit_blocked = limit_blocked;
         
         if power_state == reader::PowerState::Disconnected {
             // Unplug resets the policy state
-            new_stop_reason = StopReason::None;
+            new_thermal_blocked = false;
+            new_limit_blocked = false;
         } else if power_state.is_plugged_in() {
-            let thermal_resume_dc = max_temp_dc.saturating_sub(20);
+            let thermal_resume_dc = max_temp_dc.saturating_sub(THERMAL_HYSTERESIS_DC);
             
             if cfg.thermal_cutoff && temp_dc >= max_temp_dc {
-                new_stop_reason = StopReason::ThermalCutoff;
-            } else if stop_reason == StopReason::ThermalCutoff && temp_dc <= thermal_resume_dc && level < limit {
-                new_stop_reason = StopReason::None;
-            } else if level >= limit {
-                new_stop_reason = StopReason::LimitReached;
-            } else if level <= effective_resume && stop_reason == StopReason::LimitReached {
-                new_stop_reason = StopReason::None;
+                new_thermal_blocked = true;
+            } else if thermal_blocked && temp_dc <= thermal_resume_dc {
+                new_thermal_blocked = false;
+            }
+            
+            if level >= limit {
+                new_limit_blocked = true;
+            } else if limit_blocked && level <= effective_resume {
+                new_limit_blocked = false;
             }
         }
         
-        let desired_charging = new_stop_reason == StopReason::None;
+        let desired_charging = !new_thermal_blocked && !new_limit_blocked;
+        let desired_applied = if desired_charging { AppliedChargingState::Enabled } else { AppliedChargingState::Disabled };
         
-        if desired_charging != is_charging_enabled {
-            if let Ok(()) = control::set_charging(desired_charging) {
-                is_charging_enabled = desired_charging;
-                stop_reason = new_stop_reason;
-                
-                if power_state == reader::PowerState::Disconnected {
-                    tracing::info!("🔌 Charger disconnected. Restored charging state and reset logic.");
-                } else if desired_charging {
-                    tracing::info!("✅ Charging resumed (Reason cleared: {:?})", stop_reason);
-                } else {
-                    tracing::warn!("⚠ Charging stopped (Reason: {:?})", stop_reason);
+        if applied_state != desired_applied {
+            match control::set_charging(desired_charging) {
+                Ok(()) => {
+                    applied_state = desired_applied;
+                    thermal_blocked = new_thermal_blocked;
+                    limit_blocked = new_limit_blocked;
+                    
+                    if power_state == reader::PowerState::Disconnected {
+                        tracing::info!("🔌 Charger disconnected. Restored charging state and reset logic.");
+                    } else if desired_charging {
+                        tracing::info!("✅ Charging resumed (Thermal Blocked: {}, Limit Blocked: {})", thermal_blocked, limit_blocked);
+                    } else {
+                        tracing::warn!("⚠ Charging stopped (Thermal Blocked: {}, Limit Blocked: {})", thermal_blocked, limit_blocked);
+                    }
                 }
-            } else {
-                tracing::error!("Failed to apply charging state");
+                Err(_) => {
+                    applied_state = AppliedChargingState::Unknown;
+                    tracing::error!("Failed to fully apply charging state");
+                }
             }
-        } else if new_stop_reason != stop_reason {
+        } else if new_thermal_blocked != thermal_blocked || new_limit_blocked != limit_blocked {
             // Semantic update only, no hardware IO needed
-            stop_reason = new_stop_reason;
+            thermal_blocked = new_thermal_blocked;
+            limit_blocked = new_limit_blocked;
         }
         
         last_eval_time = Instant::now();

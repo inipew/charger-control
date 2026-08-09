@@ -146,7 +146,7 @@ pub fn get_power_state() -> Result<PowerState, ChargerError> {
     }
     
     // 2. Fallback to early attach hint if AC is offline
-    let typec = read_sysfs(Path::new("/sys/class/power_supply/battery/typec_mode")).unwrap_or_else(|_| "".into());
+    let typec = read_sysfs(Path::new("/sys/class/power_supply/usb/typec_mode")).unwrap_or_else(|_| "".into());
     if typec.contains("Source attached") {
         return Ok(PowerState::Attached);
     }
