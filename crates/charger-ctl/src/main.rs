@@ -1,14 +1,11 @@
-use clap::{Parser, Subcommand};
 use charger_core::error::ChargerError;
+use clap::{Parser, Subcommand};
 
 mod cmd;
 mod display;
 
 #[derive(Parser)]
-#[command(
-    name = "charger-ctl",
-    about = "Advanced battery charging control CLI"
-)]
+#[command(name = "charger-ctl", about = "Advanced battery charging control CLI")]
 struct Cli {
     #[command(subcommand)]
     command: Commands,
@@ -86,27 +83,23 @@ fn main() -> Result<(), ChargerError> {
             cmd::status::run()?;
         }
 
-        Commands::Set { target } => {
-            match target {
-                SetTarget::Limit { value } => {
-                    cmd::set::limit(*value)?;
-                }
-
-                SetTarget::Resume { value } => {
-                    cmd::set::resume(*value)?;
-                }
-
-                SetTarget::Thermal { state } => {
-                    cmd::set::thermal(
-                        state == "on",
-                    )?;
-                }
-
-                SetTarget::MaxTemp { value } => {
-                    cmd::set::max_temp(*value)?;
-                }
+        Commands::Set { target } => match target {
+            SetTarget::Limit { value } => {
+                cmd::set::limit(*value)?;
             }
-        }
+
+            SetTarget::Resume { value } => {
+                cmd::set::resume(*value)?;
+            }
+
+            SetTarget::Thermal { state } => {
+                cmd::set::thermal(state == "on")?;
+            }
+
+            SetTarget::MaxTemp { value } => {
+                cmd::set::max_temp(*value)?;
+            }
+        },
 
         Commands::Bypass { state } => {
             cmd::bypass::run(state == "on")?;
@@ -117,41 +110,28 @@ fn main() -> Result<(), ChargerError> {
         }
 
         Commands::Nodes => {
-            let charging =
-                charger_core::battery::nodes::detect_node(
-                    charger_core::battery::nodes::CHARGING_NODES,
-                );
-
-            let suspend =
-                charger_core::battery::nodes::detect_node(
-                    charger_core::battery::nodes::SUSPEND_NODES,
-                );
-
-            println!(
-                "Charging nodes: {:?}",
-                charging
+            let charging = charger_core::battery::nodes::detect_node(
+                charger_core::battery::nodes::CHARGING_NODES,
             );
 
-            println!(
-                "Suspend nodes : {:?}",
-                suspend
+            let suspend = charger_core::battery::nodes::detect_node(
+                charger_core::battery::nodes::SUSPEND_NODES,
             );
+
+            println!("Charging nodes: {:?}", charging);
+
+            println!("Suspend nodes : {:?}", suspend);
 
             println!(
                 "Main charging : {}",
-                std::path::Path::new(
-                    charger_core::battery::nodes::MAIN_CHARGING_NODE
-                )
-                .exists()
+                std::path::Path::new(charger_core::battery::nodes::MAIN_CHARGING_NODE).exists()
             );
         }
 
         Commands::GrantPerms => {
             charger_core::battery::control::grant_node_permissions()?;
 
-            println!(
-                "Charging node permissions updated."
-            );
+            println!("Charging node permissions updated.");
         }
 
         Commands::Debug { action } => {

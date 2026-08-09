@@ -6,7 +6,13 @@ pub fn run_uevent_dumper() -> Result<(), ChargerError> {
     println!("Please plug or unplug your charger to see hardware events.");
     println!("Press Ctrl+C to stop.\n");
 
-    let fd = unsafe { libc::socket(libc::AF_NETLINK, libc::SOCK_RAW, libc::NETLINK_KOBJECT_UEVENT) };
+    let fd = unsafe {
+        libc::socket(
+            libc::AF_NETLINK,
+            libc::SOCK_RAW,
+            libc::NETLINK_KOBJECT_UEVENT,
+        )
+    };
     if fd < 0 {
         return Err(ChargerError::ParseError("Failed to create netlink socket"));
     }
@@ -25,7 +31,9 @@ pub fn run_uevent_dumper() -> Result<(), ChargerError> {
     };
 
     if ret < 0 {
-        return Err(ChargerError::ParseError("Failed to bind netlink socket (run as root?)"));
+        return Err(ChargerError::ParseError(
+            "Failed to bind netlink socket (run as root?)",
+        ));
     }
 
     let mut buf = [0u8; 8192];
@@ -34,7 +42,7 @@ pub fn run_uevent_dumper() -> Result<(), ChargerError> {
         if res > 0 {
             let data = &buf[..res as usize];
             let s = String::from_utf8_lossy(data);
-            
+
             // Only print if it looks like a power supply or battery event to avoid huge noise
             if s.contains("power_supply") || s.contains("battery") {
                 let parts: Vec<&str> = s.split('\0').collect();

@@ -10,8 +10,7 @@ use crate::display;
 use std::os::unix::net::UnixStream;
 
 fn socket_path() -> String {
-    charger_core::config::schema::DEFAULT_CONFIG_PATH
-        .replace("config.toml", "daemon.sock")
+    charger_core::config::schema::DEFAULT_CONFIG_PATH.replace("config.toml", "daemon.sock")
 }
 
 pub fn run(action: &str) -> Result<(), ChargerError> {
@@ -107,16 +106,11 @@ fn start_daemon() {
 
         match command.spawn() {
             Ok(child) => {
-                display::success(&format!(
-                    "Daemon started (PID {})",
-                    child.id()
-                ));
+                display::success(&format!("Daemon started (PID {})", child.id()));
             }
 
             Err(e) => {
-                display::error(&format!(
-                    "Failed to start daemon: {e}"
-                ));
+                display::error(&format!("Failed to start daemon: {e}"));
                 return;
             }
         }
@@ -131,16 +125,12 @@ fn start_daemon() {
             std::thread::sleep(Duration::from_millis(100));
         }
 
-        display::warn(
-            "Daemon process started, but IPC socket is not ready yet.",
-        );
+        display::warn("Daemon process started, but IPC socket is not ready yet.");
     }
 
     #[cfg(not(unix))]
     {
-        display::error(
-            "Native daemon management is only supported on UNIX/Android.",
-        );
+        display::error("Native daemon management is only supported on UNIX/Android.");
     }
 }
 
@@ -205,9 +195,7 @@ fn send_cmd(cmd: &[u8]) {
         let mut stream = match UnixStream::connect(&path) {
             Ok(stream) => stream,
             Err(_) => {
-                display::error(
-                    "Daemon is not running or socket is missing.",
-                );
+                display::error("Daemon is not running or socket is missing.");
                 return;
             }
         };
@@ -216,9 +204,7 @@ fn send_cmd(cmd: &[u8]) {
         let _ = stream.set_read_timeout(Some(Duration::from_secs(3)));
 
         if let Err(e) = stream.write_all(cmd) {
-            display::error(&format!(
-                "Failed to send daemon command: {e}"
-            ));
+            display::error(&format!("Failed to send daemon command: {e}"));
             return;
         }
 
@@ -229,10 +215,7 @@ fn send_cmd(cmd: &[u8]) {
                 let response = response.trim();
 
                 if response.starts_with("OK:") {
-                    let msg = response
-                        .strip_prefix("OK:")
-                        .unwrap_or(response)
-                        .trim();
+                    let msg = response.strip_prefix("OK:").unwrap_or(response).trim();
 
                     display::success(msg);
                 } else if response.starts_with("OK") {
@@ -245,9 +228,7 @@ fn send_cmd(cmd: &[u8]) {
             }
 
             Err(e) => {
-                display::error(&format!(
-                    "Failed to read daemon response: {e}"
-                ));
+                display::error(&format!("Failed to read daemon response: {e}"));
             }
         }
     }

@@ -4,10 +4,18 @@ use thiserror::Error;
 #[derive(Debug, Error)]
 pub enum ChargerError {
     #[error("Failed to read sysfs node {path}: {source}")]
-    SysfsRead { path: PathBuf, #[source] source: std::io::Error },
+    SysfsRead {
+        path: PathBuf,
+        #[source]
+        source: std::io::Error,
+    },
 
     #[error("Failed to write sysfs node {path}: {source}")]
-    SysfsWrite { path: PathBuf, #[source] source: std::io::Error },
+    SysfsWrite {
+        path: PathBuf,
+        #[source]
+        source: std::io::Error,
+    },
 
     #[error("No known charging control node found on this device")]
     NoChargingNodeFound,
@@ -19,10 +27,18 @@ pub enum ChargerError {
     ParseError(&'static str),
 
     #[error("Config file read error at {path}: {source}")]
-    ConfigRead { path: PathBuf, #[source] source: std::io::Error },
+    ConfigRead {
+        path: PathBuf,
+        #[source]
+        source: std::io::Error,
+    },
 
     #[error("Config file write error at {path}: {source}")]
-    ConfigWrite { path: PathBuf, #[source] source: std::io::Error },
+    ConfigWrite {
+        path: PathBuf,
+        #[source]
+        source: std::io::Error,
+    },
 
     #[error("Config parse error: {0}")]
     ConfigParse(String),

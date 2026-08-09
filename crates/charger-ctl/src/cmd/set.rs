@@ -13,9 +13,7 @@ fn load_config() -> Result<Config, ChargerError> {
     let path = config_path();
 
     Config::load(&path).map_err(|e| {
-        display::error(&format!(
-            "Failed to load config: {e}"
-        ));
+        display::error(&format!("Failed to load config: {e}"));
 
         e
     })
@@ -34,15 +32,13 @@ fn notify_daemon() {
         use std::os::unix::net::UnixStream;
         use std::time::Duration;
 
-        let socket = charger_core::config::schema::DEFAULT_CONFIG_PATH
-            .replace("config.toml", "daemon.sock");
+        let socket =
+            charger_core::config::schema::DEFAULT_CONFIG_PATH.replace("config.toml", "daemon.sock");
 
         let mut stream = match UnixStream::connect(&socket) {
             Ok(stream) => stream,
             Err(_) => {
-                display::warn(
-                    "Config saved, but daemon is not running.",
-                );
+                display::warn("Config saved, but daemon is not running.");
                 return;
             }
         };
@@ -51,9 +47,7 @@ fn notify_daemon() {
         let _ = stream.set_read_timeout(Some(Duration::from_secs(2)));
 
         if stream.write_all(b"reload").is_err() {
-            display::warn(
-                "Config saved, but failed to notify daemon.",
-            );
+            display::warn("Config saved, but failed to notify daemon.");
             return;
         }
 
@@ -65,24 +59,18 @@ fn notify_daemon() {
             }
 
             Ok(_) => {
-                display::warn(
-                    "Config saved, but daemon returned an error.",
-                );
+                display::warn("Config saved, but daemon returned an error.");
             }
 
             Err(_) => {
-                display::warn(
-                    "Config saved, but daemon did not respond.",
-                );
+                display::warn("Config saved, but daemon did not respond.");
             }
         }
     }
 
     #[cfg(not(unix))]
     {
-        display::warn(
-            "IPC not supported on this platform. Restart daemon manually.",
-        );
+        display::warn("IPC not supported on this platform. Restart daemon manually.");
     }
 }
 
@@ -108,9 +96,7 @@ pub fn limit(value: u8) -> Result<(), ChargerError> {
         let new_resume = value.saturating_sub(5).max(40);
 
         if new_resume >= value {
-            display::error(
-                "Unable to create a valid resume limit for this charge limit.",
-            );
+            display::error("Unable to create a valid resume limit for this charge limit.");
             return Ok(());
         }
 
@@ -127,10 +113,7 @@ pub fn limit(value: u8) -> Result<(), ChargerError> {
 
     save_config(&cfg)?;
 
-    display::success(&format!(
-        "Charge limit set to {}%",
-        value
-    ));
+    display::success(&format!("Charge limit set to {}%", value));
 
     notify_daemon();
 
@@ -139,9 +122,7 @@ pub fn limit(value: u8) -> Result<(), ChargerError> {
 
 pub fn resume(value: u8) -> Result<(), ChargerError> {
     if !(40..=99).contains(&value) {
-        display::error(
-            "Resume limit must be between 40 and 99%",
-        );
+        display::error("Resume limit must be between 40 and 99%");
         return Ok(());
     }
 
@@ -150,8 +131,7 @@ pub fn resume(value: u8) -> Result<(), ChargerError> {
     if value >= cfg.charge_limit {
         display::error(&format!(
             "Resume limit ({}%) must be less than charge limit ({}%).",
-            value,
-            cfg.charge_limit
+            value, cfg.charge_limit
         ));
 
         return Ok(());
@@ -161,10 +141,7 @@ pub fn resume(value: u8) -> Result<(), ChargerError> {
 
     save_config(&cfg)?;
 
-    display::success(&format!(
-        "Resume limit set to {}%",
-        value
-    ));
+    display::success(&format!("Resume limit set to {}%", value));
 
     notify_daemon();
 
@@ -190,9 +167,7 @@ pub fn thermal(enabled: bool) -> Result<(), ChargerError> {
 
 pub fn max_temp(value: i32) -> Result<(), ChargerError> {
     if !(30..=60).contains(&value) {
-        display::error(
-            "Max temp must be between 30 and 60 °C",
-        );
+        display::error("Max temp must be between 30 and 60 °C");
         return Ok(());
     }
 
@@ -202,10 +177,7 @@ pub fn max_temp(value: i32) -> Result<(), ChargerError> {
 
     save_config(&cfg)?;
 
-    display::success(&format!(
-        "Max temperature set to {} °C",
-        value
-    ));
+    display::success(&format!("Max temperature set to {} °C", value));
 
     notify_daemon();
 

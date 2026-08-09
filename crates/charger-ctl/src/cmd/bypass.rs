@@ -9,8 +9,7 @@ use crate::display;
 use std::os::unix::net::UnixStream;
 
 fn socket_path() -> String {
-    charger_core::config::schema::DEFAULT_CONFIG_PATH
-        .replace("config.toml", "daemon.sock")
+    charger_core::config::schema::DEFAULT_CONFIG_PATH.replace("config.toml", "daemon.sock")
 }
 
 pub fn run(enable: bool) -> Result<(), ChargerError> {

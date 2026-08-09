@@ -1,8 +1,7 @@
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 
-pub const DEFAULT_CONFIG_PATH: &str =
-    "/data/adb/charger-control/config.toml";
+pub const DEFAULT_CONFIG_PATH: &str = "/data/adb/charger-control/config.toml";
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
@@ -56,48 +55,33 @@ impl Default for Config {
             max_temp_dc: 420,
             poll_interval_secs: 10,
 
-            log_path: PathBuf::from(
-                "/data/adb/charger-control/charger-control.log"
-            ),
+            log_path: PathBuf::from("/data/adb/charger-control/charger-control.log"),
         }
     }
 }
 
 impl Config {
-    pub fn load(
-        path: &PathBuf,
-    ) -> Result<Self, crate::error::ChargerError> {
+    pub fn load(path: &PathBuf) -> Result<Self, crate::error::ChargerError> {
         if !path.exists() {
             return Ok(Self::default());
         }
 
-        let raw = std::fs::read_to_string(path)
-            .map_err(|e| crate::error::ChargerError::ConfigRead {
+        let raw =
+            std::fs::read_to_string(path).map_err(|e| crate::error::ChargerError::ConfigRead {
                 path: path.clone(),
                 source: e,
             })?;
 
-        toml::from_str(&raw)
-            .map_err(|e| {
-                crate::error::ChargerError::ConfigParse(e.to_string())
-            })
+        toml::from_str(&raw).map_err(|e| crate::error::ChargerError::ConfigParse(e.to_string()))
     }
 
-    pub fn save(
-        &self,
-        path: &PathBuf,
-    ) -> Result<(), crate::error::ChargerError> {
+    pub fn save(&self, path: &PathBuf) -> Result<(), crate::error::ChargerError> {
         let raw = toml::to_string_pretty(self)
-            .map_err(|e| {
-                crate::error::ChargerError::ConfigSerialize(
-                    e.to_string(),
-                )
-            })?;
+            .map_err(|e| crate::error::ChargerError::ConfigSerialize(e.to_string()))?;
 
-        std::fs::write(path, raw)
-            .map_err(|e| crate::error::ChargerError::ConfigWrite {
-                path: path.clone(),
-                source: e,
-            })
+        std::fs::write(path, raw).map_err(|e| crate::error::ChargerError::ConfigWrite {
+            path: path.clone(),
+            source: e,
+        })
     }
 }

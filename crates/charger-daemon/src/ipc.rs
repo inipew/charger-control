@@ -10,11 +10,9 @@ use std::os::unix::net::{UnixDatagram, UnixListener, UnixStream};
 use charger_core::battery::{control, reader};
 use charger_core::config::schema::Config;
 
-pub const SOCKET_PATH: &str =
-    "/data/adb/charger-control/daemon.sock";
+pub const SOCKET_PATH: &str = "/data/adb/charger-control/daemon.sock";
 
-const IPC_READ_TIMEOUT: Duration =
-    Duration::from_millis(750);
+const IPC_READ_TIMEOUT: Duration = Duration::from_millis(750);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DaemonCommand {
@@ -27,8 +25,7 @@ pub enum DaemonCommand {
 
 impl DaemonCommand {
     pub fn from_bytes(bytes: &[u8]) -> Option<Self> {
-        let command =
-            std::str::from_utf8(bytes).ok()?.trim();
+        let command = std::str::from_utf8(bytes).ok()?.trim();
 
         match command {
             "bypass on" => Some(Self::BypassOn),
@@ -51,19 +48,17 @@ fn get_process_stats() -> (u32, f32, f32) {
 }
 
 fn read_rss_mb() -> f32 {
-    let status =
-        match std::fs::read_to_string("/proc/self/status") {
-            Ok(value) => value,
-            Err(_) => return 0.0,
-        };
+    let status = match std::fs::read_to_string("/proc/self/status") {
+        Ok(value) => value,
+        Err(_) => return 0.0,
+    };
 
     for line in status.lines() {
         if !line.starts_with("VmRSS:") {
             continue;
         }
 
-        let parts: Vec<&str> =
-            line.split_whitespace().collect();
+        let parts: Vec<&str> = line.split_whitespace().collect();
 
         if parts.len() < 2 {
             return 0.0;
@@ -78,14 +73,12 @@ fn read_rss_mb() -> f32 {
 }
 
 fn read_cpu_percent() -> f32 {
-    let stat =
-        match std::fs::read_to_string("/proc/self/stat") {
-            Ok(value) => value,
-            Err(_) => return 0.0,
-        };
+    let stat = match std::fs::read_to_string("/proc/self/stat") {
+        Ok(value) => value,
+        Err(_) => return 0.0,
+    };
 
-    let parts: Vec<&str> =
-        stat.split_whitespace().collect();
+    let parts: Vec<&str> = stat.split_whitespace().collect();
 
     if parts.len() < 22 {
         return 0.0;
@@ -106,9 +99,7 @@ fn read_cpu_percent() -> f32 {
         Err(_) => return 0.0,
     };
 
-    let clk_tck = unsafe {
-        libc::sysconf(libc::_SC_CLK_TCK)
-    };
+    let clk_tck = unsafe { libc::sysconf(libc::_SC_CLK_TCK) };
 
     if clk_tck <= 0 {
         return 0.0;
@@ -116,39 +107,31 @@ fn read_cpu_percent() -> f32 {
 
     let clk_tck = clk_tck as f64;
 
-    let uptime =
-        match std::fs::read_to_string("/proc/uptime") {
-            Ok(value) => value,
+    let uptime = match std::fs::read_to_string("/proc/uptime") {
+        Ok(value) => value,
+        Err(_) => return 0.0,
+    };
+
+    let system_uptime = match uptime.split_whitespace().next() {
+        Some(value) => match value.parse::<f64>() {
+            Ok(v) => v,
             Err(_) => return 0.0,
-        };
+        },
+        None => return 0.0,
+    };
 
-    let system_uptime =
-        match uptime.split_whitespace().next() {
-            Some(value) => match value.parse::<f64>() {
-                Ok(v) => v,
-                Err(_) => return 0.0,
-            },
-            None => return 0.0,
-        };
-
-    let process_uptime =
-        system_uptime - (starttime / clk_tck);
+    let process_uptime = system_uptime - (starttime / clk_tck);
 
     if process_uptime <= 0.0 {
         return 0.0;
     }
 
-    let cpu_time =
-        (utime + stime) / clk_tck;
+    let cpu_time = (utime + stime) / clk_tck;
 
-    ((cpu_time / process_uptime) * 100.0)
-        .clamp(0.0, 100.0) as f32
+    ((cpu_time / process_uptime) * 100.0).clamp(0.0, 100.0) as f32
 }
 
-pub fn start_ipc_server(
-    config: Arc<RwLock<Config>>,
-    tx: UnixDatagram,
-) {
+pub fn start_ipc_server(config: Arc<RwLock<Config>>, tx: UnixDatagram) {
     let socket_path = Path::new(SOCKET_PATH);
 
     if socket_path.exists() {
@@ -156,88 +139,53 @@ pub fn start_ipc_server(
             Ok(_) => {}
 
             Err(e) => {
-                tracing::warn!(
-                    "Failed to remove stale socket {:?}: {}",
-                    socket_path,
-                    e
-                );
+                tracing::warn!("Failed to remove stale socket {:?}: {}", socket_path, e);
             }
         }
     }
 
     if let Some(parent) = socket_path.parent() {
-        if let Err(e) =
-            std::fs::create_dir_all(parent)
-        {
-            tracing::error!(
-                "Failed creating IPC directory: {}",
-                e
-            );
+        if let Err(e) = std::fs::create_dir_all(parent) {
+            tracing::error!("Failed creating IPC directory: {}", e);
             return;
         }
     }
 
-    let listener =
-        match UnixListener::bind(socket_path) {
-            Ok(listener) => listener,
+    let listener = match UnixListener::bind(socket_path) {
+        Ok(listener) => listener,
 
-            Err(e) => {
-                tracing::error!(
-                    "Failed to bind IPC socket {:?}: {}",
-                    socket_path,
-                    e
-                );
-                return;
-            }
-        };
+        Err(e) => {
+            tracing::error!("Failed to bind IPC socket {:?}: {}", socket_path, e);
+            return;
+        }
+    };
 
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
 
-        if let Ok(metadata) =
-            std::fs::metadata(socket_path)
-        {
-            let mut permissions =
-                metadata.permissions();
+        if let Ok(metadata) = std::fs::metadata(socket_path) {
+            let mut permissions = metadata.permissions();
 
             // Keep compatibility with charger-ctl.
             permissions.set_mode(0o666);
 
-            if let Err(e) =
-                std::fs::set_permissions(
-                    socket_path,
-                    permissions,
-                )
-            {
-                tracing::warn!(
-                    "Failed setting socket permissions: {}",
-                    e
-                );
+            if let Err(e) = std::fs::set_permissions(socket_path, permissions) {
+                tracing::warn!("Failed setting socket permissions: {}", e);
             }
         }
     }
 
-    tracing::info!(
-        "IPC server listening on {:?}",
-        socket_path
-    );
+    tracing::info!("IPC server listening on {:?}", socket_path);
 
     for stream in listener.incoming() {
         match stream {
             Ok(mut stream) => {
-                handle_client(
-                    &mut stream,
-                    &config,
-                    &tx,
-                );
+                handle_client(&mut stream, &config, &tx);
             }
 
             Err(e) => {
-                tracing::error!(
-                    "IPC accept failed: {}",
-                    e
-                );
+                tracing::error!("IPC accept failed: {}", e);
             }
         }
     }
@@ -247,18 +195,10 @@ pub fn start_ipc_server(
     tracing::info!("IPC server stopped");
 }
 
-fn handle_client(
-    stream: &mut UnixStream,
-    config: &Arc<RwLock<Config>>,
-    tx: &UnixDatagram,
-) {
-    let _ =
-        stream.set_read_timeout(Some(IPC_READ_TIMEOUT));
+fn handle_client(stream: &mut UnixStream, config: &Arc<RwLock<Config>>, tx: &UnixDatagram) {
+    let _ = stream.set_read_timeout(Some(IPC_READ_TIMEOUT));
 
-    let _ =
-        stream.set_write_timeout(Some(
-            Duration::from_secs(2),
-        ));
+    let _ = stream.set_write_timeout(Some(Duration::from_secs(2)));
 
     let mut buf = [0u8; 1024];
 
@@ -268,33 +208,22 @@ fn handle_client(
         Ok(n) => n,
 
         Err(e) => {
-            tracing::warn!(
-                "Failed reading IPC client: {}",
-                e
-            );
+            tracing::warn!("Failed reading IPC client: {}", e);
             return;
         }
     };
 
-    let command =
-        match DaemonCommand::from_bytes(
-            &buf[..received],
-        ) {
-            Some(command) => command,
+    let command = match DaemonCommand::from_bytes(&buf[..received]) {
+        Some(command) => command,
 
-            None => {
-                let _ = stream.write_all(
-                    b"Error: Unknown command",
-                );
+        None => {
+            let _ = stream.write_all(b"Error: Unknown command");
 
-                return;
-            }
-        };
+            return;
+        }
+    };
 
-    tracing::debug!(
-        "IPC command received: {:?}",
-        command
-    );
+    tracing::debug!("IPC command received: {:?}", command);
 
     match command {
         DaemonCommand::BypassOn => {
@@ -307,148 +236,91 @@ fn handle_client(
                 Ok(()) => {
                     let _ = tx.send(&[3]);
 
-                    let _ =
-                        stream.write_all(
-                            b"OK: Bypass ON",
-                        );
+                    let _ = stream.write_all(b"OK: Bypass ON");
                 }
 
                 Err(e) => {
-                    tracing::error!(
-                        "Failed enabling bypass: {}",
-                        e
-                    );
+                    tracing::error!("Failed enabling bypass: {}", e);
 
-                    let _ = stream.write_all(
-                        format!("Error: {e}")
-                            .as_bytes(),
-                    );
+                    let _ = stream.write_all(format!("Error: {e}").as_bytes());
                 }
             }
         }
 
-        DaemonCommand::BypassOff => {
-            match control::exit_bypass_mode() {
-                Ok(()) => {
-                    let _ = tx.send(&[4]);
+        DaemonCommand::BypassOff => match control::exit_bypass_mode() {
+            Ok(()) => {
+                let _ = tx.send(&[4]);
 
-                    let _ =
-                        stream.write_all(
-                            b"OK: Bypass OFF",
-                        );
-                }
-
-                Err(e) => {
-                    tracing::error!(
-                        "Failed disabling bypass: {}",
-                        e
-                    );
-
-                    let _ = stream.write_all(
-                        format!("Error: {e}")
-                            .as_bytes(),
-                    );
-                }
+                let _ = stream.write_all(b"OK: Bypass OFF");
             }
-        }
+
+            Err(e) => {
+                tracing::error!("Failed disabling bypass: {}", e);
+
+                let _ = stream.write_all(format!("Error: {e}").as_bytes());
+            }
+        },
 
         DaemonCommand::Reload => {
             let config_path =
-                std::path::PathBuf::from(
-                    charger_core::config::schema::DEFAULT_CONFIG_PATH
-                );
+                std::path::PathBuf::from(charger_core::config::schema::DEFAULT_CONFIG_PATH);
 
             match Config::load(&config_path) {
-                Ok(new_cfg) => {
-                    match config.write() {
-                        Ok(mut c) => {
-                            *c = new_cfg;
+                Ok(new_cfg) => match config.write() {
+                    Ok(mut c) => {
+                        *c = new_cfg;
 
-                            let _ = tx.send(&[1]);
+                        let _ = tx.send(&[1]);
 
-                            let _ = stream.write_all(
-                                b"OK: Config reloaded"
-                            );
+                        let _ = stream.write_all(b"OK: Config reloaded");
 
-                            tracing::info!(
-                                "Configuration reloaded successfully"
-                            );
-                        }
-
-                        Err(_) => {
-                            let _ = stream.write_all(
-                                b"Error: Failed to lock config"
-                            );
-
-                            tracing::error!(
-                                "Failed to acquire config write lock during reload"
-                            );
-                        }
+                        tracing::info!("Configuration reloaded successfully");
                     }
-                }
+
+                    Err(_) => {
+                        let _ = stream.write_all(b"Error: Failed to lock config");
+
+                        tracing::error!("Failed to acquire config write lock during reload");
+                    }
+                },
 
                 Err(e) => {
-                    tracing::error!(
-                        "Failed to reload configuration: {}",
-                        e
-                    );
+                    tracing::error!("Failed to reload configuration: {}", e);
 
-                    let _ = stream.write_all(
-                        format!("Error loading config: {e}").as_bytes()
-                    );
+                    let _ = stream.write_all(format!("Error loading config: {e}").as_bytes());
                 }
             }
         }
 
         DaemonCommand::Status => {
-            let (pid, rss, cpu) =
-                get_process_stats();
+            let (pid, rss, cpu) = get_process_stats();
 
-            let config_guard =
-                match config.read() {
-                    Ok(cfg) => cfg,
+            let config_guard = match config.read() {
+                Ok(cfg) => cfg,
 
-                    Err(_) => {
-                        let _ =
-                            stream.write_all(
-                                b"Error: Failed to lock config",
-                            );
+                Err(_) => {
+                    let _ = stream.write_all(b"Error: Failed to lock config");
 
-                        return;
-                    }
-                };
+                    return;
+                }
+            };
 
-            let hardware =
-                control::get_actual_charging_state();
+            let hardware = control::get_actual_charging_state();
 
-            let battery =
-                reader::read_capacity()
-                    .ok()
-                    .map(|v| format!("{}%", v))
-                    .unwrap_or_else(
-                        || "N/A".to_string(),
-                    );
+            let battery = reader::read_capacity()
+                .ok()
+                .map(|v| format!("{}%", v))
+                .unwrap_or_else(|| "N/A".to_string());
 
-            let temperature =
-                reader::read_temperature_dc()
-                    .ok()
-                    .map(|v| {
-                        format!(
-                            "{:.1} C",
-                            v as f32 / 10.0
-                        )
-                    })
-                    .unwrap_or_else(
-                        || "N/A".to_string(),
-                    );
+            let temperature = reader::read_temperature_dc()
+                .ok()
+                .map(|v| format!("{:.1} C", v as f32 / 10.0))
+                .unwrap_or_else(|| "N/A".to_string());
 
-            let power_state =
-                reader::get_power_state()
-                    .ok()
-                    .map(|v| format!("{:?}", v))
-                    .unwrap_or_else(
-                        || "Unknown".to_string(),
-                    );
+            let power_state = reader::get_power_state()
+                .ok()
+                .map(|v| format!("{:?}", v))
+                .unwrap_or_else(|| "Unknown".to_string());
 
             let msg = format!(
                 "OK:\n\
@@ -493,15 +365,11 @@ fn handle_client(
                 config_guard.max_temp_dc as f32 / 10.0,
             );
 
-            let _ =
-                stream.write_all(msg.as_bytes());
+            let _ = stream.write_all(msg.as_bytes());
         }
 
         DaemonCommand::Shutdown => {
-            let _ =
-                stream.write_all(
-                    b"OK: Shutting down",
-                );
+            let _ = stream.write_all(b"OK: Shutting down");
 
             let _ = tx.send(&[2]);
         }

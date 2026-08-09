@@ -1,14 +1,9 @@
 use std::{fs, path::Path};
 
-use crate::{
-    battery::nodes::*,
-    error::ChargerError,
-};
+use crate::{battery::nodes::*, error::ChargerError};
 
 /// Read a sysfs node and trim surrounding whitespace.
-pub fn read_sysfs(
-    path: &Path,
-) -> Result<String, ChargerError> {
+pub fn read_sysfs(path: &Path) -> Result<String, ChargerError> {
     fs::read_to_string(path)
         .map(|value| value.trim().to_owned())
         .map_err(|e| ChargerError::SysfsRead {
@@ -21,9 +16,8 @@ pub fn read_sysfs(
 ///
 /// This helper is useful for devices where the same information can exist
 /// under different power_supply nodes.
-fn read_first_available(
-    paths: &[&str],
-) -> Result<String, ChargerError> {
+#[warn(unused, dead_code)]
+fn read_first_available(paths: &[&str]) -> Result<String, ChargerError> {
     let mut last_error: Option<ChargerError> = None;
 
     for path in paths {
@@ -33,8 +27,7 @@ fn read_first_available(
             }
 
             Ok(_) => {
-                last_error =
-                    Some(ChargerError::ParseError("empty_sysfs_value"));
+                last_error = Some(ChargerError::ParseError("empty_sysfs_value"));
             }
 
             Err(error) => {
@@ -43,18 +36,14 @@ fn read_first_available(
         }
     }
 
-    Err(last_error.unwrap_or(
-        ChargerError::ParseError("sysfs"),
-    ))
+    Err(last_error.unwrap_or(ChargerError::ParseError("sysfs")))
 }
 
 /// Read battery SOC as an integer percentage.
 pub fn read_capacity() -> Result<u8, ChargerError> {
     let value = read_capacity_raw()?;
 
-    Ok(value
-        .round()
-        .clamp(0.0, 100.0) as u8)
+    Ok(value.round().clamp(0.0, 100.0) as u8)
 }
 
 /// Read battery SOC with fractional precision.
@@ -69,29 +58,19 @@ pub fn read_capacity() -> Result<u8, ChargerError> {
 ///     9848    -> 98.48
 pub fn read_capacity_raw() -> Result<f32, ChargerError> {
     // Standard Linux power_supply SOC.
-    if let Ok(raw) = read_sysfs(
-        Path::new("/sys/class/power_supply/battery/capacity"),
-    ) {
+    if let Ok(raw) = read_sysfs(Path::new("/sys/class/power_supply/battery/capacity")) {
         if let Ok(value) = raw.parse::<f32>() {
-            if value.is_finite()
-                && (0.0..=100.0).contains(&value)
-            {
+            if value.is_finite() && (0.0..=100.0).contains(&value) {
                 return Ok(value);
             }
         }
     }
 
     // Some BMS implementations expose a higher-resolution SOC.
-    if let Ok(raw) = read_sysfs(
-        Path::new("/sys/class/power_supply/bms/capacity_raw"),
-    ) {
+    if let Ok(raw) = read_sysfs(Path::new("/sys/class/power_supply/bms/capacity_raw")) {
         if let Ok(value) = raw.parse::<f32>() {
             if value.is_finite() {
-                let normalized = if value > 100.0 {
-                    value / 100.0
-                } else {
-                    value
-                };
+                let normalized = if value > 100.0 { value / 100.0 } else { value };
 
                 if (0.0..=100.0).contains(&normalized) {
                     return Ok(normalized);
@@ -101,13 +80,9 @@ pub fn read_capacity_raw() -> Result<f32, ChargerError> {
     }
 
     // Android/MTK devices sometimes expose real_soc.
-    if let Ok(raw) = read_sysfs(
-        Path::new("/sys/class/power_supply/battery/real_soc"),
-    ) {
+    if let Ok(raw) = read_sysfs(Path::new("/sys/class/power_supply/battery/real_soc")) {
         if let Ok(value) = raw.parse::<f32>() {
-            if value.is_finite()
-                && (0.0..=100.0).contains(&value)
-            {
+            if value.is_finite() && (0.0..=100.0).contains(&value) {
                 return Ok(value);
             }
         }
@@ -118,31 +93,15 @@ pub fn read_capacity_raw() -> Result<f32, ChargerError> {
 
 /// Read charger/input current in microamps.
 pub fn read_input_current_ua() -> Result<i64, ChargerError> {
-    let mut last_parse_error = false;
-
     for path in INPUT_CURRENT_NODES {
         if let Ok(raw) = read_sysfs(Path::new(path)) {
-            match raw.parse::<i64>() {
-                Ok(value) => {
-                    return Ok(value);
-                }
-
-                Err(_) => {
-                    last_parse_error = true;
-                }
+            if let Ok(value) = raw.parse::<i64>() {
+                return Ok(value);
             }
         }
     }
 
-    if last_parse_error {
-        Err(ChargerError::ParseError(
-            "input_current_ua",
-        ))
-    } else {
-        Err(ChargerError::ParseError(
-            "input_current_ua",
-        ))
-    }
+    Err(ChargerError::ParseError("input_current_ua"))
 }
 
 /// Read battery current in microamps.
@@ -158,23 +117,15 @@ pub fn read_battery_current_ua() -> Result<i64, ChargerError> {
         }
     }
 
-    Err(ChargerError::ParseError(
-        "battery_current_ua",
-    ))
+    Err(ChargerError::ParseError("battery_current_ua"))
 }
 
 /// Read battery voltage in microvolts.
 pub fn read_voltage_uv() -> Result<u32, ChargerError> {
-    let raw = read_sysfs(
-        Path::new(
-            "/sys/class/power_supply/battery/voltage_now",
-        ),
-    )?;
+    let raw = read_sysfs(Path::new("/sys/class/power_supply/battery/voltage_now"))?;
 
     raw.parse::<u32>()
-        .map_err(|_| {
-            ChargerError::ParseError("voltage_now")
-        })
+        .map_err(|_| ChargerError::ParseError("voltage_now"))
 }
 
 /// Read battery temperature in deci-Celsius.
@@ -217,11 +168,7 @@ pub fn read_charge_full_design() -> Result<u32, ChargerError> {
                 // Most power_supply nodes expose uAh.
                 //
                 // Smaller values are assumed to already be mAh.
-                let mah = if value > 100_000 {
-                    value / 1000
-                } else {
-                    value
-                };
+                let mah = if value > 100_000 { value / 1000 } else { value };
 
                 if mah > 0 {
                     return Ok(mah);
@@ -230,9 +177,7 @@ pub fn read_charge_full_design() -> Result<u32, ChargerError> {
         }
     }
 
-    Err(ChargerError::ParseError(
-        "charge_full_design",
-    ))
+    Err(ChargerError::ParseError("charge_full_design"))
 }
 
 /// Read battery cycle count.
@@ -251,9 +196,7 @@ pub fn read_cycle_count() -> Result<u32, ChargerError> {
         }
     }
 
-    Err(ChargerError::ParseError(
-        "cycle_count",
-    ))
+    Err(ChargerError::ParseError("cycle_count"))
 }
 
 /// Read battery chemistry / technology.
@@ -285,12 +228,8 @@ pub fn read_technology() -> Result<String, ChargerError> {
 ///
 /// result:
 ///     watts
-pub fn calc_wattage_w(
-    voltage_uv: u32,
-    current_ma: f32,
-) -> f32 {
-    (voltage_uv as f32 / 1_000_000.0)
-        * (current_ma / 1000.0)
+pub fn calc_wattage_w(voltage_uv: u32, current_ma: f32) -> f32 {
+    (voltage_uv as f32 / 1_000_000.0) * (current_ma / 1000.0)
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -304,12 +243,7 @@ pub enum PowerState {
 
 impl PowerState {
     pub fn is_plugged_in(&self) -> bool {
-        matches!(
-            self,
-            Self::Attached
-                | Self::Connected
-                | Self::Charging
-        )
+        matches!(self, Self::Attached | Self::Connected | Self::Charging)
     }
 
     pub fn is_charging(&self) -> bool {
@@ -331,15 +265,11 @@ impl PowerState {
 /// AC is still treated as the primary source of truth because USB Type-C
 /// attach can happen before the charger is actually online.
 pub fn get_power_state() -> Result<PowerState, ChargerError> {
-    let ac_online = read_sysfs(
-        Path::new(AC_ONLINE_NODE),
-    )?;
+    let ac_online = read_sysfs(Path::new(AC_ONLINE_NODE))?;
 
     if ac_online == "1" {
-        let status = read_sysfs(
-            Path::new(BATTERY_STATUS_NODE),
-        )
-        .unwrap_or_else(|_| "Unknown".to_string());
+        let status =
+            read_sysfs(Path::new(BATTERY_STATUS_NODE)).unwrap_or_else(|_| "Unknown".to_string());
 
         if status.eq_ignore_ascii_case("Charging") {
             return Ok(PowerState::Charging);
@@ -349,9 +279,7 @@ pub fn get_power_state() -> Result<PowerState, ChargerError> {
     }
 
     // Early USB Type-C attach hint.
-    if let Ok(typec) = read_sysfs(
-        Path::new(USB_TYPEC_MODE_NODE),
-    ) {
+    if let Ok(typec) = read_sysfs(Path::new(USB_TYPEC_MODE_NODE)) {
         if typec.contains("Source attached") {
             return Ok(PowerState::Attached);
         }
