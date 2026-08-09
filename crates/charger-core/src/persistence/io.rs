@@ -3,22 +3,23 @@ use crate::error::ChargerError;
 use std::fs;
 
 pub trait PersistenceIo: Send + Sync {
-    fn read_state(&self, path: &Path) -> Result<String, ChargerError>;
-    fn write_state(&self, path: &Path, content: &str) -> Result<(), ChargerError>;
-    fn delete_state(&self, path: &Path) -> Result<(), ChargerError>;
+    fn read(&self, path: &Path) -> Result<String, ChargerError>;
+    fn atomic_write(&self, path: &Path, contents: &[u8]) -> Result<(), ChargerError>;
+    fn remove(&self, path: &Path) -> Result<(), ChargerError>;
+    fn exists(&self, path: &Path) -> bool;
 }
 
 pub struct FilePersistenceIo;
 
 impl PersistenceIo for FilePersistenceIo {
-    fn read_state(&self, path: &Path) -> Result<String, ChargerError> {
+    fn read(&self, path: &Path) -> Result<String, ChargerError> {
         fs::read_to_string(path).map_err(|e| ChargerError::StateError {
             path: path.to_path_buf(),
             source: e,
         })
     }
 
-    fn write_state(&self, path: &Path, content: &str) -> Result<(), ChargerError> {
+    fn atomic_write(&self, path: &Path, contents: &[u8]) -> Result<(), ChargerError> {
         if let Some(parent) = path.parent() {
             if let Err(e) = fs::create_dir_all(parent) {
                 return Err(ChargerError::StateError {
@@ -29,7 +30,7 @@ impl PersistenceIo for FilePersistenceIo {
         }
 
         let tmp = path.with_extension("tmp");
-        fs::write(&tmp, content).map_err(|e| ChargerError::StateError {
+        fs::write(&tmp, contents).map_err(|e| ChargerError::StateError {
             path: tmp.clone(),
             source: e,
         })?;
@@ -43,11 +44,15 @@ impl PersistenceIo for FilePersistenceIo {
         })
     }
 
-    fn delete_state(&self, path: &Path) -> Result<(), ChargerError> {
+    fn remove(&self, path: &Path) -> Result<(), ChargerError> {
         fs::remove_file(path).map_err(|e| ChargerError::StateError {
             path: path.to_path_buf(),
             source: e,
         })
+    }
+
+    fn exists(&self, path: &Path) -> bool {
+        path.exists()
     }
 }
 
@@ -55,6 +60,7 @@ impl PersistenceIo for FilePersistenceIo {
 pub mod testing {
     use super::*;
     use std::collections::HashMap;
+    use std::path::PathBuf;
     use std::sync::{Arc, Mutex};
 
     #[derive(Clone)]
@@ -62,6 +68,12 @@ pub mod testing {
         states: Arc<Mutex<HashMap<PathBuf, String>>>,
         read_errors: Arc<Mutex<HashMap<PathBuf, std::io::ErrorKind>>>,
         write_errors: Arc<Mutex<HashMap<PathBuf, std::io::ErrorKind>>>,
+    }
+
+    impl Default for MockPersistenceIo {
+        fn default() -> Self {
+            Self::new()
+        }
     }
 
     impl MockPersistenceIo {
@@ -83,7 +95,7 @@ pub mod testing {
     }
 
     impl PersistenceIo for MockPersistenceIo {
-        fn read_state(&self, path: &Path) -> Result<String, ChargerError> {
+        fn read(&self, path: &Path) -> Result<String, ChargerError> {
             if let Some(err) = self.read_errors.lock().unwrap().get(path) {
                 return Err(ChargerError::StateError {
                     path: path.to_path_buf(),
@@ -102,7 +114,7 @@ pub mod testing {
                 })
         }
 
-        fn write_state(&self, path: &Path, content: &str) -> Result<(), ChargerError> {
+        fn atomic_write(&self, path: &Path, contents: &[u8]) -> Result<(), ChargerError> {
             if let Some(err) = self.write_errors.lock().unwrap().get(path) {
                 return Err(ChargerError::StateError {
                     path: path.to_path_buf(),
@@ -110,13 +122,17 @@ pub mod testing {
                 });
             }
 
-            self.states.lock().unwrap().insert(path.to_path_buf(), content.to_string());
+            self.states.lock().unwrap().insert(path.to_path_buf(), String::from_utf8_lossy(contents).into_owned());
             Ok(())
         }
 
-        fn delete_state(&self, path: &Path) -> Result<(), ChargerError> {
+        fn remove(&self, path: &Path) -> Result<(), ChargerError> {
             self.states.lock().unwrap().remove(path);
             Ok(())
+        }
+
+        fn exists(&self, path: &Path) -> bool {
+            self.states.lock().unwrap().contains_key(path)
         }
     }
 }

@@ -1,6 +1,6 @@
 use crate::battery::control;
 
-use crate::persistence::ownership::{clear_persistent_ownership, recover_stale_ownership, save_persistent_ownership, Ownership, RecoveryStatus};
+use crate::persistence::ownership::{clear_persistent_ownership, Ownership};
 use std::time::{Duration, Instant};
 use std::sync::Arc;
 use crate::hardware::io::HardwareIo;
@@ -29,9 +29,16 @@ pub enum HardwareTarget {
     Unmanaged,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HardwareEffect {
+    None,
+    ChargingEnabled,
+    ChargingDisabled,
+    Unknown,
+}
+
 #[derive(Debug, PartialEq, Eq, Clone, Copy)]
 pub enum SyncState {
-    Recovering,
     Unknown,
     Pending,
     Synced,
@@ -44,8 +51,6 @@ pub enum ControllerEvent {
     ApplyFailed,
     VerificationFailed(u8),
     VerificationSuccess,
-    Recovered,
-    RecoveryFailed,
     ExternalModificationDetected,
 }
 
@@ -56,12 +61,13 @@ struct Verification {
 }
 
 pub struct HardwareController {
-    pub profile: &'static crate::hardware::profile::HardwareProfile,
+    pub profile: Arc<crate::hardware::profile::HardwareProfile>,
     pub hw_io: Arc<dyn HardwareIo>,
     pub pers_io: Arc<dyn PersistenceIo>,
     pub clock: Arc<dyn Clock>,
     pub desired_target: HardwareTarget,
     pub applied_target: HardwareTarget,
+    pub effect: HardwareEffect,
     pub sync: SyncState,
     pub force_apply: bool,
     pub ownership: Ownership,
@@ -74,11 +80,11 @@ pub struct HardwareController {
 }
 
 impl HardwareController {
-    pub fn new(profile: &'static crate::hardware::profile::HardwareProfile, hw_io: Arc<dyn HardwareIo>, pers_io: Arc<dyn PersistenceIo>, clock: Arc<dyn Clock>) -> Self {
+    pub fn new(profile: Arc<crate::hardware::profile::HardwareProfile>, hw_io: Arc<dyn HardwareIo>, pers_io: Arc<dyn PersistenceIo>, clock: Arc<dyn Clock>) -> Self {
         Self::with_initial_sync(SyncState::Unknown, profile, hw_io, pers_io, clock)
     }
 
-    pub fn with_initial_sync(sync: SyncState, profile: &'static crate::hardware::profile::HardwareProfile, hw_io: Arc<dyn HardwareIo>, pers_io: Arc<dyn PersistenceIo>, clock: Arc<dyn Clock>) -> Self {
+    pub fn with_initial_sync(sync: SyncState, profile: Arc<crate::hardware::profile::HardwareProfile>, hw_io: Arc<dyn HardwareIo>, pers_io: Arc<dyn PersistenceIo>, clock: Arc<dyn Clock>) -> Self {
         Self {
             profile,
             hw_io,
@@ -86,6 +92,7 @@ impl HardwareController {
             clock,
             desired_target: HardwareTarget::Unmanaged,
             applied_target: HardwareTarget::Unmanaged,
+            effect: HardwareEffect::None,
             sync,
             force_apply: true,
             ownership: Ownership::NotOwned,
@@ -144,35 +151,14 @@ impl HardwareController {
             return true;
         }
 
-        if self.sync == SyncState::Recovering {
-            return true;
-        }
-
         self.applied_target != target
     }
 
-    pub fn attempt_recovery(&mut self) -> Vec<ControllerEvent> {
-        let mut events = Vec::new();
-        match recover_stale_ownership(self.profile, &*self.hw_io, &*self.pers_io) {
-            Ok(RecoveryStatus::Recovered) | Ok(RecoveryStatus::NotNeeded) => {
-                self.sync = SyncState::Unknown;
-                self.force_apply = true;
-                self.retry_at = None;
-                events.push(ControllerEvent::Recovered);
-            }
-            Err(_) => {
-                self.mark_apply_failed();
-                events.push(ControllerEvent::RecoveryFailed);
-            }
-        }
-        events
+    pub fn is_owned(&self) -> bool {
+        matches!(self.ownership, Ownership::Owned { .. })
     }
 
     pub fn apply_target(&mut self, target: HardwareTarget) -> Vec<ControllerEvent> {
-        if self.sync == SyncState::Recovering {
-            return self.attempt_recovery();
-        }
-
         self.desired_target = target;
 
         match target {
@@ -197,7 +183,7 @@ impl HardwareController {
     ) -> Vec<ControllerEvent> {
         let mut events = Vec::new();
         if self.ownership == Ownership::NotOwned {
-            match control::is_charging_enabled(self.profile, &*self.hw_io) {
+            match control::is_charging_enabled(&self.profile, &*self.hw_io) {
                 Ok(original) => {
                     tracing::info!(
                         "Taking hardware ownership. \
@@ -205,9 +191,17 @@ impl HardwareController {
                         original
                     );
 
-                    if let Err(e) = save_persistent_ownership(original, &*self.pers_io) {
+                    let record = crate::persistence::ownership::OwnershipRecord {
+                        version: 1,
+                        generation: self.generation,
+                        original_charging: original,
+                        target_charging: enable,
+                        phase: crate::persistence::ownership::OwnershipPhase::Acquiring,
+                    };
+
+                    if let Err(e) = crate::persistence::ownership::save_persistent_ownership(&record, &*self.pers_io) {
                         tracing::error!(
-                            "Cannot persist hardware ownership: {}",
+                            "Cannot persist hardware ownership phase Acquiring: {}",
                             e
                         );
 
@@ -234,20 +228,43 @@ impl HardwareController {
             }
         }
 
-        match control::set_charging(enable, self.profile, &*self.hw_io) {
+        match control::set_charging(enable, &self.profile, &*self.hw_io) {
             Ok(res) if res.all_succeeded() => {
                 tracing::info!(
-                    "Hardware charging set to {} successfully: {}/{} nodes",
+                    "Hardware charging set to {}: {}/{} nodes succeeded",
                     enable, res.succeeded, res.attempted
                 );
 
-                self.mark_apply_success(target);
+                if let Ownership::Owned { original_charging } = self.ownership {
+                    let record = crate::persistence::ownership::OwnershipRecord {
+                        version: 1,
+                        generation: self.generation,
+                        original_charging,
+                        target_charging: enable,
+                        phase: crate::persistence::ownership::OwnershipPhase::Owned,
+                    };
+                    if let Err(e) = crate::persistence::ownership::save_persistent_ownership(&record, &*self.pers_io) {
+                        tracing::error!("Failed to persist hardware ownership phase Owned: {}", e);
+                    }
+                }
+
+                self.mark_apply_success(target, false);
                 events.push(ControllerEvent::ApplySuccess(target));
+            }
+
+            Ok(res) if res.partial_failure() => {
+                tracing::error!(
+                    "Hardware charging partially applied: {}/{} succeeded, {} failed",
+                    res.succeeded, res.attempted, res.failed
+                );
+
+                self.mark_apply_failed();
+                events.push(ControllerEvent::ApplyFailed);
             }
 
             Ok(res) => {
                 tracing::error!(
-                    "Partial charging control failure: {}/{} succeeded, {} failed",
+                    "Charging control completely failed: {}/{} succeeded, {} failed",
                     res.succeeded, res.attempted, res.failed
                 );
 
@@ -284,12 +301,23 @@ impl HardwareController {
 
         match original {
             Some(original_charging) => {
-                match control::set_charging(original_charging, self.profile, &*self.hw_io) {
+                let record = crate::persistence::ownership::OwnershipRecord {
+                    version: 1,
+                    generation: self.generation,
+                    original_charging,
+                    target_charging: original_charging,
+                    phase: crate::persistence::ownership::OwnershipPhase::Releasing,
+                };
+                if let Err(e) = crate::persistence::ownership::save_persistent_ownership(&record, &*self.pers_io) {
+                    tracing::error!("Failed to persist hardware ownership phase Releasing: {}", e);
+                }
+
+                match control::set_charging(original_charging, &self.profile, &*self.hw_io) {
                     Ok(res) if res.all_succeeded() => {
                         tracing::info!(
                             "Released ownership and restored \
-                             original charging state: {}",
-                            original_charging
+                             original charging state: {} (succeeded: {}/{})",
+                            original_charging, res.succeeded, res.attempted
                         );
 
                         clear_persistent_ownership(&*self.pers_io);
@@ -301,14 +329,29 @@ impl HardwareController {
                             HardwareTarget::Unmanaged;
 
                         self.sync = SyncState::Synced;
+                        self.effect = HardwareEffect::None;
                         self.force_apply = false;
                         self.failed_attempts = 0;
                         events.push(ControllerEvent::ApplySuccess(HardwareTarget::Unmanaged));
                     }
 
-                    Ok(res) => {
+                    Ok(res) if res.partial_failure() => {
                         tracing::error!(
                             "Partial failure restoring original charging \
+                             state: {}/{} succeeded, {} failed",
+                            res.succeeded, res.attempted, res.failed
+                        );
+
+                        self.sync = SyncState::Failed;
+                        self.force_apply = true;
+                        self.retry_at =
+                            Some(self.clock.now() + RETRY_BACKOFF[0]);
+                        events.push(ControllerEvent::ApplyFailed);
+                    }
+
+                    Ok(res) => {
+                        tracing::error!(
+                            "Complete failure restoring original charging \
                              state: {}/{} succeeded, {} failed",
                             res.succeeded, res.attempted, res.failed
                         );
@@ -344,6 +387,7 @@ impl HardwareController {
                     HardwareTarget::Unmanaged;
 
                 self.sync = SyncState::Synced;
+                self.effect = HardwareEffect::None;
                 self.force_apply = false;
                 events.push(ControllerEvent::ApplySuccess(HardwareTarget::Unmanaged));
             }
@@ -355,8 +399,20 @@ impl HardwareController {
     fn mark_apply_success(
         &mut self,
         target: HardwareTarget,
+        partial: bool,
     ) {
         self.applied_target = target;
+        
+        self.effect = if partial {
+            HardwareEffect::Unknown
+        } else {
+            match target {
+                HardwareTarget::ChargingEnabled => HardwareEffect::ChargingEnabled,
+                HardwareTarget::ChargingDisabled => HardwareEffect::ChargingDisabled,
+                HardwareTarget::Unmanaged => HardwareEffect::None,
+            }
+        };
+
         self.force_apply = false;
         self.sync = SyncState::Pending;
 
@@ -429,10 +485,8 @@ impl HardwareController {
 
         let success = match target {
             HardwareTarget::ChargingEnabled => {
-                match control::read_charging_state(self.profile, &*self.hw_io) {
-                    Ok(control::ChargingState::Enabled) => {
-                        snapshot.online == Some(true)
-                    }
+                match control::read_charging_state(&self.profile, &*self.hw_io) {
+                    Ok(control::ChargingState::Enabled) => true,
 
                     Ok(control::ChargingState::Disabled) => false,
 
@@ -453,10 +507,10 @@ impl HardwareController {
             }
 
             HardwareTarget::ChargingDisabled => {
-                let current_safe = snapshot.current_ma
+                let current_safe = snapshot.battery_current_ma
                     .is_some_and(|current| current <= 100);
 
-                match control::read_charging_state(self.profile, &*self.hw_io) {
+                match control::read_charging_state(&self.profile, &*self.hw_io) {
                     Ok(control::ChargingState::Disabled) => current_safe,
 
                     Ok(control::ChargingState::Enabled) => false,
@@ -487,6 +541,11 @@ impl HardwareController {
             );
 
             self.sync = SyncState::Synced;
+            self.effect = match target {
+                HardwareTarget::ChargingEnabled => HardwareEffect::ChargingEnabled,
+                HardwareTarget::ChargingDisabled => HardwareEffect::ChargingDisabled,
+                HardwareTarget::Unmanaged => HardwareEffect::None,
+            };
             self.verification = None;
             self.verification_failures = 0;
             self.failed_attempts = 0;
@@ -557,19 +616,33 @@ impl HardwareController {
 
         match self.applied_target {
             HardwareTarget::ChargingEnabled => {
-                if let Ok(control::ChargingState::Disabled) | Ok(control::ChargingState::Mixed) = control::read_charging_state(self.profile, &*self.hw_io) {
-                    tracing::warn!("External hardware modification detected (charging disabled/mixed). Re-syncing.");
-                    self.sync = SyncState::Unknown;
-                    self.force_apply = true;
-                    events.push(ControllerEvent::ExternalModificationDetected);
+                match control::read_charging_state(&self.profile, &*self.hw_io) {
+                    Ok(control::ChargingState::Disabled) => {
+                        tracing::warn!("External hardware modification detected (charging disabled). Re-syncing.");
+                        self.sync = SyncState::Unknown;
+                        self.force_apply = true;
+                        events.push(ControllerEvent::ExternalModificationDetected);
+                    }
+                    Ok(control::ChargingState::Mixed) => {
+                        tracing::warn!("Hardware state is Mixed (uncertain). Waiting for next verification.");
+                        self.sync = SyncState::Unknown;
+                    }
+                    _ => {}
                 }
             }
             HardwareTarget::ChargingDisabled => {
-                if let Ok(control::ChargingState::Enabled) | Ok(control::ChargingState::Mixed) = control::read_charging_state(self.profile, &*self.hw_io) {
-                    tracing::warn!("External hardware modification detected (charging enabled/mixed). Re-syncing.");
-                    self.sync = SyncState::Unknown;
-                    self.force_apply = true;
-                    events.push(ControllerEvent::ExternalModificationDetected);
+                match control::read_charging_state(&self.profile, &*self.hw_io) {
+                    Ok(control::ChargingState::Enabled) => {
+                        tracing::warn!("External hardware modification detected (charging enabled). Re-syncing.");
+                        self.sync = SyncState::Unknown;
+                        self.force_apply = true;
+                        events.push(ControllerEvent::ExternalModificationDetected);
+                    }
+                    Ok(control::ChargingState::Mixed) => {
+                        tracing::warn!("Hardware state is Mixed (uncertain). Waiting for next verification.");
+                        self.sync = SyncState::Unknown;
+                    }
+                    _ => {}
                 }
             }
             HardwareTarget::Unmanaged => {}
@@ -590,11 +663,22 @@ impl HardwareController {
             return;
         };
 
-        match control::set_charging(original_charging, self.profile, &*self.hw_io) {
+        let record = crate::persistence::ownership::OwnershipRecord {
+            version: 1,
+            generation: self.generation,
+            original_charging,
+            target_charging: original_charging,
+            phase: crate::persistence::ownership::OwnershipPhase::Releasing,
+        };
+        if let Err(e) = crate::persistence::ownership::save_persistent_ownership(&record, &*self.pers_io) {
+            tracing::error!("Failed to persist hardware ownership phase Releasing during shutdown: {}", e);
+        }
+
+        match control::set_charging(original_charging, &self.profile, &*self.hw_io) {
             Ok(res) if res.all_succeeded() => {
                 tracing::info!(
-                    "Shutdown: restored original charging state: {}",
-                    original_charging
+                    "Shutdown: restored original charging state: {} (succeeded: {}/{})",
+                    original_charging, res.succeeded, res.attempted
                 );
 
                 clear_persistent_ownership(&*self.pers_io);
@@ -610,9 +694,20 @@ impl HardwareController {
                 self.retry_at = None;
             }
 
-            Ok(res) => {
+            Ok(res) if res.partial_failure() => {
                 tracing::error!(
                     "Partial failure restoring charging state during shutdown: \
+                     {}/{} succeeded, {} failed",
+                    res.succeeded, res.attempted, res.failed
+                );
+
+                self.sync = SyncState::Failed;
+                self.force_apply = true;
+            }
+
+            Ok(res) => {
+                tracing::error!(
+                    "Complete failure restoring charging state during shutdown: \
                      {}/{} succeeded, {} failed",
                     res.succeeded, res.attempted, res.failed
                 );

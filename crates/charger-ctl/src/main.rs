@@ -70,12 +70,12 @@ fn run_app() -> Result<(), ChargerError> {
         Commands::Nodes => {
             let profile = &charger_core::hardware::profile::GENERIC_PROFILE;
             println!("Profile: {}", profile.name);
-            println!("Charging nodes ({} configured):", profile.charging_nodes.len());
-            for node in profile.charging_nodes {
+            println!("Charging nodes ({} configured):", profile.control.charging_nodes.len());
+            for node in profile.control.charging_nodes {
                 println!("  - {:?}", node);
             }
-            println!("Suspend nodes ({} configured):", profile.suspend_nodes.len());
-            for node in profile.suspend_nodes {
+            println!("Suspend nodes ({} configured):", profile.control.suspend_nodes.len());
+            for node in profile.control.suspend_nodes {
                 println!("  - {:?}", node);
             }
         }

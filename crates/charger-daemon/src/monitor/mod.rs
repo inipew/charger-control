@@ -1,7 +1,168 @@
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ChargerPresence {
+    Online,
+    Offline,
+    Unknown,
+}
+
+const OFFLINE_CONFIRMATIONS: u8 = 3;
+const OFFLINE_CONFIRM_DURATION: std::time::Duration = std::time::Duration::from_secs(2);
+
+pub struct PresenceTracker {
+    pub current_presence: ChargerPresence,
+    offline_candidate_since: Option<std::time::Instant>,
+    consecutive_false_reads: u8,
+    inhibited_until: Option<std::time::Instant>,
+    last_target: charger_core::hardware::controller::HardwareTarget,
+}
+
+impl PresenceTracker {
+    pub fn new() -> Self {
+        Self {
+            current_presence: ChargerPresence::Unknown,
+            offline_candidate_since: None,
+            consecutive_false_reads: 0,
+            inhibited_until: None,
+            last_target: charger_core::hardware::controller::HardwareTarget::Unmanaged,
+        }
+    }
+
+    pub fn on_hardware_transition(
+        &mut self,
+        target: charger_core::hardware::controller::HardwareTarget,
+        now: std::time::Instant,
+    ) {
+        self.last_target = target;
+        match target {
+            charger_core::hardware::controller::HardwareTarget::ChargingEnabled
+            | charger_core::hardware::controller::HardwareTarget::ChargingDisabled => {
+                self.inhibited_until = Some(now + std::time::Duration::from_secs(2));
+                self.reset_offline_candidate();
+            }
+            charger_core::hardware::controller::HardwareTarget::Unmanaged => {}
+        }
+    }
+
+    /// Perbarui state presence berdasarkan sinyal mentah dan profile.
+    ///
+    /// Prioritas:
+    /// 1. `OnlineReading::Online/Offline` → authoritative, langsung tentukan presence
+    ///    (tidak dipengaruhi transisi PMIC atau self_induced_offline)
+    /// 2. `OnlineReading::Unavailable` → fallback ke input_current_ma
+    /// 3. `OnlineReading::Error` → Unknown (node ada tapi tidak bisa dibaca)
+    pub fn update(
+        &mut self,
+        reading: &charger_core::battery::reader::PresenceReading,
+        profile: &charger_core::hardware::profile::PresenceProfile,
+        now: std::time::Instant,
+    ) -> ChargerPresence {
+        use charger_core::battery::reader::OnlineReading;
+
+        match reading.online {
+            OnlineReading::Online => {
+                // Online node terbaca "1" — authoritative, langsung Online
+                self.current_presence = ChargerPresence::Online;
+                self.reset_offline_candidate();
+                return self.current_presence;
+            }
+            OnlineReading::Offline => {
+                // Online node terbaca "0" — authoritative, debounce ke Offline
+                // self_induced_offline TIDAK berlaku di sini: online node adalah sinyal
+                // yang independen dari charging control state
+                self.advance_offline_debounce(now);
+                return self.current_presence;
+            }
+            OnlineReading::Error => {
+                // Node terkonfigurasi tapi gagal dibaca — Unknown
+                // Jangan fallback ke input_current; jangan pura-pura node tidak ada
+                self.current_presence = ChargerPresence::Unknown;
+                self.reset_offline_candidate();
+                return self.current_presence;
+            }
+            OnlineReading::Unavailable => {
+                // Tidak ada online node di profile → fallback ke input_current_ma
+            }
+        }
+
+        // Fallback: gunakan input_current_ma dengan threshold dari PresenceProfile
+        let online_threshold = match profile.input_online_threshold_ma {
+            Some(t) => t,
+            None => {
+                // Profile tidak mengkonfigurasi presence via current → Unknown
+                self.current_presence = ChargerPresence::Unknown;
+                return ChargerPresence::Unknown;
+            }
+        };
+        let offline_threshold = profile.input_offline_threshold_ma
+            .unwrap_or(online_threshold);
+
+        match reading.input_current_ma {
+            None => {
+                // Sensor failure → Unknown, BUKAN Offline.
+                // "Sensor tidak terbaca" ≠ "charger tidak ada".
+                self.current_presence = ChargerPresence::Unknown;
+                self.reset_offline_candidate();
+            }
+            Some(ma) if ma >= online_threshold => {
+                // Arus input kuat → Online langsung (asimetris)
+                self.current_presence = ChargerPresence::Online;
+                self.reset_offline_candidate();
+            }
+            Some(ma) if ma <= offline_threshold => {
+                if self.inhibited_until.is_some_and(|deadline| now < deadline) {
+                    // Jangan simpulkan Offline selama masa transisi PMIC
+                    return self.current_presence;
+                }
+                
+                if self.last_target == charger_core::hardware::controller::HardwareTarget::ChargingDisabled {
+                    // Daemon sendiri yang mematikan charging → main/current_now turun ke 0,
+                    // tapi kabel mungkin masih terpasang → Unknown (bukan Offline)
+                    self.current_presence = ChargerPresence::Unknown;
+                    self.reset_offline_candidate();
+                } else {
+                    self.advance_offline_debounce(now);
+                }
+            }
+            Some(_) => {
+                // Dead-band (offline_threshold < ma < online_threshold):
+                // pertahankan state sebelumnya, tidak reset debounce
+            }
+        }
+        self.current_presence
+    }
+
+    fn advance_offline_debounce(&mut self, now: std::time::Instant) {
+        if self.current_presence != ChargerPresence::Offline {
+            self.consecutive_false_reads =
+                self.consecutive_false_reads.saturating_add(1);
+            if self.offline_candidate_since.is_none() {
+                self.offline_candidate_since = Some(now);
+            }
+            // Kedua syarat HARUS terpenuhi: jumlah sample DAN durasi
+            let elapsed = now.saturating_duration_since(
+                self.offline_candidate_since.unwrap()
+            );
+            if self.consecutive_false_reads >= OFFLINE_CONFIRMATIONS
+                && elapsed >= OFFLINE_CONFIRM_DURATION
+            {
+                self.current_presence = ChargerPresence::Offline;
+            }
+        }
+    }
+
+    fn reset_offline_candidate(&mut self) {
+        self.offline_candidate_since = None;
+        self.consecutive_false_reads = 0;
+    }
+}
+
+
 pub mod decision {
+    
     use charger_core::hardware::controller::HardwareTarget;
     use charger_core::battery::snapshot::SensorSnapshot;
     use charger_core::config::schema::Config;
+    use crate::monitor::ChargerPresence;
     use std::fmt;
 
     const FAULT_RECOVERY_READS: u8 = 3;
@@ -82,6 +243,7 @@ pub mod decision {
             &mut self,
             snapshot: &SensorSnapshot,
             cfg: &Config,
+            presence: ChargerPresence,
         ) -> Decision {
             if !cfg.enabled {
                 self.policy = ChargePolicyState::Disabled;
@@ -93,13 +255,29 @@ pub mod decision {
                 );
             }
 
-            if snapshot.online == Some(false) {
+            if presence == ChargerPresence::Offline {
                 self.policy = ChargePolicyState::Offline;
                 self.fault_recovery_reads = 0;
                 return Self::decision(
                     self.policy,
                     HardwareTarget::Unmanaged,
                     DecisionReason::ChargerOffline,
+                );
+            }
+
+            if presence == ChargerPresence::Unknown {
+                let (target, reason) = match self.policy {
+                    ChargePolicyState::Charging => (HardwareTarget::ChargingEnabled, DecisionReason::NormalCharging),
+                    ChargePolicyState::LimitReached => (HardwareTarget::ChargingDisabled, DecisionReason::ChargeLimitReached),
+                    ChargePolicyState::ThermalCutoff => (HardwareTarget::ChargingDisabled, DecisionReason::ThermalLimitReached),
+                    ChargePolicyState::Fault => (HardwareTarget::ChargingDisabled, DecisionReason::SensorFault),
+                    ChargePolicyState::Disabled => (HardwareTarget::Unmanaged, DecisionReason::DaemonDisabled),
+                    ChargePolicyState::Offline => (HardwareTarget::Unmanaged, DecisionReason::ChargerOffline),
+                };
+                return Self::decision(
+                    self.policy, // HOLD policy saat ini
+                    target,      // HOLD target saat ini
+                    reason,
                 );
             }
 
@@ -114,11 +292,10 @@ pub mod decision {
             );
 
             let capacity_valid = snapshot.capacity_pct.is_some_and(|c| c <= 100);
-            let temp_valid = snapshot.temp_dc.is_some_and(|t| t >= -200 && t <= 1500);
+            let temp_valid = snapshot.temp_dc.is_some_and(|t| (-200..=1500).contains(&t));
 
             let sensors_valid = capacity_valid
                 && temp_valid
-                && snapshot.online.is_some()
                 && status_valid;
 
             if !sensors_valid {
@@ -240,21 +417,16 @@ pub mod netlink {
         debounce_target: Option<Instant>,
     }
 
-    impl Default for NetlinkMonitor {
-        fn default() -> Self {
-            Self::new()
-        }
-    }
 
     impl NetlinkMonitor {
-        pub fn new() -> Self {
+        pub fn new(now: std::time::Instant) -> Self {
             let mut monitor = Self {
                 socket: None,
                 reconnect_at: None,
                 backoff: INITIAL_BACKOFF,
                 debounce_target: None,
             };
-            monitor.try_reconnect(Instant::now());
+            monitor.try_reconnect(now);
             monitor
         }
 
@@ -283,7 +455,7 @@ pub mod netlink {
             if self.socket.is_some() {
                 return false;
             }
-            self.reconnect_at.map_or(true, |deadline| now >= deadline)
+            self.reconnect_at.is_none_or(|deadline| now >= deadline)
         }
 
         pub fn try_reconnect(&mut self, now: Instant) -> bool {
@@ -410,6 +582,7 @@ pub mod netlink {
 }
 
 pub mod scheduler {
+    use super::ChargerPresence;
     use charger_core::battery::snapshot::SensorSnapshot;
     use charger_core::config::schema::Config;
     use std::collections::VecDeque;
@@ -494,11 +667,24 @@ pub mod scheduler {
             self.last_interval = MIN_INTERVAL;
         }
 
-        pub fn next_interval(&mut self, snapshot: &SensorSnapshot, netlink_alive: bool) -> Duration {
-            if snapshot.online == Some(false) {
-                self.last_interval = if netlink_alive { UNPLUGGED_HEARTBEAT } else { UNPLUGGED_HEARTBEAT_NO_NETLINK };
-                return self.last_interval;
+        pub fn next_interval(&mut self, snapshot: &SensorSnapshot, presence: ChargerPresence, netlink_alive: bool) -> Duration {
+            match presence {
+                ChargerPresence::Offline => {
+                    self.last_interval = if netlink_alive { UNPLUGGED_HEARTBEAT } else { UNPLUGGED_HEARTBEAT_NO_NETLINK };
+                    self.last_interval
+                }
+                ChargerPresence::Unknown => {
+                    self.last_interval = Duration::from_secs(5);
+                    self.last_interval
+                }
+                ChargerPresence::Online => {
+                    self.last_interval = self.calculate_eta(snapshot);
+                    self.last_interval
+                }
             }
+        }
+
+        fn calculate_eta(&self, snapshot: &SensorSnapshot) -> Duration {
 
             let target = match self.cap_rate_ema {
                 Some(rate) if rate < -0.01 => self.resume_limit,
@@ -535,8 +721,7 @@ pub mod scheduler {
                 }
             }
 
-            self.last_interval = interval.clamp(MIN_INTERVAL, MAX_INTERVAL);
-            self.last_interval
+            interval.clamp(MIN_INTERVAL, MAX_INTERVAL)
         }
 
         fn eta_to(current: Option<f32>, threshold: f32, rate: Option<f32>, safety: f32) -> Option<Duration> {
@@ -608,29 +793,84 @@ use charger_core::hardware::controller::{HardwareController, SyncState};
 use charger_core::battery::snapshot::SensorSnapshot;
 use charger_core::hardware::io::SysfsIo;
 use charger_core::persistence::io::FilePersistenceIo;
-use charger_core::time::SystemClock;
 
 use std::os::fd::AsRawFd;
 use std::os::unix::net::UnixDatagram;
 use std::sync::{Arc, RwLock};
-use std::time::Instant;
+use std::time::{Instant, Duration};
+
+const RECOVERY_BACKOFF: [Duration; 4] = [
+    Duration::from_secs(1),
+    Duration::from_secs(2),
+    Duration::from_secs(4),
+    Duration::from_secs(8),
+];
+
+#[derive(Debug, PartialEq, Eq)]
+enum RecoveryState {
+    NotNeeded,
+    Required,
+    Failed { attempts: u32, next_retry: Instant },
+    Done,
+}
+
+struct RecoveryManager {
+    state: RecoveryState,
+}
+
+impl RecoveryManager {
+    fn new(required: bool) -> Self {
+        Self {
+            state: if required { RecoveryState::Required } else { RecoveryState::NotNeeded },
+        }
+    }
+
+    fn should_recover(&self, now: Instant) -> bool {
+        match self.state {
+            RecoveryState::Required => true,
+            RecoveryState::Failed { next_retry, .. } => now >= next_retry,
+            _ => false,
+        }
+    }
+
+    fn mark_failed(&mut self, now: Instant) {
+        let attempts = match self.state {
+            RecoveryState::Failed { attempts, .. } => attempts + 1,
+            _ => 1,
+        };
+        let index = (attempts as usize - 1).min(RECOVERY_BACKOFF.len() - 1);
+        self.state = RecoveryState::Failed {
+            attempts,
+            next_retry: now + RECOVERY_BACKOFF[index],
+        };
+    }
+
+    fn mark_done(&mut self) {
+        self.state = RecoveryState::Done;
+    }
+
+    fn is_blocking(&self) -> bool {
+        !matches!(self.state, RecoveryState::NotNeeded | RecoveryState::Done)
+    }
+}
 
 pub fn run_monitor_loop(config: Arc<RwLock<Config>>, rx: UnixDatagram) {
     tracing::info!("Charging monitor started.");
 
     let hw_io = Arc::new(SysfsIo);
     let pers_io = Arc::new(FilePersistenceIo);
-    let clock = Arc::new(SystemClock);
+    let clock: Arc<dyn charger_core::time::Clock> = Arc::new(charger_core::time::SystemClock);
 
-    let initial_sync = match charger_core::persistence::ownership::recover_stale_ownership(&charger_core::hardware::profile::GENERIC_PROFILE, &*hw_io, &*pers_io) {
-        Ok(_) => SyncState::Unknown,
-        Err(_) => SyncState::Recovering,
-    };
+    let initial_recovery_required = charger_core::persistence::ownership::load_persistent_ownership(&*pers_io).is_some();
+    let mut recovery = RecoveryManager::new(initial_recovery_required);
+    let initial_sync = SyncState::Unknown;
 
-    let mut battery_reader = CachedReader::new(&charger_core::hardware::profile::GENERIC_PROFILE);
-    let mut netlink = NetlinkMonitor::new();
+    let profile = std::sync::Arc::new(charger_core::hardware::profile::DEVICE_PROFILE);
+    let mut battery_reader = CachedReader::new(profile.clone(), clock.clone());
+    let mut netlink = NetlinkMonitor::new(clock.now());
     let mut engine = DecisionEngine::new();
-    let mut hardware = HardwareController::with_initial_sync(initial_sync, &charger_core::hardware::profile::GENERIC_PROFILE, hw_io, pers_io, clock);
+    let mut presence_tracker = PresenceTracker::new();
+    let mut hardware = HardwareController::with_initial_sync(initial_sync, profile.clone(), hw_io.clone(), pers_io.clone(), clock.clone());
 
     let initial_cfg = config.read().unwrap_or_else(|e| e.into_inner()).clone();
 
@@ -660,17 +900,37 @@ pub fn run_monitor_loop(config: Arc<RwLock<Config>>, rx: UnixDatagram) {
     ];
 
     loop {
-        let now = Instant::now();
+        let now = clock.now();
         let cfg = config.read().unwrap_or_else(|e| e.into_inner()).clone();
         scheduler.sync_config(&cfg);
+
+        if recovery.should_recover(now) {
+            tracing::info!("Attempting to recover stale ownership...");
+            match charger_core::persistence::ownership::recover_stale_ownership(&profile, &*hw_io, &*pers_io) {
+                charger_core::persistence::ownership::RecoveryResult::Recovered |
+                charger_core::persistence::ownership::RecoveryResult::NotNeeded => {
+                    tracing::info!("Stale ownership recovery finished successfully.");
+                    recovery.mark_done();
+                    hardware.sync = SyncState::Unknown;
+                    hardware.force_apply = true;
+                    continue;
+                }
+                charger_core::persistence::ownership::RecoveryResult::Failed { .. } => {
+                    tracing::error!("Stale ownership recovery failed. Will retry.");
+                    recovery.mark_failed(now);
+                }
+            }
+        }
+
+        let presence_reading = battery_reader.read_presence();
 
         let snapshot = SensorSnapshot {
             capacity_pct: battery_reader.read_capacity().ok(),
             temp_dc: battery_reader.read_temperature_dc().ok(),
-            current_ma: battery_reader.read_current_ma().ok(),
+            battery_current_ma: battery_reader.read_battery_current_ma().ok(),
+            input_current_ma: presence_reading.input_current_ma,
             status: battery_reader.read_status().ok(),
-            online: battery_reader.is_plugged_in().ok(),
-            ts: Instant::now(),
+            ts: clock.now(),
         };
 
         if hardware.verification_due(now) {
@@ -682,7 +942,23 @@ pub fn run_monitor_loop(config: Arc<RwLock<Config>>, rx: UnixDatagram) {
             hardware.reconcile();
         }
 
-        let decision = engine.evaluate(&snapshot, &cfg);
+        let presence = presence_tracker.update(
+            &presence_reading,
+            &profile.sensor.presence,
+            now,
+        );
+
+        tracing::debug!(
+            "Presence Debug: input_ma={:?}, online_node={:?}, owned={}, sync={:?}, desired={:?}, presence={:?}",
+            presence_reading.input_current_ma,
+            presence_reading.online,
+            hardware.is_owned(),
+            hardware.sync,
+            hardware.desired_target,
+            presence,
+        );
+
+        let decision = engine.evaluate(&snapshot, &cfg, presence);
 
         tracing::debug!(
             "Decision: policy={:?}, target={:?}, reason={}",
@@ -706,28 +982,39 @@ pub fn run_monitor_loop(config: Arc<RwLock<Config>>, rx: UnixDatagram) {
             hardware.force_apply = true;
         }
 
-        if hardware.needs_apply(decision.target, now) {
-            tracing::info!(
-                "Applying hardware target: {:?} (sync={:?}, force={})",
-                decision.target,
-                hardware.sync,
-                hardware.force_apply
-            );
-            hardware.apply_target(decision.target);
+        if !recovery.is_blocking() {
+            if hardware.needs_apply(decision.target, now) {
+                tracing::info!(
+                    "Applying hardware target: {:?} (sync={:?}, force={})",
+                    decision.target,
+                    hardware.sync,
+                    hardware.force_apply
+                );
+                hardware.apply_target(decision.target);
+                
+                // Beri tahu tracker bahwa hardware baru saja berubah, agar PMIC transient diabaikan
+                presence_tracker.on_hardware_transition(decision.target, now);
+            }
+        } else {
+            tracing::debug!("Hardware apply blocked because recovery is in progress or failed.");
         }
 
         if netlink.should_reconnect(now) {
             netlink.try_reconnect(now);
         }
 
-        let mut target_wake = Instant::now() + scheduler.next_interval(&snapshot, netlink.is_connected());
+        let mut target_wake = clock.now() + scheduler.next_interval(&snapshot, presence, netlink.is_connected());
 
         if let Some(deadline) = hardware.next_deadline() {
             target_wake = target_wake.min(deadline);
         }
+        
+        if let RecoveryState::Failed { next_retry, .. } = recovery.state {
+            target_wake = target_wake.min(next_retry);
+        }
 
         loop {
-            let loop_now = Instant::now();
+            let loop_now = clock.now();
             if loop_now >= target_wake {
                 break;
             }
@@ -831,9 +1118,9 @@ pub fn run_monitor_loop(config: Arc<RwLock<Config>>, rx: UnixDatagram) {
                 if events & (libc::POLLERR | libc::POLLHUP | libc::POLLNVAL) != 0 {
                     tracing::warn!("Netlink socket error; reconnecting.");
                     netlink.disconnect();
-                    netlink.schedule_reconnect(Instant::now());
+                    netlink.schedule_reconnect(clock.now());
                 } else if events & libc::POLLIN != 0 {
-                    let event_now = Instant::now();
+                    let event_now = clock.now();
                     netlink.handle_events(event_now);
                     if netlink.debounce_due(event_now) {
                         battery_reader.invalidate_battery_fds();

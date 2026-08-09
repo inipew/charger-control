@@ -9,8 +9,8 @@ mod tests {
     use std::sync::Arc;
     use std::time::Instant;
 
-    fn create_test_profile() -> &'static crate::hardware::profile::HardwareProfile {
-        &crate::hardware::profile::GENERIC_PROFILE
+    fn create_test_profile() -> Arc<crate::hardware::profile::HardwareProfile> {
+        Arc::new(crate::hardware::profile::GENERIC_PROFILE)
     }
 
     #[test]
@@ -30,10 +30,13 @@ mod tests {
         
         // Should acquire ownership
         assert!(matches!(ctrl.ownership, Ownership::Owned { original_charging: true }));
-        // State file should be saved as "1"
-        assert_eq!(pers_io.read_state(std::path::Path::new("/data/adb/charger-control/ownership.state")).unwrap(), "1");
+        // State file should be saved as TOML OwnershipRecord
+        let state_str = pers_io.read(std::path::Path::new("/data/adb/charger-control/ownership.state")).unwrap();
+        let record: crate::persistence::ownership::OwnershipRecord = toml::from_str(&state_str).unwrap();
+        assert_eq!(record.phase, crate::persistence::ownership::OwnershipPhase::Owned);
+        assert!(record.original_charging);
         // Apply should succeed
-        assert!(events.contains(&ControllerEvent::ApplySuccess(HardwareTarget::ChargingDisabled)));
+        assert!(events.iter().any(|e| matches!(e, ControllerEvent::ApplySuccess(HardwareTarget::ChargingDisabled))));
         assert_eq!(ctrl.sync, SyncState::Pending);
 
         // Release ownership
@@ -42,8 +45,8 @@ mod tests {
         // Original charging state restored to 1
         assert_eq!(hw_io.read(std::path::Path::new("/sys/class/power_supply/battery/charging_enabled")).unwrap(), "1");
         // State file should be deleted
-        assert!(pers_io.read_state(std::path::Path::new("/data/adb/charger-control/ownership.state")).is_err());
-        assert!(events.contains(&ControllerEvent::ApplySuccess(HardwareTarget::Unmanaged)));
+        assert!(pers_io.read(std::path::Path::new("/data/adb/charger-control/ownership.state")).is_err());
+        assert!(events.iter().any(|e| matches!(e, ControllerEvent::ApplySuccess(HardwareTarget::Unmanaged))));
     }
 
     #[test]
@@ -60,7 +63,7 @@ mod tests {
 
         // Verify partial write means it's not synced
         assert_eq!(ctrl.sync, SyncState::Failed);
-        assert!(events.contains(&ControllerEvent::ApplyFailed));
+        assert!(events.iter().any(|e| matches!(e, ControllerEvent::ApplyFailed)));
     }
 
     #[test]
@@ -73,10 +76,10 @@ mod tests {
 
         hw_io.set_node(std::path::Path::new("/sys/class/power_supply/battery/charging_enabled"), "1");
         
-        let events = ctrl.apply_target(HardwareTarget::ChargingDisabled);
+        let _events = ctrl.apply_target(HardwareTarget::ChargingDisabled);
         assert_eq!(ctrl.sync, SyncState::Pending);
 
-        let mut snapshot = SensorSnapshot {
+        let snapshot = SensorSnapshot {
             online: Some(true),
             current_ma: Some(10),
             ..SensorSnapshot {
@@ -91,7 +94,7 @@ mod tests {
         hw_io.set_node(std::path::Path::new("/sys/class/power_supply/battery/charging_enabled"), "0"); // successfully disabled
 
         let events = ctrl.verify(&snapshot);
-        assert!(events.contains(&ControllerEvent::VerificationSuccess));
+        assert!(events.iter().any(|e| matches!(e, ControllerEvent::VerificationSuccess)));
         assert_eq!(ctrl.sync, SyncState::Synced); // remains synced
 
         // Now simulate external modification (charging enabled externally)
@@ -99,7 +102,7 @@ mod tests {
         
         // Next reconciliation detects mismatch
         let events = ctrl.reconcile();
-        assert!(events.contains(&ControllerEvent::ExternalModificationDetected));
+        assert!(events.iter().any(|e| matches!(e, ControllerEvent::ExternalModificationDetected)));
         assert_eq!(ctrl.sync, SyncState::Unknown);
     }
 }

@@ -35,7 +35,7 @@ pub fn read_current_ma(profile: &crate::hardware::profile::HardwareProfile) -> R
     let mut best_val: Option<i32> = None;
     let mut highest_prio: Option<u8> = None;
 
-    for node in profile.current_nodes {
+    for node in profile.sensor.current_nodes {
         if let Ok(raw) = read_sysfs(Path::new(node.path)) {
             if let Ok(value) = raw.parse::<i64>() {
                 if value == 0 {
@@ -171,6 +171,7 @@ pub fn is_plugged_in() -> Result<bool, ChargerError> {
 use std::fs::File;
 use std::io::{Read, Seek, SeekFrom};
 use std::time::{Duration, Instant};
+use std::sync::Arc;
 
 // ============================================================================
 // CachedReader
@@ -192,12 +193,37 @@ struct CurrentFd {
     file: File,
 }
 
-struct OnlineFd {
-    file: File,
+/// Hasil pembacaan online node sysfs ("1"/"0").
+/// Membedakan antara "node tidak terkonfigurasi" vs "node error saat dibaca".
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OnlineReading {
+    /// Tidak ada online node yang dikonfigurasi di profile.
+    /// Boleh fallback ke input_current sebagai sinyal presence.
+    Unavailable,
+    /// Node terbaca dengan nilai valid.
+    Online,
+    /// Node terbaca, tidak ada yang bernilai "1".
+    Offline,
+    /// Node terkonfigurasi tetapi gagal dibaca (I/O error, stale FD).
+    /// Jangan fallback ke input_current jika ini terjadi.
+    Error,
+}
+
+/// Sinyal mentah kehadiran charger sebelum diproses PresenceTracker.
+/// Reader mengumpulkan kedua sinyal ini; PresenceTracker yang menginterpretasinya.
+pub struct PresenceReading {
+    /// Arus input aktual (mA). None = sensor tidak tersedia/error.
+    /// None ≠ Offline; None berarti pembacaan gagal.
+    pub input_current_ma: Option<i32>,
+    /// Status online dari online node yang terkonfigurasi.
+    /// `Unavailable` = tidak ada node dikonfigurasi → boleh fallback ke input_current.
+    /// `Error` = node ada tapi gagal dibaca → jangan berpura-pura node tidak ada.
+    pub online: OnlineReading,
 }
 
 pub struct CachedReader {
-    profile: &'static crate::hardware::profile::HardwareProfile,
+    profile: Arc<crate::hardware::profile::HardwareProfile>,
+    clock: Arc<dyn crate::time::Clock>,
 
     capacity: BatteryFd,
     temperature: BatteryFd,
@@ -216,21 +242,16 @@ pub struct CachedReader {
      *   usb/current_now
      *
      * and the active node can change after reconnect/restart.
+     * All nodes are kept in one collection and filtered by CurrentRole.
      */
     current_fds: Vec<CurrentFd>,
 
     /*
-     * Online nodes are dynamic on Android.
-     *
-     * Examples:
-     *   usb/online
-     *   ac/online
-     *   mains/online
-     *   wireless/online
-     *
-     * Therefore these are also periodically rescanned.
+     * Online nodes from PresenceProfile.online_nodes.
+     * These are "1"/"0" sysfs nodes used as primary presence signal
+     * (higher priority than input_current).
      */
-    online_fds: Vec<OnlineFd>,
+    online_fds: Vec<File>,
 
     buf: [u8; READ_BUFFER_SIZE],
 
@@ -240,21 +261,26 @@ pub struct CachedReader {
 }
 
 impl CachedReader {
-    pub fn new(profile: &'static crate::hardware::profile::HardwareProfile) -> Self {
+    pub fn new(profile: Arc<crate::hardware::profile::HardwareProfile>, clock: Arc<dyn crate::time::Clock>) -> Self {
+        let capacity_path = profile.sensor.capacity_path;
+        let temperature_path = profile.sensor.temperature_path;
+        let status_path = profile.sensor.status_path;
+
         let mut reader = Self {
             profile,
-            capacity: BatteryFd { path: profile.capacity_path, file: None },
-            temperature: BatteryFd { path: profile.temperature_path, file: None },
-            status: BatteryFd { path: profile.status_path, file: None },
+            clock: clock.clone(),
+            capacity: BatteryFd { path: capacity_path, file: None },
+            temperature: BatteryFd { path: temperature_path, file: None },
+            status: BatteryFd { path: status_path, file: None },
 
             current_fds: Vec::new(),
             online_fds: Vec::new(),
 
             buf: [0; READ_BUFFER_SIZE],
 
-            next_battery_rescan: Instant::now(),
-            next_current_rescan: Instant::now(),
-            next_online_rescan: Instant::now(),
+            next_battery_rescan: clock.now(),
+            next_current_rescan: clock.now(),
+            next_online_rescan: clock.now(),
         };
 
         reader.rescan_battery_nodes();
@@ -273,7 +299,7 @@ impl CachedReader {
         self.temperature.file = None;
         self.status.file = None;
         // Also force a rescan immediately
-        self.next_battery_rescan = Instant::now();
+        self.next_battery_rescan = self.clock.now();
     }
 
     fn rescan_battery_nodes(&mut self) {
@@ -286,7 +312,7 @@ impl CachedReader {
         if self.status.file.is_none() {
             self.status.file = File::open(self.status.path).ok();
         }
-        self.next_battery_rescan = Instant::now() + BATTERY_RESCAN_INTERVAL;
+        self.next_battery_rescan = self.clock.now() + BATTERY_RESCAN_INTERVAL;
     }
 
     fn rescan_current_nodes(&mut self) {
@@ -301,7 +327,7 @@ impl CachedReader {
          */
         self.current_fds.clear();
 
-        for config in self.profile.current_nodes {
+        for config in self.profile.sensor.current_nodes {
             match File::open(config.path) {
                 Ok(file) => {
                     self.current_fds.push(CurrentFd { config: *config, file });
@@ -316,33 +342,33 @@ impl CachedReader {
             }
         }
 
-        self.next_current_rescan = Instant::now() + CURRENT_RESCAN_INTERVAL;
+        self.next_current_rescan = self.clock.now() + CURRENT_RESCAN_INTERVAL;
     }
 
     fn rescan_online_nodes(&mut self) {
         self.online_fds.clear();
 
-        for config in self.profile.online_nodes {
-            match File::open(config.path) {
+        for path in self.profile.sensor.presence.online_nodes {
+            match File::open(path) {
                 Ok(file) => {
-                    self.online_fds.push(OnlineFd { file });
+                    self.online_fds.push(file);
                 }
                 Err(e) => {
                     tracing::trace!(
                         "Online node unavailable: {}: {}",
-                        config.path,
+                        path,
                         e
                     );
                 }
             }
         }
 
-        self.next_online_rescan = Instant::now() + ONLINE_RESCAN_INTERVAL;
+        self.next_online_rescan = self.clock.now() + ONLINE_RESCAN_INTERVAL;
     }
 
     #[inline]
     fn maybe_rescan_nodes(&mut self) {
-        let now = Instant::now();
+        let now = self.clock.now();
 
         if now >= self.next_battery_rescan {
             self.rescan_battery_nodes();
@@ -452,18 +478,25 @@ impl CachedReader {
     // Current
     // ========================================================================
 
-    pub fn read_current_ma(&mut self) -> Result<i32, ChargerError> {
-        self.maybe_rescan_nodes();
+    // ========================================================================
+    // Current (by role)
+    // ========================================================================
 
-        if self.current_fds.is_empty() {
-            return Err(ChargerError::ParseError("No current nodes available"));
-        }
+    /// Internal helper: baca arus berdasarkan role (Battery atau Input).
+    /// Mengembalikan nilai dari node dengan priority tertinggi untuk role tersebut.
+    fn read_current_role(&mut self, role: crate::hardware::profile::CurrentRole) -> Result<i32, ChargerError> {
+
+        self.maybe_rescan_nodes();
 
         let mut best_val: Option<i32> = None;
         let mut highest_prio: Option<u8> = None;
         let mut stale_fd = false;
 
         for current_fd in &mut self.current_fds {
+            if current_fd.config.role != role {
+                continue;
+            }
+
             let result = Self::read_file(
                 &mut current_fd.file,
                 &mut self.buf,
@@ -471,6 +504,7 @@ impl CachedReader {
             );
 
             let Ok(s) = result else {
+                // Node gagal dibaca (stale FD, I/O error) — boleh coba node berikutnya
                 stale_fd = true;
                 continue;
             };
@@ -484,6 +518,8 @@ impl CachedReader {
                 CurrentUnit::MilliAmp => value as i32,
             };
 
+            // 0 adalah nilai valid — jangan skip atau fallback ke node priority lebih rendah.
+            // Fallback hanya terjadi jika node ini read-error/unavailable.
             let better = highest_prio
                 .map(|p| current_fd.config.priority > p)
                 .unwrap_or(true);
@@ -500,13 +536,6 @@ impl CachedReader {
             }
         }
 
-        /*
-         * A vendor node may disappear/reappear while the daemon is running.
-         *
-         * Do NOT reopen here.
-         *
-         * The next scheduled rescan will reopen it.
-         */
         if stale_fd {
             tracing::trace!(
                 "One or more current FDs became stale; \
@@ -515,6 +544,73 @@ impl CachedReader {
         }
 
         best_val.ok_or(ChargerError::ParseError("No valid current reading found in cache"))
+    }
+
+    /// Baca arus baterai aktual (mA). Sign bersifat vendor-specific — jangan dibalik.
+    pub fn read_battery_current_ma(&mut self) -> Result<i32, ChargerError> {
+        self.read_current_role(crate::hardware::profile::CurrentRole::Battery)
+    }
+
+    /// Baca arus input dari charger/USB (mA).
+    pub fn read_input_current_ma(&mut self) -> Result<i32, ChargerError> {
+        self.read_current_role(crate::hardware::profile::CurrentRole::Input)
+    }
+
+    // ========================================================================
+    // Online node (untuk PresenceReading)
+    // ========================================================================
+
+    /// Baca semua online nodes yang terkonfigurasi di PresenceProfile.
+    /// Membedakan antara node tidak dikonfigurasi (Unavailable) vs error pembacaan (Error).
+    fn read_online_node(&mut self) -> OnlineReading {
+        self.maybe_rescan_nodes();
+
+        if self.online_fds.is_empty() {
+            // Tidak ada online node yang terkonfigurasi di profile
+            return OnlineReading::Unavailable;
+        }
+
+        let mut any_readable = false;
+        let mut stale = false;
+
+        for file in &mut self.online_fds {
+            if file.seek(SeekFrom::Start(0)).is_err() {
+                stale = true;
+                continue;
+            }
+            let n = match file.read(&mut self.buf) {
+                Ok(n) => n,
+                Err(_) => { stale = true; continue; }
+            };
+            let Ok(value) = std::str::from_utf8(&self.buf[..n]) else {
+                continue;
+            };
+            any_readable = true;
+            if value.trim() == "1" {
+                return OnlineReading::Online;
+            }
+        }
+
+        if stale {
+            tracing::trace!("One or more online FDs became stale; waiting for scheduled rescan.");
+        }
+
+        if any_readable {
+            // Node terbaca tapi tidak ada yang "1"
+            OnlineReading::Offline
+        } else {
+            // Node terkonfigurasi tapi semua stale/error — beda dari Unavailable
+            OnlineReading::Error
+        }
+    }
+
+    /// Kumpulkan semua sinyal presence mentah.
+    /// PresenceTracker yang akan menginterpretasikan hasilnya.
+    pub fn read_presence(&mut self) -> PresenceReading {
+        let online = self.read_online_node();
+        // input_current hanya dibaca jika online node tidak authoritative
+        let input_current_ma = self.read_input_current_ma().ok();
+        PresenceReading { input_current_ma, online }
     }
 
     // ========================================================================
@@ -546,63 +642,6 @@ impl CachedReader {
             "not charging" => Ok(BatteryStatus::NotCharging),
             "full" => Ok(BatteryStatus::Full),
             _ => Ok(BatteryStatus::Unknown),
-        }
-    }
-
-    // ========================================================================
-    // Online
-    // ========================================================================
-
-    pub fn is_plugged_in(&mut self) -> Result<bool, ChargerError> {
-        self.maybe_rescan_nodes();
-
-        if self.online_fds.is_empty() {
-            return Err(ChargerError::ParseError("No valid online nodes configured or available"));
-        }
-
-        let mut any_readable = false;
-        let mut stale_fd = false;
-
-        for online_fd in &mut self.online_fds {
-            if online_fd.file.seek(SeekFrom::Start(0)).is_err() {
-                stale_fd = true;
-                continue;
-            }
-
-            let n = match online_fd.file.read(&mut self.buf) {
-                Ok(n) => n,
-                Err(_) => {
-                    stale_fd = true;
-                    continue;
-                }
-            };
-
-            let Ok(value) = std::str::from_utf8(&self.buf[..n]) else {
-                continue;
-            };
-
-            any_readable = true;
-
-            if value.trim() == "1" {
-                return Ok(true);
-            }
-        }
-
-        if stale_fd {
-            tracing::trace!(
-                "One or more online FDs became stale; \
-                 waiting for scheduled rescan."
-            );
-        }
-
-        if any_readable {
-            Ok(false)
-        } else {
-            /*
-             * All cached nodes became unusable.
-             * Return an error rather than false.
-             */
-            Err(ChargerError::ParseError("All online nodes are stale or unreadable"))
         }
     }
 }

@@ -5,7 +5,6 @@ use std::fs;
 pub trait HardwareIo: Send + Sync {
     fn read(&self, path: &Path) -> Result<String, ChargerError>;
     fn write(&self, path: &Path, value: &str) -> Result<(), ChargerError>;
-    fn exists(&self, path: &Path) -> bool;
 }
 
 pub struct SysfsIo;
@@ -19,14 +18,17 @@ impl HardwareIo for SysfsIo {
     }
 
     fn write(&self, path: &Path, value: &str) -> Result<(), ChargerError> {
-        fs::write(path, value).map_err(|e| ChargerError::SysfsWrite {
-            path: path.to_path_buf(),
-            source: e,
-        })
-    }
+        use std::fs::OpenOptions;
+        use std::io::Write;
 
-    fn exists(&self, path: &Path) -> bool {
-        path.exists()
+        OpenOptions::new()
+            .write(true)
+            .open(path)
+            .and_then(|mut f| f.write_all(value.as_bytes()))
+            .map_err(|e| ChargerError::SysfsWrite {
+                path: path.to_path_buf(),
+                source: e,
+            })
     }
 }
 
@@ -42,6 +44,12 @@ pub mod testing {
         nodes: Arc<Mutex<HashMap<PathBuf, String>>>,
         read_errors: Arc<Mutex<HashMap<PathBuf, std::io::ErrorKind>>>,
         write_errors: Arc<Mutex<HashMap<PathBuf, std::io::ErrorKind>>>,
+    }
+
+    impl Default for MockHardwareIo {
+        fn default() -> Self {
+            Self::new()
+        }
     }
 
     impl MockHardwareIo {
@@ -100,10 +108,6 @@ pub mod testing {
 
             self.nodes.lock().unwrap().insert(path.to_path_buf(), value.to_string());
             Ok(())
-        }
-
-        fn exists(&self, path: &Path) -> bool {
-            self.nodes.lock().unwrap().contains_key(path)
         }
     }
 }

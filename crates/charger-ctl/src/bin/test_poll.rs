@@ -1,4 +1,3 @@
-use std::mem;
 
 #[cfg(target_os = "linux")]
 fn main() {

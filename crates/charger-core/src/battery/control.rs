@@ -28,7 +28,9 @@ pub struct ChargingWriteResult {
 impl ChargingWriteResult {
     #[inline]
     pub fn all_succeeded(&self) -> bool {
-        self.attempted > 0 && self.failed == 0
+        self.attempted > 0
+            && self.failed == 0
+            && self.succeeded == self.attempted
     }
 
     #[inline]
@@ -73,18 +75,12 @@ pub fn set_charging(enable: bool, profile: &crate::hardware::profile::HardwarePr
     let mut last_error: Option<ChargerError> = None;
 
     // charging_enabled-style nodes.
-    for node in profile.charging_nodes {
+    for node in profile.control.charging_nodes {
         let path = Path::new(node);
-
-
-        if !io.exists(path) {
-            continue;
-        }
-
-        result.attempted += 1;
 
         match write_sysfs(path, charge_val, io) {
             Ok(()) => {
+                result.attempted += 1;
                 result.succeeded += 1;
                 tracing::debug!(
                     "Charging node write succeeded: {} = {}",
@@ -92,7 +88,12 @@ pub fn set_charging(enable: bool, profile: &crate::hardware::profile::HardwarePr
                     charge_val
                 );
             }
+            Err(ChargerError::SysfsWrite { source, .. }) if source.kind() == std::io::ErrorKind::NotFound => {
+                // Ignore missing node during discovery
+                continue;
+            }
             Err(e) => {
+                result.attempted += 1;
                 result.failed += 1;
 
                 tracing::warn!(
@@ -108,17 +109,12 @@ pub fn set_charging(enable: bool, profile: &crate::hardware::profile::HardwarePr
     }
 
     // input_suspend-style nodes.
-    for node in profile.suspend_nodes {
+    for node in profile.control.suspend_nodes {
         let path = Path::new(node);
-
-        if !io.exists(path) {
-            continue;
-        }
-
-        result.attempted += 1;
 
         match write_sysfs(path, suspend_val, io) {
             Ok(()) => {
+                result.attempted += 1;
                 result.succeeded += 1;
                 tracing::debug!(
                     "Suspend node write succeeded: {} = {}",
@@ -126,7 +122,11 @@ pub fn set_charging(enable: bool, profile: &crate::hardware::profile::HardwarePr
                     suspend_val
                 );
             }
+            Err(ChargerError::SysfsWrite { source, .. }) if source.kind() == std::io::ErrorKind::NotFound => {
+                continue;
+            }
             Err(e) => {
+                result.attempted += 1;
                 result.failed += 1;
 
                 tracing::warn!(
@@ -204,13 +204,19 @@ pub fn enter_bypass_mode(io: &dyn HardwareIo) -> Result<ChargingWriteResult, Cha
 
     for (path, val) in &nodes {
         let p = Path::new(path);
-        if io.exists(p) {
-            result.attempted += 1;
-            if let Err(e) = write_sysfs(p, val, io) {
+        
+        match write_sysfs(p, val, io) {
+            Ok(()) => {
+                result.attempted += 1;
+                result.succeeded += 1;
+            }
+            Err(ChargerError::SysfsWrite { source, .. }) if source.kind() == std::io::ErrorKind::NotFound => {
+                continue;
+            }
+            Err(e) => {
+                result.attempted += 1;
                 result.failed += 1;
                 last_error = Some(e);
-            } else {
-                result.succeeded += 1;
             }
         }
     }
@@ -250,13 +256,18 @@ pub fn exit_bypass_mode(io: &dyn HardwareIo) -> Result<ChargingWriteResult, Char
 
     for (path, val) in &nodes {
         let p = Path::new(path);
-        if io.exists(p) {
-            result.attempted += 1;
-            if let Err(e) = write_sysfs(p, val, io) {
+        match write_sysfs(p, val, io) {
+            Ok(()) => {
+                result.attempted += 1;
+                result.succeeded += 1;
+            }
+            Err(ChargerError::SysfsWrite { source, .. }) if source.kind() == std::io::ErrorKind::NotFound => {
+                continue;
+            }
+            Err(e) => {
+                result.attempted += 1;
                 result.failed += 1;
                 last_error = Some(e);
-            } else {
-                result.succeeded += 1;
             }
         }
     }
@@ -363,7 +374,7 @@ impl ChargingNode {
 ///
 /// The exact vendor hierarchy can later be adjusted in one place.
 fn charging_nodes(profile: &crate::hardware::profile::HardwareProfile) -> impl Iterator<Item = ChargingNode> {
-    profile.charging_nodes
+    profile.control.charging_nodes
         .iter()
         .copied()
         .map(|path| {
@@ -377,7 +388,7 @@ fn charging_nodes(profile: &crate::hardware::profile::HardwareProfile) -> impl I
 
             ChargingNode::charging_enabled(path, priority)
         })
-        .chain(profile.suspend_nodes.iter().copied().map(|path| {
+        .chain(profile.control.suspend_nodes.iter().copied().map(|path| {
             ChargingNode::input_suspend(path, 80)
         }))
 }
@@ -400,14 +411,9 @@ struct NodeObservation {
 /// overriding the actual primary charging controller.
 pub fn read_charging_state(profile: &crate::hardware::profile::HardwareProfile, io: &dyn HardwareIo) -> Result<ChargingState, ChargerError> {
     let mut observations: Vec<NodeObservation> =
-        Vec::with_capacity(profile.charging_nodes.len() + profile.suspend_nodes.len());
+        Vec::with_capacity(profile.control.charging_nodes.len() + profile.control.suspend_nodes.len());
 
     for node in charging_nodes(profile) {
-        let path = Path::new(node.path);
-
-        if !io.exists(path) {
-            continue;
-        }
 
         let state = match node.read_state(io) {
             Ok(state) => state,
