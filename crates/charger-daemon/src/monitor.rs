@@ -42,9 +42,16 @@ impl AdaptiveScheduler {
     fn push_sample(&mut self, s: Sample) {
         if let Some(prev) = self.history.back() {
             let dt = (s.ts - prev.ts).as_secs_f32().max(0.5);
-            const ALPHA: f32 = 0.3; // Smoothing factor
-            self.ema_cap_rate = ALPHA * ((s.capacity - prev.capacity) / dt) + (1.0 - ALPHA) * self.ema_cap_rate;
-            self.ema_temp_rate = ALPHA * ((s.temp - prev.temp) / dt) + (1.0 - ALPHA) * self.ema_temp_rate;
+            // Deep sleep recovery (Doze mode)
+            if dt > 300.0 {
+                self.ema_cap_rate = 0.0;
+                self.ema_temp_rate = 0.0;
+                self.history.clear();
+            } else {
+                const ALPHA: f32 = 0.3; // Smoothing factor
+                self.ema_cap_rate = ALPHA * ((s.capacity - prev.capacity) / dt) + (1.0 - ALPHA) * self.ema_cap_rate;
+                self.ema_temp_rate = ALPHA * ((s.temp - prev.temp) / dt) + (1.0 - ALPHA) * self.ema_temp_rate;
+            }
         }
         self.history.push_back(s);
         if self.history.len() > 5 { self.history.pop_front(); }
@@ -123,9 +130,42 @@ fn create_netlink_socket() -> Option<std::os::unix::io::RawFd> {
     Some(fd)
 }
 
+/// Zero-allocation netlink parser. 
+/// Drains socket and returns true only if a relevant power_supply event is found.
+fn drain_and_parse_netlink(fd: std::os::unix::io::RawFd) -> bool {
+    let mut buf = [0u8; 8192];
+    let mut relevant_event = false;
+    
+    loop {
+        let res = unsafe { libc::recv(fd, buf.as_mut_ptr() as *mut libc::c_void, buf.len(), libc::MSG_DONTWAIT) };
+        if res <= 0 { break; }
+        
+        let data = &buf[..res as usize];
+        let mut is_power_supply = false;
+        let mut is_relevant_name = false;
+        
+        for part in data.split(|&b| b == 0) {
+            if part == b"SUBSYSTEM=power_supply" {
+                is_power_supply = true;
+            } else if part.starts_with(b"POWER_SUPPLY_NAME=") {
+                let name = &part[18..];
+                if matches!(name, b"usb" | b"battery" | b"main" | b"ac" | b"wireless" | b"bms" | b"mtk-charger" | b"mt_charger") {
+                    is_relevant_name = true;
+                }
+            }
+        }
+        
+        if is_power_supply && is_relevant_name {
+            relevant_event = true;
+        }
+    }
+    
+    relevant_event
+}
+
 pub fn run_monitor_loop(config: Arc<RwLock<Config>>, rx: UnixDatagram) {
     let mut stop_reason = StopReason::None;
-    tracing::info!("Monitor loop started (Adaptive Netlink Event-Driven)");
+    tracing::info!("Monitor loop started (Bulletproof Event-Driven Architecture)");
 
     let (initial_level, initial_limit, enabled) = {
         let cfg = config.read().unwrap_or_else(|e| e.into_inner());
@@ -145,6 +185,10 @@ pub fn run_monitor_loop(config: Arc<RwLock<Config>>, rx: UnixDatagram) {
     }
 
     let mut scheduler = AdaptiveScheduler::new(initial_limit, 420);
+    let mut last_eval_time = Instant::now() - Duration::from_secs(60); 
+
+    let mut force_next_eval = true;
+    let mut pending_netlink_eval = false;
 
     loop {
         let cfg = config.read().unwrap_or_else(|e| e.into_inner()).clone();
@@ -173,12 +217,101 @@ pub fn run_monitor_loop(config: Arc<RwLock<Config>>, rx: UnixDatagram) {
             continue;
         }
 
+        let mut timeout = scheduler.next_interval(stop_reason);
+        
+        // Deferred evaluation handler
+        if force_next_eval {
+            timeout = Duration::ZERO;
+        } else if pending_netlink_eval {
+            let elapsed = last_eval_time.elapsed();
+            if elapsed >= Duration::from_millis(500) {
+                timeout = Duration::ZERO;
+            } else {
+                let remain = Duration::from_millis(500) - elapsed;
+                if remain < timeout {
+                    timeout = remain;
+                }
+            }
+        }
+        
+        let mut pfds = vec![
+            libc::pollfd { fd: rx.as_raw_fd(), events: libc::POLLIN, revents: 0 },
+        ];
+        if nl_fd >= 0 {
+            pfds.push(libc::pollfd { fd: nl_fd, events: libc::POLLIN, revents: 0 });
+        }
+
+        let ret = unsafe { libc::poll(pfds.as_mut_ptr(), pfds.len() as libc::nfds_t, timeout.as_millis() as i32) };
+        
+        let mut needs_evaluation = false;
+
+        if ret == 0 {
+            // Timeout expired
+            needs_evaluation = true;
+        } else if ret > 0 {
+            // IPC Command received (Highest Priority)
+            if pfds[0].revents & libc::POLLIN != 0 {
+                let mut buf = [0u8; 1];
+                if rx.recv(&mut buf).is_ok() {
+                    if buf[0] == 2 {
+                        tracing::info!("Monitor loop shutting down via IPC");
+                        break; 
+                    }
+                    if buf[0] == 1 {
+                        tracing::info!("Config reloaded");
+                        needs_evaluation = true;
+                    }
+                    if buf[0] == 3 {
+                        tracing::info!("Bypass mode enabled via IPC");
+                        stop_reason = StopReason::Bypass;
+                        needs_evaluation = true;
+                    }
+                    if buf[0] == 4 {
+                        tracing::info!("Bypass mode disabled via IPC");
+                        stop_reason = StopReason::None;
+                        needs_evaluation = true;
+                    }
+                }
+            }
+            
+            // Netlink uevent received
+            if pfds.len() > 1 && (pfds[1].revents & libc::POLLIN) != 0 {
+                let valid_event = drain_and_parse_netlink(nl_fd);
+                if valid_event {
+                    pending_netlink_eval = true;
+                    let elapsed = last_eval_time.elapsed();
+                    if elapsed >= Duration::from_millis(500) {
+                        needs_evaluation = true;
+                        tracing::debug!("Valid netlink event triggered evaluation");
+                    } else {
+                        tracing::debug!("Valid netlink event deferred (debounce)");
+                    }
+                }
+            }
+        }
+
+        // Deferred evaluation triggers timeout early
+        if pending_netlink_eval && last_eval_time.elapsed() >= Duration::from_millis(500) {
+            needs_evaluation = true;
+        }
+
+        // --- DECOUPLED LOOP LOGIC ---
+        // Do not perform heavy sysfs IO unless evaluation is required
+        if !needs_evaluation {
+            continue;
+        }
+
+        force_next_eval = false;
+        pending_netlink_eval = false;
+
+        // --- SENSOR EVALUATION GATE ---
         let level = reader::read_capacity().unwrap_or(0);
         let temp_dc = reader::read_temperature_dc().unwrap_or(0);
         let current = reader::read_input_current_ua().unwrap_or(0) as f32 / 1000.0;
         let power_connected = reader::is_power_connected().unwrap_or(true);
         
-        if !power_connected && stop_reason != StopReason::None {
+        // Gate 1: Physical Disconnection
+        if !power_connected && stop_reason != StopReason::None && stop_reason != StopReason::Bypass {
             if let Err(e) = control::set_charging(true) {
                 tracing::error!("failed to restore charging state on unplug: {e}");
             }
@@ -205,7 +338,14 @@ pub fn run_monitor_loop(config: Arc<RwLock<Config>>, rx: UnixDatagram) {
             ts: Instant::now(),
         });
 
-        if power_connected && stop_reason != StopReason::Bypass {
+        // Gate 2: Protect Bypass Mode
+        if stop_reason == StopReason::Bypass {
+            last_eval_time = Instant::now();
+            continue;
+        }
+
+        // Gate 3: Environment Evaluation
+        if power_connected {
             if cfg.thermal_cutoff && temp_dc >= max_temp_dc {
                 if stop_reason != StopReason::ThermalCutoff {
                     if let Err(e) = control::set_charging(false) {
@@ -236,57 +376,7 @@ pub fn run_monitor_loop(config: Arc<RwLock<Config>>, rx: UnixDatagram) {
                 tracing::info!("⚡ Charging resumed — Level: {}% | Threshold: {}%", level, effective_resume);
             }
         }
-
-        let timeout = scheduler.next_interval(stop_reason);
         
-        let mut pfds = vec![
-            libc::pollfd { fd: rx.as_raw_fd(), events: libc::POLLIN, revents: 0 },
-        ];
-        if nl_fd >= 0 {
-            pfds.push(libc::pollfd { fd: nl_fd, events: libc::POLLIN, revents: 0 });
-        }
-
-        let ret = unsafe { libc::poll(pfds.as_mut_ptr(), pfds.len() as libc::nfds_t, timeout.as_millis() as i32) };
-        
-        if ret > 0 {
-            // IPC Command received
-            if pfds[0].revents & libc::POLLIN != 0 {
-                let mut buf = [0u8; 1];
-                if rx.recv(&mut buf).is_ok() {
-                    if buf[0] == 2 {
-                        tracing::info!("Monitor loop shutting down via IPC");
-                        break; 
-                    }
-                    if buf[0] == 1 {
-                        tracing::info!("Config reloaded, re-evaluating instantly");
-                        continue;
-                    }
-                    if buf[0] == 3 {
-                        tracing::info!("Bypass mode enabled via IPC");
-                        stop_reason = StopReason::Bypass;
-                        continue;
-                    }
-                    if buf[0] == 4 {
-                        tracing::info!("Bypass mode disabled via IPC");
-                        stop_reason = StopReason::None;
-                        continue;
-                    }
-                }
-            }
-            
-            // Netlink uevent received
-            if pfds.len() > 1 && (pfds[1].revents & libc::POLLIN) != 0 {
-                // Drain socket buffer to clear POLLIN
-                let mut buf = [0u8; 4096];
-                loop {
-                    let res = unsafe { libc::recv(nl_fd, buf.as_mut_ptr() as *mut libc::c_void, buf.len(), libc::MSG_DONTWAIT) };
-                    if res <= 0 {
-                        break;
-                    }
-                }
-                // We just continue loop to sample and re-evaluate immediately
-                tracing::debug!("Woken up by Netlink event");
-            }
-        }
+        last_eval_time = Instant::now();
     }
 }

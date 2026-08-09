@@ -123,7 +123,7 @@ pub fn is_power_connected() -> Result<bool, ChargerError> {
     // 1. Check typec_mode first (Hardware-level Sink detection)
     let path = Path::new("/sys/class/power_supply/battery/typec_mode");
     if let Ok(mode) = read_sysfs(path) {
-        if mode.contains("Sink attached") {
+        if mode.contains("Source attached") || mode.contains("Sink attached") {
             return Ok(true);
         } else if mode.contains("Powered cable w/ sink") {
             return Ok(false);

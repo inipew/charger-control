@@ -34,6 +34,11 @@ enum Commands {
     Nodes,
     /// Grant permissions to charging nodes
     GrantPerms,
+    /// Debugging utilities
+    Debug {
+        #[arg(value_parser = ["uevent"])]
+        action: String,
+    },
 }
 
 #[derive(Subcommand)]
@@ -66,6 +71,11 @@ fn main() -> Result<(), ChargerError> {
         Commands::GrantPerms => {
             charger_core::battery::control::grant_node_permissions()?;
             println!("Granted 0644 to sysfs charging nodes");
+        }
+        Commands::Debug { action } => {
+            if action == "uevent" {
+                cmd::debug::run_uevent_dumper()?;
+            }
         }
     }
 
