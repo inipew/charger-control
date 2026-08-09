@@ -1,24 +1,44 @@
 use std::path::Path;
-use tracing_subscriber::{fmt, EnvFilter};
 
-pub fn init_logger(log_path: &Path) -> Result<(), std::io::Error> {
+use tracing_subscriber::{
+    fmt,
+    layer::SubscriberExt,
+    util::SubscriberInitExt,
+    EnvFilter,
+};
+
+pub fn init_logger(
+    log_path: &Path,
+) -> Result<(), std::io::Error> {
     if let Some(parent) = log_path.parent() {
         std::fs::create_dir_all(parent)?;
     }
-    
+
     let file = std::fs::OpenOptions::new()
         .create(true)
         .append(true)
         .open(log_path)?;
 
-    let subscriber = fmt::Subscriber::builder()
-        .with_env_filter(EnvFilter::from_default_env().add_directive(tracing::Level::INFO.into()))
+    let env_filter =
+        EnvFilter::try_from_default_env()
+            .unwrap_or_else(|_| {
+                EnvFilter::new("info")
+            });
+
+    let layer = fmt::layer()
         .with_writer(file)
-        .with_ansi(false) // No colors in file
-        .finish();
+        .with_ansi(false)
+        .with_target(true);
 
-    tracing::subscriber::set_global_default(subscriber)
-        .expect("Failed to set tracing subscriber");
-
-    Ok(())
+    tracing_subscriber::registry()
+        .with(env_filter)
+        .with(layer)
+        .try_init()
+        .map_err(|e| {
+            std::io::Error::other(
+                format!(
+                    "failed to initialize tracing: {e}"
+                ),
+            )
+        })
 }

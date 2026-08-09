@@ -1,93 +1,213 @@
 use std::path::Path;
-use charger_core::error::ChargerError;
+
 use charger_core::config::schema::{Config, DEFAULT_CONFIG_PATH};
+use charger_core::error::ChargerError;
+
 use crate::display;
+
+fn config_path() -> std::path::PathBuf {
+    Path::new(DEFAULT_CONFIG_PATH).to_path_buf()
+}
+
+fn load_config() -> Result<Config, ChargerError> {
+    let path = config_path();
+
+    Config::load(&path).map_err(|e| {
+        display::error(&format!(
+            "Failed to load config: {e}"
+        ));
+
+        e
+    })
+}
+
+fn save_config(cfg: &Config) -> Result<(), ChargerError> {
+    let path = config_path();
+
+    cfg.save(&path)
+}
+
+fn notify_daemon() {
+    #[cfg(unix)]
+    {
+        use std::io::{Read, Write};
+        use std::os::unix::net::UnixStream;
+        use std::time::Duration;
+
+        let socket = charger_core::config::schema::DEFAULT_CONFIG_PATH
+            .replace("config.toml", "daemon.sock");
+
+        let mut stream = match UnixStream::connect(&socket) {
+            Ok(stream) => stream,
+            Err(_) => {
+                display::warn(
+                    "Config saved, but daemon is not running.",
+                );
+                return;
+            }
+        };
+
+        let _ = stream.set_write_timeout(Some(Duration::from_secs(1)));
+        let _ = stream.set_read_timeout(Some(Duration::from_secs(2)));
+
+        if stream.write_all(b"reload").is_err() {
+            display::warn(
+                "Config saved, but failed to notify daemon.",
+            );
+            return;
+        }
+
+        let mut response = String::new();
+
+        match stream.read_to_string(&mut response) {
+            Ok(_) if response.starts_with("OK") => {
+                display::info("Daemon configuration reloaded.");
+            }
+
+            Ok(_) => {
+                display::warn(
+                    "Config saved, but daemon returned an error.",
+                );
+            }
+
+            Err(_) => {
+                display::warn(
+                    "Config saved, but daemon did not respond.",
+                );
+            }
+        }
+    }
+
+    #[cfg(not(unix))]
+    {
+        display::warn(
+            "IPC not supported on this platform. Restart daemon manually.",
+        );
+    }
+}
 
 pub fn limit(value: u8) -> Result<(), ChargerError> {
     if !(50..=100).contains(&value) {
-        display::error("Limit must be between 50 and 100");
+        display::error("Limit must be between 50 and 100%");
         return Ok(());
     }
 
-    let path = Path::new(DEFAULT_CONFIG_PATH).to_path_buf();
-    let mut cfg = Config::load(&path).unwrap_or_default();
-    
-    if value <= cfg.resume_limit {
-        let new_resume = value.saturating_sub(5).max(40);
-        cfg.resume_limit = new_resume;
-        display::warn(&format!("Resume limit automatically adjusted to {}% to prevent overlap", new_resume));
-    }
-    
-    cfg.charge_limit = value;
-    cfg.save(&path)?;
+    let mut cfg = load_config()?;
 
-    display::success(&format!("Charge limit set to {}%", value));
+    /*
+     * resume_limit must always be strictly below charge_limit.
+     *
+     * Example:
+     *   old limit = 80
+     *   resume = 75
+     *
+     * set limit 70
+     * -> resume automatically becomes 65
+     */
+    if cfg.resume_limit >= value {
+        let new_resume = value.saturating_sub(5).max(40);
+
+        if new_resume >= value {
+            display::error(
+                "Unable to create a valid resume limit for this charge limit.",
+            );
+            return Ok(());
+        }
+
+        cfg.resume_limit = new_resume;
+
+        display::warn(&format!(
+            "Resume limit automatically adjusted to {}% \
+             because it must remain below charge limit.",
+            new_resume
+        ));
+    }
+
+    cfg.charge_limit = value;
+
+    save_config(&cfg)?;
+
+    display::success(&format!(
+        "Charge limit set to {}%",
+        value
+    ));
+
     notify_daemon();
+
     Ok(())
 }
 
 pub fn resume(value: u8) -> Result<(), ChargerError> {
     if !(40..=99).contains(&value) {
-        display::error("Resume limit must be between 40 and 99%");
+        display::error(
+            "Resume limit must be between 40 and 99%",
+        );
         return Ok(());
     }
 
-    let path = Path::new(DEFAULT_CONFIG_PATH).to_path_buf();
-    let mut cfg = Config::load(&path).unwrap_or_default();
+    let mut cfg = load_config()?;
+
     if value >= cfg.charge_limit {
-        display::error(&format!("Resume limit ({}%) must be less than charge limit ({}%)", value, cfg.charge_limit));
+        display::error(&format!(
+            "Resume limit ({}%) must be less than charge limit ({}%).",
+            value,
+            cfg.charge_limit
+        ));
+
         return Ok(());
     }
-    cfg.resume_limit = value;
-    cfg.save(&path)?;
 
-    display::success(&format!("Resume limit set to {}%", value));
+    cfg.resume_limit = value;
+
+    save_config(&cfg)?;
+
+    display::success(&format!(
+        "Resume limit set to {}%",
+        value
+    ));
+
     notify_daemon();
+
     Ok(())
 }
 
 pub fn thermal(enabled: bool) -> Result<(), ChargerError> {
-    let path = Path::new(DEFAULT_CONFIG_PATH).to_path_buf();
-    let mut cfg = Config::load(&path).unwrap_or_default();
-    cfg.thermal_cutoff = enabled;
-    cfg.save(&path)?;
+    let mut cfg = load_config()?;
 
-    display::success(&format!("Thermal cutoff {}", if enabled { "enabled" } else { "disabled" }));
+    cfg.thermal_cutoff = enabled;
+
+    save_config(&cfg)?;
+
+    display::success(&format!(
+        "Thermal cutoff {}",
+        if enabled { "enabled" } else { "disabled" }
+    ));
+
     notify_daemon();
+
     Ok(())
 }
 
 pub fn max_temp(value: i32) -> Result<(), ChargerError> {
     if !(30..=60).contains(&value) {
-        display::error("Max temp must be between 30 and 60 °C");
+        display::error(
+            "Max temp must be between 30 and 60 °C",
+        );
         return Ok(());
     }
 
-    let path = Path::new(DEFAULT_CONFIG_PATH).to_path_buf();
-    let mut cfg = Config::load(&path).unwrap_or_default();
-    cfg.max_temp_dc = value * 10;
-    cfg.save(&path)?;
+    let mut cfg = load_config()?;
 
-    display::success(&format!("Max temperature set to {} °C", value));
+    cfg.max_temp_dc = value.saturating_mul(10);
+
+    save_config(&cfg)?;
+
+    display::success(&format!(
+        "Max temperature set to {} °C",
+        value
+    ));
+
     notify_daemon();
-    Ok(())
-}
 
-fn notify_daemon() {
-    // Send reload command to daemon via socket
-    #[cfg(unix)]
-    {
-        use std::os::unix::net::UnixStream;
-        use std::io::Write;
-        
-        if let Ok(mut stream) = UnixStream::connect(charger_core::config::schema::DEFAULT_CONFIG_PATH.replace("config.toml", "daemon.sock")) {
-            let _ = stream.write_all(b"reload");
-            display::info("Daemon configuration reloaded");
-        } else {
-            display::warn("Failed to contact daemon. Is it running?");
-        }
-    }
-    
-    #[cfg(not(unix))]
-    display::warn("IPC not supported on this platform. Please restart daemon manually.");
+    Ok(())
 }

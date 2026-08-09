@@ -2,112 +2,268 @@ mod ipc;
 mod logging;
 mod monitor;
 
+use std::os::unix::io::AsRawFd;
 use std::path::Path;
 use std::sync::{Arc, RwLock};
-use std::os::unix::io::AsRawFd;
-use charger_core::config::schema::{Config, DEFAULT_CONFIG_PATH};
+
+use charger_core::config::schema::{
+    Config,
+    DEFAULT_CONFIG_PATH,
+};
 
 fn setup_environment() {
     unsafe {
         libc::umask(0o022);
-        libc::chdir(c"/".as_ptr());
+
+        let root = b"/\0";
+
+        libc::chdir(
+            root.as_ptr() as *const libc::c_char
+        );
     }
 }
 
-fn acquire_lock() -> Result<std::fs::File, String> {
-    let lock_path = "/data/adb/charger-control/daemon.lock";
-    if let Some(p) = std::path::Path::new(lock_path).parent() {
-        let _ = std::fs::create_dir_all(p);
+fn acquire_lock()
+    -> Result<std::fs::File, String>
+{
+    let lock_path =
+        "/data/adb/charger-control/daemon.lock";
+
+    if let Some(parent) =
+        Path::new(lock_path).parent()
+    {
+        std::fs::create_dir_all(parent)
+            .map_err(|e| {
+                format!(
+                    "Gagal membuat directory lock: {e}"
+                )
+            })?;
     }
-    
-    let file = std::fs::OpenOptions::new()
-        .write(true)
-        .create(true)
-        .truncate(true)
-        .open(lock_path)
-        .map_err(|e| format!("Gagal membuka file lock: {e}"))?;
+
+    let file =
+        std::fs::OpenOptions::new()
+            .write(true)
+            .create(true)
+            .open(lock_path)
+            .map_err(|e| {
+                format!(
+                    "Gagal membuka file lock: {e}"
+                )
+            })?;
 
     unsafe {
         let fd = file.as_raw_fd();
-        if libc::flock(fd, libc::LOCK_EX | libc::LOCK_NB) != 0 {
-            return Err("Daemon sudah berjalan! (flock gagal)".to_string());
+
+        if libc::flock(
+            fd,
+            libc::LOCK_EX | libc::LOCK_NB,
+        ) != 0
+        {
+            return Err(
+                "Daemon sudah berjalan! \
+                 (flock gagal)"
+                    .to_string(),
+            );
         }
     }
-    
+
     Ok(file)
 }
 
 fn main() {
     setup_environment();
-    
-    // Simpan file lock agar tidak di-drop selama daemon hidup
-    let _lock_file = match acquire_lock() {
-        Ok(f) => f,
-        Err(e) => {
-            eprintln!("FATAL: {e}");
-            std::process::exit(1);
-        }
-    };
 
-    let config_path = Path::new(DEFAULT_CONFIG_PATH).to_path_buf();
-    
-    // Load config (synchronous)
-    let config = match Config::load(&config_path) {
-        Ok(c) => c,
-        Err(e) => {
-            let def = Config::default();
-            // Try to create parent dirs and save default if it fails to load
-            if let Some(p) = config_path.parent() {
-                let _ = std::fs::create_dir_all(p);
+    /*
+     * Keep the lock alive for the entire daemon lifetime.
+     */
+    let _lock_file =
+        match acquire_lock() {
+            Ok(file) => file,
+
+            Err(e) => {
+                eprintln!("FATAL: {e}");
+                std::process::exit(1);
             }
-            let _ = def.save(&config_path);
-            eprintln!("Failed to load config: {e}. Using defaults.");
-            def
-        }
-    };
+        };
 
-    let log_path = config.log_path.clone();
-    let shared_config = Arc::new(RwLock::new(config));
+    let config_path =
+        Path::new(DEFAULT_CONFIG_PATH)
+            .to_path_buf();
 
-    // Initialize synchronous logging
-    if let Err(e) = logging::init_logger(&log_path) {
-        eprintln!("Failed to initialize logging: {e}");
+    let config =
+        match Config::load(&config_path) {
+            Ok(config) => config,
+
+            Err(e) => {
+                eprintln!(
+                    "Failed to load config: {e}"
+                );
+
+                let default_config =
+                    Config::default();
+
+                if let Some(parent) =
+                    config_path.parent()
+                {
+                    let _ =
+                        std::fs::create_dir_all(
+                            parent,
+                        );
+                }
+
+                if let Err(save_error) =
+                    default_config.save(
+                        &config_path,
+                    )
+                {
+                    eprintln!(
+                        "Failed to save default config: \
+                         {save_error}"
+                    );
+                }
+
+                default_config
+            }
+        };
+
+    let log_path =
+        config.log_path.clone();
+
+    if let Err(e) =
+        logging::init_logger(&log_path)
+    {
+        eprintln!(
+            "Failed to initialize logging: {e}"
+        );
         return;
     }
 
-    tracing::info!("ChargerControl Daemon Starting (Pure Native STD)");
+    tracing::info!(
+        "ChargerControl daemon starting"
+    );
 
-    let (tx, rx) = std::os::unix::net::UnixDatagram::pair().expect("Failed to create UnixDatagram pair for IPC");
-    
-    // Spawn Background Thread for SIGTERM / SIGINT Signal Handling
-    if let Ok(mut signals) = signal_hook::iterator::Signals::new([
-        signal_hook::consts::signal::SIGTERM,
-        signal_hook::consts::signal::SIGINT,
-    ]) {
+    tracing::info!(
+        "Config path: {}",
+        config_path.display()
+    );
+
+    tracing::info!(
+        "Log path: {}",
+        log_path.display()
+    );
+
+    let shared_config =
+        Arc::new(RwLock::new(config));
+
+    let (tx, rx) =
+        match std::os::unix::net::UnixDatagram::pair()
+        {
+            Ok(pair) => pair,
+
+            Err(e) => {
+                tracing::error!(
+                    "Failed to create internal IPC: {}",
+                    e
+                );
+                return;
+            }
+        };
+
+    /*
+     * Signal handling.
+     *
+     * The monitor is responsible for restoring charging
+     * during normal shutdown. Signal handler is only a
+     * last-resort emergency path.
+     */
+    if let Ok(mut signals) =
+        signal_hook::iterator::Signals::new([
+            signal_hook::consts::signal::SIGTERM,
+            signal_hook::consts::signal::SIGINT,
+        ])
+    {
         std::thread::spawn(move || {
-            if let Some(sig) = signals.forever().next() {
-                tracing::info!("Received signal {}, restoring charging state and exiting...", sig);
-                let _ = charger_core::battery::control::set_charging(true);
-                let _ = std::fs::remove_file(ipc::SOCKET_PATH);
-                let _ = std::fs::remove_file("/data/adb/charger-control/daemon.lock");
+            if let Some(signal) =
+                signals.forever().next()
+            {
+                tracing::warn!(
+                    "Received signal {}",
+                    signal
+                );
+
+                let _ =
+                    charger_core::battery::control::set_charging(
+                        true,
+                    );
+
+                let _ =
+                    std::fs::remove_file(
+                        ipc::SOCKET_PATH,
+                    );
+
+                /*
+                 * Do not remove daemon.lock manually.
+                 *
+                 * The lock file itself can remain on disk;
+                 * flock is released automatically when the
+                 * process exits.
+                 */
+
                 std::process::exit(0);
             }
         });
     }
 
-    // Spawn Background Thread for IPC Server
-    let config_for_ipc = Arc::clone(&shared_config);
+    /*
+     * IPC server.
+     */
+    let config_for_ipc =
+        Arc::clone(&shared_config);
+
     std::thread::spawn(move || {
-        ipc::start_ipc_server(config_for_ipc, tx);
+        ipc::start_ipc_server(
+            config_for_ipc,
+            tx,
+        );
     });
 
-    // Main Thread runs the Monitor Loop
-    monitor::run_monitor_loop(shared_config, rx);
+    /*
+     * Main monitor loop.
+     */
+    monitor::run_monitor_loop(
+        Arc::clone(&shared_config),
+        rx,
+    );
 
-    tracing::info!("Daemon shutting down, restoring charging state...");
-    let _ = charger_core::battery::control::set_charging(true);
-    let _ = std::fs::remove_file(ipc::SOCKET_PATH);
-    let _ = std::fs::remove_file("/data/adb/charger-control/daemon.lock");
+    /*
+     * Graceful shutdown.
+     */
+    tracing::info!(
+        "Daemon shutting down; \
+         restoring charging state..."
+    );
 
-    tracing::info!("Daemon exited gracefully");
+    if let Err(e) =
+        charger_core::battery::control::set_charging(
+            true,
+        )
+    {
+        tracing::error!(
+            "Failed to restore charging: {}",
+            e
+        );
+    } else {
+        tracing::info!(
+            "Charging restored successfully"
+        );
+    }
+
+    let _ =
+        std::fs::remove_file(
+            ipc::SOCKET_PATH,
+        );
+
+    tracing::info!(
+        "ChargerControl daemon exited gracefully"
+    );
 }
