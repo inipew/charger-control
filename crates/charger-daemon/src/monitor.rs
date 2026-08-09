@@ -14,7 +14,7 @@ struct Sample {
     capacity: f32,
     temp: f32,
     _current_ma: f32,
-    power_connected: bool,
+    power_state: reader::PowerState,
     ts: Instant,
 }
 
@@ -41,7 +41,16 @@ impl AdaptiveScheduler {
 
     fn push_sample(&mut self, s: Sample) {
         if let Some(prev) = self.history.back() {
-            let dt = (s.ts - prev.ts).as_secs_f32().max(0.5);
+            let dt = (s.ts - prev.ts).as_secs_f32();
+            let capacity_rate = (s.capacity - prev.capacity).abs() / dt.max(0.1);
+            
+            if dt < 0.5 || capacity_rate > 1.0 {
+                // Event evaluation or transient anomaly: update state but skip EMA measurement
+                if let Some(last) = self.history.back_mut() {
+                    *last = s;
+                }
+                return;
+            }
             // Deep sleep recovery (Doze mode)
             if dt > 300.0 {
                 self.ema_cap_rate = 0.0;
@@ -60,7 +69,7 @@ impl AdaptiveScheduler {
     fn next_interval(&mut self, stop_reason: StopReason) -> Duration {
         let s = self.history.back().expect("At least 1 sample needed");
 
-        if !s.power_connected {
+        if s.power_state == reader::PowerState::Disconnected {
             self.last_interval = UNPLUGGED_HEARTBEAT;
             return self.last_interval;
         }
@@ -68,7 +77,7 @@ impl AdaptiveScheduler {
         let dist_to_limit = (self.limit - s.capacity).max(0.0);
         let dist_to_thermal = (self.thermal_cutoff - s.temp).max(0.0);
 
-        // Danger -> immediate reaction
+        // High-risk state: use aggressive fallback polling
         let danger = (dist_to_limit < 2.0
             || dist_to_thermal < 3.0
             || self.ema_temp_rate > 0.15)
@@ -79,8 +88,11 @@ impl AdaptiveScheduler {
             return self.last_interval;
         }
 
-        if stop_reason != StopReason::None {
-            self.last_interval = MAX_INTERVAL;
+        if stop_reason == StopReason::ThermalCutoff {
+            self.last_interval = Duration::from_secs(10);
+            return self.last_interval;
+        } else if stop_reason != StopReason::None {
+            self.last_interval = Duration::from_secs(60);
             return self.last_interval;
         }
 
@@ -99,6 +111,15 @@ impl AdaptiveScheduler {
             self.last_interval.mul_f32(1.5).min(MAX_INTERVAL).min(target.max(self.last_interval))
         };
         self.last_interval
+    }
+}
+
+struct NetlinkFd(std::os::unix::io::RawFd);
+impl Drop for NetlinkFd {
+    fn drop(&mut self) {
+        if self.0 >= 0 {
+            unsafe { libc::close(self.0); }
+        }
     }
 }
 
@@ -130,11 +151,18 @@ fn create_netlink_socket() -> Option<std::os::unix::io::RawFd> {
     Some(fd)
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum NetlinkEvent {
+    None,
+    FastPath, // ac online, battery status, usb attached
+    Coalesce, // other relevant events
+}
+
 /// Zero-allocation netlink parser. 
-/// Drains socket and returns true only if a relevant power_supply event is found.
-fn drain_and_parse_netlink(fd: std::os::unix::io::RawFd) -> bool {
+/// Drains socket and returns the most urgent event found.
+fn drain_and_parse_netlink(fd: std::os::unix::io::RawFd) -> NetlinkEvent {
     let mut buf = [0u8; 8192];
-    let mut relevant_event = false;
+    let mut urgent_event = NetlinkEvent::None;
     
     loop {
         let res = unsafe { libc::recv(fd, buf.as_mut_ptr() as *mut libc::c_void, buf.len(), libc::MSG_DONTWAIT) };
@@ -142,42 +170,51 @@ fn drain_and_parse_netlink(fd: std::os::unix::io::RawFd) -> bool {
         
         let data = &buf[..res as usize];
         let mut is_power_supply = false;
-        let mut is_relevant_name = false;
+        let mut name = b"".as_slice();
         
         for part in data.split(|&b| b == 0) {
             if part == b"SUBSYSTEM=power_supply" {
                 is_power_supply = true;
             } else if part.starts_with(b"POWER_SUPPLY_NAME=") {
-                let name = &part[18..];
-                if matches!(name, b"usb" | b"battery" | b"main" | b"ac" | b"wireless" | b"bms" | b"mtk-charger" | b"mt_charger") {
-                    is_relevant_name = true;
-                }
+                name = &part[18..];
             }
         }
         
-        if is_power_supply && is_relevant_name {
-            relevant_event = true;
+        if is_power_supply {
+            let mut fast_path = false;
+            for part in data.split(|&b| b == 0) {
+                if name == b"ac" && part.starts_with(b"POWER_SUPPLY_ONLINE=") {
+                    fast_path = true;
+                } else if name == b"battery" && part.starts_with(b"POWER_SUPPLY_STATUS=") {
+                    fast_path = true;
+                } else if name == b"usb" && part.starts_with(b"POWER_SUPPLY_TYPEC_MODE=") {
+                    fast_path = true; // Any TYPEC_MODE change is an early attach/detach hint
+                }
+            }
+            
+            if fast_path {
+                urgent_event = NetlinkEvent::FastPath;
+            } else if urgent_event == NetlinkEvent::None && matches!(name, b"usb" | b"battery" | b"main" | b"ac" | b"wireless" | b"bms" | b"mtk-charger" | b"mt_charger") {
+                urgent_event = NetlinkEvent::Coalesce;
+            }
         }
     }
     
-    relevant_event
+    urgent_event
 }
 
 pub fn run_monitor_loop(config: Arc<RwLock<Config>>, rx: UnixDatagram) {
     let mut stop_reason = StopReason::None;
     tracing::info!("Monitor loop started (Bulletproof Event-Driven Architecture)");
 
-    let (initial_level, initial_limit, enabled) = {
+    let (_initial_level, initial_limit, _enabled) = {
         let cfg = config.read().unwrap_or_else(|e| e.into_inner());
         (reader::read_capacity().unwrap_or(0), cfg.charge_limit, cfg.enabled)
     };
 
-    if enabled && initial_level < initial_limit {
-        let _ = control::set_charging(true);
-        tracing::info!("Boot sync: Forcing charging ON because {}% < {}%", initial_level, initial_limit);
-    }
-
-    let nl_fd = create_netlink_socket().unwrap_or(-1);
+    let nl_fd_raw = create_netlink_socket().unwrap_or(-1);
+    let _nl_fd_guard = NetlinkFd(nl_fd_raw);
+    let nl_fd = nl_fd_raw;
     if nl_fd >= 0 {
         tracing::info!("Successfully bound to NETLINK_KOBJECT_UEVENT");
     } else {
@@ -189,6 +226,7 @@ pub fn run_monitor_loop(config: Arc<RwLock<Config>>, rx: UnixDatagram) {
 
     let mut force_next_eval = true;
     let mut pending_netlink_eval = false;
+    let mut is_charging_enabled = true; // Track actual hardware state
 
     loop {
         let cfg = config.read().unwrap_or_else(|e| e.into_inner()).clone();
@@ -224,24 +262,32 @@ pub fn run_monitor_loop(config: Arc<RwLock<Config>>, rx: UnixDatagram) {
             timeout = Duration::ZERO;
         } else if pending_netlink_eval {
             let elapsed = last_eval_time.elapsed();
-            if elapsed >= Duration::from_millis(500) {
+            if elapsed >= Duration::from_millis(100) {
                 timeout = Duration::ZERO;
             } else {
-                let remain = Duration::from_millis(500) - elapsed;
+                let remain = Duration::from_millis(100) - elapsed;
                 if remain < timeout {
                     timeout = remain;
                 }
             }
         }
         
-        let mut pfds = vec![
+        let mut pfds = [
             libc::pollfd { fd: rx.as_raw_fd(), events: libc::POLLIN, revents: 0 },
+            libc::pollfd { fd: nl_fd, events: if nl_fd >= 0 { libc::POLLIN } else { 0 }, revents: 0 },
         ];
-        if nl_fd >= 0 {
-            pfds.push(libc::pollfd { fd: nl_fd, events: libc::POLLIN, revents: 0 });
-        }
+        let nfds = if nl_fd >= 0 { 2 } else { 1 };
 
-        let ret = unsafe { libc::poll(pfds.as_mut_ptr(), pfds.len() as libc::nfds_t, timeout.as_millis() as i32) };
+        let ret = unsafe { libc::poll(pfds.as_mut_ptr(), nfds, timeout.as_millis() as i32) };
+        
+        if ret < 0 {
+            let errno = std::io::Error::last_os_error();
+            if errno.kind() != std::io::ErrorKind::Interrupted {
+                tracing::error!("poll() failed: {}", errno);
+                std::thread::sleep(Duration::from_secs(1));
+            }
+            continue;
+        }
         
         let mut needs_evaluation = false;
 
@@ -276,22 +322,26 @@ pub fn run_monitor_loop(config: Arc<RwLock<Config>>, rx: UnixDatagram) {
             
             // Netlink uevent received
             if pfds.len() > 1 && (pfds[1].revents & libc::POLLIN) != 0 {
-                let valid_event = drain_and_parse_netlink(nl_fd);
-                if valid_event {
+                let event = drain_and_parse_netlink(nl_fd);
+                if event == NetlinkEvent::FastPath {
+                    needs_evaluation = true;
+                    pending_netlink_eval = false;
+                    tracing::debug!("Netlink Fast-Path triggered instant evaluation");
+                } else if event == NetlinkEvent::Coalesce {
                     pending_netlink_eval = true;
                     let elapsed = last_eval_time.elapsed();
-                    if elapsed >= Duration::from_millis(500) {
+                    if elapsed >= Duration::from_millis(100) {
                         needs_evaluation = true;
-                        tracing::debug!("Valid netlink event triggered evaluation");
+                        tracing::debug!("Valid netlink event triggered evaluation (coalesce)");
                     } else {
-                        tracing::debug!("Valid netlink event deferred (debounce)");
+                        tracing::debug!("Valid netlink event deferred (coalesce)");
                     }
                 }
             }
         }
 
         // Deferred evaluation triggers timeout early
-        if pending_netlink_eval && last_eval_time.elapsed() >= Duration::from_millis(500) {
+        if pending_netlink_eval && last_eval_time.elapsed() >= Duration::from_millis(100) {
             needs_evaluation = true;
         }
 
@@ -305,19 +355,24 @@ pub fn run_monitor_loop(config: Arc<RwLock<Config>>, rx: UnixDatagram) {
         pending_netlink_eval = false;
 
         // --- SENSOR EVALUATION GATE ---
-        let level = reader::read_capacity().unwrap_or(0);
-        let temp_dc = reader::read_temperature_dc().unwrap_or(0);
-        let current = reader::read_input_current_ua().unwrap_or(0) as f32 / 1000.0;
-        let power_connected = reader::is_power_connected().unwrap_or(true);
-        
-        // Gate 1: Physical Disconnection
-        if !power_connected && stop_reason != StopReason::None && stop_reason != StopReason::Bypass {
-            if let Err(e) = control::set_charging(true) {
-                tracing::error!("failed to restore charging state on unplug: {e}");
+        let level = match reader::read_capacity() {
+            Ok(v) => v,
+            Err(e) => {
+                tracing::error!("Failed to read battery capacity: {}", e);
+                last_eval_time = Instant::now();
+                continue;
             }
-            stop_reason = StopReason::None;
-            tracing::info!("🔌 Charger disconnected. Restored charging state and reset logic.");
-        }
+        };
+        let temp_dc = match reader::read_temperature_dc() {
+            Ok(v) => v,
+            Err(e) => {
+                tracing::error!("Failed to read battery temperature: {}", e);
+                last_eval_time = Instant::now();
+                continue;
+            }
+        };
+        let current = reader::read_input_current_ua().unwrap_or(0) as f32 / 1000.0;
+        let power_state = reader::get_power_state().unwrap_or(reader::PowerState::Disconnected);
         
         let limit = cfg.charge_limit;
         let max_temp_dc = cfg.max_temp_dc;
@@ -334,47 +389,56 @@ pub fn run_monitor_loop(config: Arc<RwLock<Config>>, rx: UnixDatagram) {
             capacity: level as f32,
             temp: temp_dc as f32 / 10.0,
             _current_ma: current,
-            power_connected,
+            power_state,
             ts: Instant::now(),
         });
 
-        // Gate 2: Protect Bypass Mode
+        // Gate 1: Protect Bypass Mode
         if stop_reason == StopReason::Bypass {
             last_eval_time = Instant::now();
             continue;
         }
 
-        // Gate 3: Environment Evaluation
-        if power_connected {
+        // Gate 2: Unified Policy Engine (Desired vs Actual)
+        let mut new_stop_reason = stop_reason;
+        
+        if power_state == reader::PowerState::Disconnected {
+            // Unplug resets the policy state
+            new_stop_reason = StopReason::None;
+        } else if power_state.is_plugged_in() {
+            let thermal_resume_dc = max_temp_dc.saturating_sub(20);
+            
             if cfg.thermal_cutoff && temp_dc >= max_temp_dc {
-                if stop_reason != StopReason::ThermalCutoff {
-                    if let Err(e) = control::set_charging(false) {
-                        tracing::error!("thermal cutoff: set_charging(false) failed: {e}");
-                    }
-                    stop_reason = StopReason::ThermalCutoff;
-                    tracing::warn!("⚠ Charging stopped — Temp {:.1}°C (limit {:.1}°C)", temp_dc as f32 / 10.0, max_temp_dc as f32 / 10.0);
-                }
-            } else if stop_reason == StopReason::ThermalCutoff && level < limit {
-                if let Err(e) = control::set_charging(true) {
-                    tracing::error!("resume from thermal: set_charging(true) failed: {e}");
-                }
-                stop_reason = StopReason::None;
-                tracing::info!("✅ Temperature normal — Charging resumed at {}%", level);
+                new_stop_reason = StopReason::ThermalCutoff;
+            } else if stop_reason == StopReason::ThermalCutoff && temp_dc <= thermal_resume_dc && level < limit {
+                new_stop_reason = StopReason::None;
             } else if level >= limit {
-                if stop_reason != StopReason::LimitReached {
-                    if let Err(e) = control::set_charging(false) {
-                        tracing::error!("limit reached: set_charging(false) failed: {e}");
-                    }
-                    stop_reason = StopReason::LimitReached;
-                    tracing::info!("🔋 Limit reached — Charging stopped at {}%", limit);
-                }
+                new_stop_reason = StopReason::LimitReached;
             } else if level <= effective_resume && stop_reason == StopReason::LimitReached {
-                if let Err(e) = control::set_charging(true) {
-                    tracing::error!("resume from limit: set_charging(true) failed: {e}");
-                }
-                stop_reason = StopReason::None;
-                tracing::info!("⚡ Charging resumed — Level: {}% | Threshold: {}%", level, effective_resume);
+                new_stop_reason = StopReason::None;
             }
+        }
+        
+        let desired_charging = new_stop_reason == StopReason::None;
+        
+        if desired_charging != is_charging_enabled {
+            if let Ok(()) = control::set_charging(desired_charging) {
+                is_charging_enabled = desired_charging;
+                stop_reason = new_stop_reason;
+                
+                if power_state == reader::PowerState::Disconnected {
+                    tracing::info!("🔌 Charger disconnected. Restored charging state and reset logic.");
+                } else if desired_charging {
+                    tracing::info!("✅ Charging resumed (Reason cleared: {:?})", stop_reason);
+                } else {
+                    tracing::warn!("⚠ Charging stopped (Reason: {:?})", stop_reason);
+                }
+            } else {
+                tracing::error!("Failed to apply charging state");
+            }
+        } else if new_stop_reason != stop_reason {
+            // Semantic update only, no hardware IO needed
+            stop_reason = new_stop_reason;
         }
         
         last_eval_time = Instant::now();

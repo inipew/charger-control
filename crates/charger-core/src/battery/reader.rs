@@ -118,67 +118,39 @@ pub fn calc_wattage_w(voltage_uv: u32, current_ma: f32) -> f32 {
     (voltage_uv as f32 / 1_000_000.0) * (current_ma / 1000.0)
 }
 
-/// Check if the charger/power source is physically connected
-pub fn is_power_connected() -> Result<bool, ChargerError> {
-    // 1. Check typec_mode first (Hardware-level Sink detection)
-    let path = Path::new("/sys/class/power_supply/battery/typec_mode");
-    if let Ok(mode) = read_sysfs(path) {
-        if mode.contains("Source attached") || mode.contains("Sink attached") {
-            return Ok(true);
-        } else if mode.contains("Powered cable w/ sink") {
-            return Ok(false);
-        }
-    }
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PowerState {
+    Disconnected,
+    Attached,
+    Connected,
+    Charging,
+}
 
-    // 2. Check input current (if > 0, we are definitely drawing power)
-    if let Ok(current) = read_input_current_ua() {
-        if current > 0 {
-            return Ok(true);
-        }
+impl PowerState {
+    pub fn is_plugged_in(&self) -> bool {
+        matches!(self, PowerState::Connected | PowerState::Charging)
     }
+}
 
-    // 3. Fallback to present nodes (VBUS physical detection)
-    let present_nodes = [
-        "/sys/class/power_supply/usb/present",
-        "/sys/class/power_supply/ac/present",
-        "/sys/class/power_supply/wireless/present",
-    ];
-    let mut present_supported = false;
-    for p in present_nodes {
-        if let Ok(val) = read_sysfs(Path::new(p)) {
-            present_supported = true;
-            if val == "1" {
-                return Ok(true);
-            }
+/// Get the current 4-Tier power state
+pub fn get_power_state() -> Result<PowerState, ChargerError> {
+    // 1. Check AC Online (Source of Truth for Connected)
+    let ac_online = read_sysfs(Path::new("/sys/class/power_supply/ac/online")).unwrap_or_else(|_| "0".into());
+    if ac_online == "1" {
+        // Validation: Is it actually charging?
+        let status = read_sysfs(Path::new("/sys/class/power_supply/battery/status")).unwrap_or_else(|_| "Unknown".into());
+        if status == "Charging" {
+            return Ok(PowerState::Charging);
         }
+        return Ok(PowerState::Connected);
     }
-    if present_supported {
-        return Ok(false);
-    }
-
-    // 4. Fallback to online nodes
-    let nodes = [
-        "/sys/class/power_supply/ac/online",
-        "/sys/class/power_supply/usb/online",
-        "/sys/class/power_supply/wireless/online",
-    ];
     
-    let mut online_supported = false;
-    let mut any_online = false;
+    // 2. Fallback to early attach hint if AC is offline
+    let typec = read_sysfs(Path::new("/sys/class/power_supply/battery/typec_mode")).unwrap_or_else(|_| "".into());
+    if typec.contains("Source attached") {
+        return Ok(PowerState::Attached);
+    }
     
-    for p in nodes {
-        if let Ok(val) = read_sysfs(Path::new(p)) {
-            online_supported = true;
-            if val == "1" {
-                any_online = true;
-                break;
-            }
-        }
-    }
-
-    if online_supported {
-        return Ok(any_online);
-    }
-
-    Ok(true) // Safe default, do not rely on battery/status discharging
+    // 3. Completely disconnected
+    Ok(PowerState::Disconnected)
 }

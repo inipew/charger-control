@@ -13,28 +13,36 @@ pub fn set_charging(enable: bool) -> Result<(), ChargerError> {
     let charge_val = if enable { "1" } else { "0" };
     let suspend_val = if enable { "0" } else { "1" };
 
-    let mut any_written = false;
+    let mut succeeded = 0;
+    let mut failed = 0;
 
     for node in CHARGING_NODES {
         let path = Path::new(node);
-        if path.exists() {
-            match write_sysfs(path, charge_val) {
-                Ok(_) => any_written = true,
-                Err(e) => tracing::warn!("Failed to write to {}: {}", node, e),
+        match write_sysfs(path, charge_val) {
+            Ok(_) => succeeded += 1,
+            Err(ChargerError::SysfsWrite { source, .. }) if source.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => {
+                tracing::warn!("Failed to write to {}: {}", node, e);
+                failed += 1;
             }
         }
     }
     for node in SUSPEND_NODES {
         let path = Path::new(node);
-        if path.exists() {
-            match write_sysfs(path, suspend_val) {
-                Ok(_) => any_written = true,
-                Err(e) => tracing::warn!("Failed to write to {}: {}", node, e),
+        match write_sysfs(path, suspend_val) {
+            Ok(_) => succeeded += 1,
+            Err(ChargerError::SysfsWrite { source, .. }) if source.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => {
+                tracing::warn!("Failed to write to {}: {}", node, e);
+                failed += 1;
             }
         }
     }
 
-    if !any_written {
+    if failed > 0 {
+        tracing::warn!("Charging state partially applied: {} succeeded, {} failed", succeeded, failed);
+        Err(ChargerError::NoChargingNodeFound)
+    } else if succeeded == 0 {
         Err(ChargerError::NoChargingNodeFound)
     } else {
         Ok(())
@@ -48,17 +56,22 @@ pub fn enter_bypass_mode() -> Result<(), ChargerError> {
         ("/sys/class/power_supply/battery/charging_enabled", "0"),
         ("/sys/class/power_supply/main/charging_enabled", "0"),
     ];
-    let mut any_written = false;
+    let mut succeeded = 0;
+    let mut failed = 0;
+    
     for (path, val) in &nodes {
         let p = Path::new(path);
-        if p.exists() {
-            match write_sysfs(p, val) {
-                Ok(_) => any_written = true,
-                Err(e) => tracing::warn!("Bypass ON: Failed to write to {}: {}", path, e),
+        match write_sysfs(p, val) {
+            Ok(_) => succeeded += 1,
+            Err(ChargerError::SysfsWrite { source, .. }) if source.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => {
+                tracing::warn!("Bypass ON: Failed to write to {}: {}", path, e);
+                failed += 1;
             }
         }
     }
-    if !any_written {
+    
+    if failed > 0 || succeeded == 0 {
         Err(ChargerError::NoChargingNodeFound)
     } else {
         Ok(())
@@ -72,17 +85,22 @@ pub fn exit_bypass_mode() -> Result<(), ChargerError> {
         ("/sys/class/power_supply/battery/charging_enabled", "1"),
         ("/sys/class/power_supply/main/charging_enabled", "1"),
     ];
-    let mut any_written = false;
+    let mut succeeded = 0;
+    let mut failed = 0;
+    
     for (path, val) in &nodes {
         let p = Path::new(path);
-        if p.exists() {
-            match write_sysfs(p, val) {
-                Ok(_) => any_written = true,
-                Err(e) => tracing::warn!("Bypass OFF: Failed to write to {}: {}", path, e),
+        match write_sysfs(p, val) {
+            Ok(_) => succeeded += 1,
+            Err(ChargerError::SysfsWrite { source, .. }) if source.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => {
+                tracing::warn!("Bypass OFF: Failed to write to {}: {}", path, e);
+                failed += 1;
             }
         }
     }
-    if !any_written {
+    
+    if failed > 0 || succeeded == 0 {
         Err(ChargerError::NoChargingNodeFound)
     } else {
         Ok(())
