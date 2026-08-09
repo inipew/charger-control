@@ -21,9 +21,6 @@ pub struct Config {
     /// Suhu maksimum sebelum charging dihentikan (°C × 10 = decidegree)
     pub max_temp_dc: i32,
 
-    /// CPU power save mode (governor: powersave vs schedutil)
-    pub cpu_power_save: bool,
-
     /// Polling interval monitor loop (detik)
     pub poll_interval_secs: u64,
 
@@ -39,7 +36,6 @@ impl Default for Config {
             resume_limit: 95,
             thermal_cutoff: false,
             max_temp_dc: 420, // 42.0°C
-            cpu_power_save: false,
             poll_interval_secs: 10,
             log_path: PathBuf::from("/data/adb/charger-control/charger-control.log"),
         }
@@ -61,6 +57,6 @@ impl Config {
         let raw = toml::to_string_pretty(self)
             .map_err(|e| crate::error::ChargerError::ConfigSerialize(e.to_string()))?;
         std::fs::write(path, raw)
-            .map_err(|e| crate::error::ChargerError::ConfigRead { path: path.clone(), source: e })
+            .map_err(|e| crate::error::ChargerError::ConfigWrite { path: path.clone(), source: e })
     }
 }

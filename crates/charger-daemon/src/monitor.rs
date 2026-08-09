@@ -14,13 +14,12 @@ struct Sample {
     capacity: f32,
     temp: f32,
     _current_ma: f32,
-    online: bool,
+    power_connected: bool,
     ts: Instant,
 }
 
 struct AdaptiveScheduler {
     limit: f32,
-    resume_limit: f32,
     thermal_cutoff: f32,
     history: VecDeque<Sample>,
     ema_cap_rate: f32,
@@ -29,10 +28,9 @@ struct AdaptiveScheduler {
 }
 
 impl AdaptiveScheduler {
-    fn new(limit: u8, resume_limit: u8, thermal_cutoff: i32) -> Self {
+    fn new(limit: u8, thermal_cutoff: i32) -> Self {
         Self {
             limit: limit as f32,
-            resume_limit: resume_limit as f32,
             thermal_cutoff: thermal_cutoff as f32 / 10.0,
             history: VecDeque::new(),
             ema_cap_rate: 0.0,
@@ -52,10 +50,10 @@ impl AdaptiveScheduler {
         if self.history.len() > 5 { self.history.pop_front(); }
     }
 
-    fn next_interval(&mut self) -> Duration {
+    fn next_interval(&mut self, stop_reason: StopReason) -> Duration {
         let s = self.history.back().expect("At least 1 sample needed");
 
-        if !s.online {
+        if !s.power_connected {
             self.last_interval = UNPLUGGED_HEARTBEAT;
             return self.last_interval;
         }
@@ -64,12 +62,18 @@ impl AdaptiveScheduler {
         let dist_to_thermal = (self.thermal_cutoff - s.temp).max(0.0);
 
         // Danger -> immediate reaction
-        let danger = dist_to_limit < 2.0
+        let danger = (dist_to_limit < 2.0
             || dist_to_thermal < 3.0
-            || self.ema_temp_rate > 0.15;
+            || self.ema_temp_rate > 0.15)
+            && stop_reason == StopReason::None;
             
         if danger {
             self.last_interval = MIN_INTERVAL;
+            return self.last_interval;
+        }
+
+        if stop_reason != StopReason::None {
+            self.last_interval = MAX_INTERVAL;
             return self.last_interval;
         }
 
@@ -92,7 +96,7 @@ impl AdaptiveScheduler {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum StopReason { None, LimitReached, ThermalCutoff }
+enum StopReason { None, LimitReached, ThermalCutoff, Bypass }
 
 fn create_netlink_socket() -> Option<std::os::unix::io::RawFd> {
     let fd = unsafe { libc::socket(libc::AF_NETLINK, libc::SOCK_RAW, libc::NETLINK_KOBJECT_UEVENT) };
@@ -140,7 +144,7 @@ pub fn run_monitor_loop(config: Arc<RwLock<Config>>, rx: UnixDatagram) {
         tracing::warn!("Failed to bind Netlink socket, falling back to pure adaptive timer");
     }
 
-    let mut scheduler = AdaptiveScheduler::new(initial_limit, 95, 420);
+    let mut scheduler = AdaptiveScheduler::new(initial_limit, 420);
 
     loop {
         let cfg = config.read().unwrap_or_else(|e| e.into_inner()).clone();
@@ -171,8 +175,16 @@ pub fn run_monitor_loop(config: Arc<RwLock<Config>>, rx: UnixDatagram) {
 
         let level = reader::read_capacity().unwrap_or(0);
         let temp_dc = reader::read_temperature_dc().unwrap_or(0);
-        let current = reader::read_current_ma().unwrap_or(0.0);
-        let online = reader::is_plugged_in().unwrap_or(true);
+        let current = reader::read_input_current_ua().unwrap_or(0) as f32 / 1000.0;
+        let power_connected = reader::is_power_connected().unwrap_or(true);
+        
+        if !power_connected && stop_reason != StopReason::None {
+            if let Err(e) = control::set_charging(true) {
+                tracing::error!("failed to restore charging state on unplug: {e}");
+            }
+            stop_reason = StopReason::None;
+            tracing::info!("🔌 Charger disconnected. Restored charging state and reset logic.");
+        }
         
         let limit = cfg.charge_limit;
         let max_temp_dc = cfg.max_temp_dc;
@@ -183,48 +195,49 @@ pub fn run_monitor_loop(config: Arc<RwLock<Config>>, rx: UnixDatagram) {
         };
 
         scheduler.limit = limit as f32;
-        scheduler.resume_limit = effective_resume as f32;
         scheduler.thermal_cutoff = max_temp_dc as f32 / 10.0;
         
         scheduler.push_sample(Sample {
             capacity: level as f32,
             temp: temp_dc as f32 / 10.0,
             _current_ma: current,
-            online,
+            power_connected,
             ts: Instant::now(),
         });
 
-        if cfg.thermal_cutoff && temp_dc >= max_temp_dc {
-            if stop_reason != StopReason::ThermalCutoff {
-                if let Err(e) = control::set_charging(false) {
-                    tracing::error!("thermal cutoff: set_charging(false) failed: {e}");
+        if power_connected && stop_reason != StopReason::Bypass {
+            if cfg.thermal_cutoff && temp_dc >= max_temp_dc {
+                if stop_reason != StopReason::ThermalCutoff {
+                    if let Err(e) = control::set_charging(false) {
+                        tracing::error!("thermal cutoff: set_charging(false) failed: {e}");
+                    }
+                    stop_reason = StopReason::ThermalCutoff;
+                    tracing::warn!("⚠ Charging stopped — Temp {:.1}°C (limit {:.1}°C)", temp_dc as f32 / 10.0, max_temp_dc as f32 / 10.0);
                 }
-                stop_reason = StopReason::ThermalCutoff;
-                tracing::warn!("⚠ Charging stopped — Temp {:.1}°C (limit {:.1}°C)", temp_dc as f32 / 10.0, max_temp_dc as f32 / 10.0);
-            }
-        } else if stop_reason == StopReason::ThermalCutoff && level < limit {
-            if let Err(e) = control::set_charging(true) {
-                tracing::error!("resume from thermal: set_charging(true) failed: {e}");
-            }
-            stop_reason = StopReason::None;
-            tracing::info!("✅ Temperature normal — Charging resumed at {}%", level);
-        } else if level >= limit {
-            if stop_reason != StopReason::LimitReached {
-                if let Err(e) = control::set_charging(false) {
-                    tracing::error!("limit reached: set_charging(false) failed: {e}");
+            } else if stop_reason == StopReason::ThermalCutoff && level < limit {
+                if let Err(e) = control::set_charging(true) {
+                    tracing::error!("resume from thermal: set_charging(true) failed: {e}");
                 }
-                stop_reason = StopReason::LimitReached;
-                tracing::info!("🔋 Limit reached — Charging stopped at {}%", limit);
+                stop_reason = StopReason::None;
+                tracing::info!("✅ Temperature normal — Charging resumed at {}%", level);
+            } else if level >= limit {
+                if stop_reason != StopReason::LimitReached {
+                    if let Err(e) = control::set_charging(false) {
+                        tracing::error!("limit reached: set_charging(false) failed: {e}");
+                    }
+                    stop_reason = StopReason::LimitReached;
+                    tracing::info!("🔋 Limit reached — Charging stopped at {}%", limit);
+                }
+            } else if level <= effective_resume && stop_reason == StopReason::LimitReached {
+                if let Err(e) = control::set_charging(true) {
+                    tracing::error!("resume from limit: set_charging(true) failed: {e}");
+                }
+                stop_reason = StopReason::None;
+                tracing::info!("⚡ Charging resumed — Level: {}% | Threshold: {}%", level, effective_resume);
             }
-        } else if level <= effective_resume && stop_reason == StopReason::LimitReached {
-            if let Err(e) = control::set_charging(true) {
-                tracing::error!("resume from limit: set_charging(true) failed: {e}");
-            }
-            stop_reason = StopReason::None;
-            tracing::info!("⚡ Charging resumed — Level: {}% | Threshold: {}%", level, effective_resume);
         }
 
-        let timeout = scheduler.next_interval();
+        let timeout = scheduler.next_interval(stop_reason);
         
         let mut pfds = vec![
             libc::pollfd { fd: rx.as_raw_fd(), events: libc::POLLIN, revents: 0 },
@@ -248,6 +261,16 @@ pub fn run_monitor_loop(config: Arc<RwLock<Config>>, rx: UnixDatagram) {
                         tracing::info!("Config reloaded, re-evaluating instantly");
                         continue;
                     }
+                    if buf[0] == 3 {
+                        tracing::info!("Bypass mode enabled via IPC");
+                        stop_reason = StopReason::Bypass;
+                        continue;
+                    }
+                    if buf[0] == 4 {
+                        tracing::info!("Bypass mode disabled via IPC");
+                        stop_reason = StopReason::None;
+                        continue;
+                    }
                 }
             }
             
@@ -255,7 +278,12 @@ pub fn run_monitor_loop(config: Arc<RwLock<Config>>, rx: UnixDatagram) {
             if pfds.len() > 1 && (pfds[1].revents & libc::POLLIN) != 0 {
                 // Drain socket buffer to clear POLLIN
                 let mut buf = [0u8; 4096];
-                unsafe { libc::recv(nl_fd, buf.as_mut_ptr() as *mut libc::c_void, buf.len(), libc::MSG_DONTWAIT) };
+                loop {
+                    let res = unsafe { libc::recv(nl_fd, buf.as_mut_ptr() as *mut libc::c_void, buf.len(), libc::MSG_DONTWAIT) };
+                    if res <= 0 {
+                        break;
+                    }
+                }
                 // We just continue loop to sample and re-evaluate immediately
                 tracing::debug!("Woken up by Netlink event");
             }

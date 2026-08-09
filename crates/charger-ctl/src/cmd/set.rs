@@ -11,6 +11,13 @@ pub fn limit(value: u8) -> Result<(), ChargerError> {
 
     let path = Path::new(DEFAULT_CONFIG_PATH).to_path_buf();
     let mut cfg = Config::load(&path).unwrap_or_default();
+    
+    if value <= cfg.resume_limit {
+        let new_resume = value.saturating_sub(5).max(40);
+        cfg.resume_limit = new_resume;
+        display::warn(&format!("Resume limit automatically adjusted to {}% to prevent overlap", new_resume));
+    }
+    
     cfg.charge_limit = value;
     cfg.save(&path)?;
 

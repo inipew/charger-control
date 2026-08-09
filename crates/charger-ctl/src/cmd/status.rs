@@ -8,8 +8,12 @@ pub fn run() -> Result<(), ChargerError> {
     let level = reader::read_capacity().unwrap_or(0);
     display::key_val("Level", format!("{}%", level));
 
-    if let Ok(ma) = reader::read_current_ma() {
-        display::key_val("Current", format!("{:.1} mA", ma));
+    if let Ok(ua) = reader::read_battery_current_ua() {
+        display::key_val("Battery Current", format!("{:.1} mA", ua as f32 / 1000.0));
+    }
+
+    if let Ok(ua) = reader::read_input_current_ua() {
+        display::key_val("Input Current", format!("{:.1} mA", ua as f32 / 1000.0));
     }
 
     if let Ok(uv) = reader::read_voltage_uv() {
@@ -20,9 +24,9 @@ pub fn run() -> Result<(), ChargerError> {
         display::key_val("Temperature", format!("{:.1} °C", temp as f32 / 10.0));
     }
 
-    if let Ok(ma) = reader::read_current_ma() {
+    if let Ok(ua) = reader::read_input_current_ua() {
         if let Ok(uv) = reader::read_voltage_uv() {
-            let watts = reader::calc_wattage_w(uv, ma);
+            let watts = reader::calc_wattage_w(uv, ua as f32 / 1000.0);
             display::key_val("Wattage", format!("{:.2} W", watts.abs()));
         }
     }

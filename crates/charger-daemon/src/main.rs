@@ -23,6 +23,7 @@ fn acquire_lock() -> Result<std::fs::File, String> {
     let file = std::fs::OpenOptions::new()
         .write(true)
         .create(true)
+        .truncate(true)
         .open(lock_path)
         .map_err(|e| format!("Gagal membuka file lock: {e}"))?;
 
@@ -84,7 +85,7 @@ fn main() {
         signal_hook::consts::signal::SIGINT,
     ]) {
         std::thread::spawn(move || {
-            for sig in signals.forever() {
+            if let Some(sig) = signals.forever().next() {
                 tracing::info!("Received signal {}, restoring charging state and exiting...", sig);
                 let _ = charger_core::battery::control::set_charging(true);
                 let _ = std::fs::remove_file(ipc::SOCKET_PATH);
@@ -102,6 +103,11 @@ fn main() {
 
     // Main Thread runs the Monitor Loop
     monitor::run_monitor_loop(shared_config, rx);
+
+    tracing::info!("Daemon shutting down, restoring charging state...");
+    let _ = charger_core::battery::control::set_charging(true);
+    let _ = std::fs::remove_file(ipc::SOCKET_PATH);
+    let _ = std::fs::remove_file("/data/adb/charger-control/daemon.lock");
 
     tracing::info!("Daemon exited gracefully");
 }

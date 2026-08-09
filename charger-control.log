@@ -1,0 +1,14 @@
+2026-08-09T13:46:06.589398129+07:00  INFO charger_daemon: ChargerControl Daemon Starting (Pure Native STD)
+2026-08-09T13:46:06.590376283+07:00  INFO charger_daemon::monitor: Charging monitor started.
+2026-08-09T13:46:06.590566514+07:00  INFO charger_daemon::ipc: IPC server listening on "/data/adb/charger-control/daemon.sock"
+2026-08-09T13:46:06.591042206+07:00  INFO charger_daemon::monitor::netlink: Netlink power-supply monitor connected.
+2026-08-09T13:46:06.622474437+07:00  INFO charger_daemon::monitor: Hardware target changed: Unmanaged -> ChargingEnabled
+2026-08-09T13:46:06.622515437+07:00  INFO charger_daemon::monitor: Applying hardware target: ChargingEnabled (sync=Unknown, force=true)
+2026-08-09T13:46:06.622817283+07:00  INFO charger_core::hardware::controller: Taking hardware ownership. Original charging state: false
+2026-08-09T13:46:06.694448052+07:00  INFO charger_core::battery::control: Charging control applied successfully: 2/2 writes succeeded
+2026-08-09T13:46:06.69449936+07:00  INFO charger_core::hardware::controller: Hardware charging set to true: 2/2 nodes succeeded
+2026-08-09T13:46:12.414333899+07:00  INFO charger_daemon::monitor: Hardware target changed: ChargingEnabled -> Unmanaged
+2026-08-09T13:46:12.414367976+07:00  INFO charger_daemon::monitor: Applying hardware target: Unmanaged (sync=Synced, force=true)
+2026-08-09T13:46:12.726854745+07:00  INFO charger_core::battery::control: Charging control applied successfully: 2/2 writes succeeded
+2026-08-09T13:46:12.726953514+07:00  INFO charger_core::hardware::controller: Released ownership and restored original charging state: false (succeeded: 2/2)
+2026-08-09T13:46:13.377538206+07:00  INFO charger_daemon::ipc: Received IPC command: Status

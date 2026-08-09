@@ -18,16 +18,18 @@ pub fn set_charging(enable: bool) -> Result<(), ChargerError> {
     for node in CHARGING_NODES {
         let path = Path::new(node);
         if path.exists() {
-            if write_sysfs(path, charge_val).is_ok() {
-                any_written = true;
+            match write_sysfs(path, charge_val) {
+                Ok(_) => any_written = true,
+                Err(e) => tracing::warn!("Failed to write to {}: {}", node, e),
             }
         }
     }
     for node in SUSPEND_NODES {
         let path = Path::new(node);
         if path.exists() {
-            if write_sysfs(path, suspend_val).is_ok() {
-                any_written = true;
+            match write_sysfs(path, suspend_val) {
+                Ok(_) => any_written = true,
+                Err(e) => tracing::warn!("Failed to write to {}: {}", node, e),
             }
         }
     }
@@ -46,11 +48,21 @@ pub fn enter_bypass_mode() -> Result<(), ChargerError> {
         ("/sys/class/power_supply/battery/charging_enabled", "0"),
         ("/sys/class/power_supply/main/charging_enabled", "0"),
     ];
+    let mut any_written = false;
     for (path, val) in &nodes {
         let p = Path::new(path);
-        if p.exists() { let _ = write_sysfs(p, val); }
+        if p.exists() {
+            match write_sysfs(p, val) {
+                Ok(_) => any_written = true,
+                Err(e) => tracing::warn!("Bypass ON: Failed to write to {}: {}", path, e),
+            }
+        }
     }
-    Ok(())
+    if !any_written {
+        Err(ChargerError::NoChargingNodeFound)
+    } else {
+        Ok(())
+    }
 }
 
 /// Restore normal charging from bypass mode.
@@ -60,11 +72,21 @@ pub fn exit_bypass_mode() -> Result<(), ChargerError> {
         ("/sys/class/power_supply/battery/charging_enabled", "1"),
         ("/sys/class/power_supply/main/charging_enabled", "1"),
     ];
+    let mut any_written = false;
     for (path, val) in &nodes {
         let p = Path::new(path);
-        if p.exists() { let _ = write_sysfs(p, val); }
+        if p.exists() {
+            match write_sysfs(p, val) {
+                Ok(_) => any_written = true,
+                Err(e) => tracing::warn!("Bypass OFF: Failed to write to {}: {}", path, e),
+            }
+        }
     }
-    Ok(())
+    if !any_written {
+        Err(ChargerError::NoChargingNodeFound)
+    } else {
+        Ok(())
+    }
 }
 
 #[cfg(unix)]

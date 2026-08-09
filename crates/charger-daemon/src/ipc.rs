@@ -136,6 +136,7 @@ fn handle_client(stream: &mut std::os::unix::net::UnixStream, config: &Arc<RwLoc
                         if let Err(e) = charger_core::battery::control::enter_bypass_mode() {
                             let _ = stream.write_all(format!("Error: {e}").as_bytes());
                         } else {
+                            let _ = tx.send(&[3]);
                             let _ = stream.write_all(b"OK: Bypass ON");
                         }
                     }
@@ -143,6 +144,7 @@ fn handle_client(stream: &mut std::os::unix::net::UnixStream, config: &Arc<RwLoc
                         if let Err(e) = charger_core::battery::control::exit_bypass_mode() {
                             let _ = stream.write_all(format!("Error: {e}").as_bytes());
                         } else {
+                            let _ = tx.send(&[4]);
                             let _ = stream.write_all(b"OK: Bypass OFF");
                         }
                     }
@@ -165,26 +167,24 @@ fn handle_client(stream: &mut std::os::unix::net::UnixStream, config: &Arc<RwLoc
                         let (pid, rss, cpu) = get_process_stats();
                         let msg = if let Ok(cfg) = config.read() {
                             format!(
-                                "OK:\n\
-                                 [ DAEMON STATUS ]\n\
-                                 • Status       : {}\n\
-                                 • PID          : {}\n\
-                                 • Memory (RSS) : {:.2} MB\n\
-                                 • CPU Usage    : {:.3}%\n\
-                                 \n\
-                                 [ CURRENT CONFIG ]\n\
-                                 • Charge Limit : {}%\n\
-                                 • Resume Limit : {}%\n\
-                                 • Thermal Cut  : {}\n\
-                                 • Power Save   : {}",
+                                 "OK:\n\
+                                  [ DAEMON STATUS ]\n\
+                                  • Status       : {}\n\
+                                  • PID          : {}\n\
+                                  • Memory (RSS) : {:.2} MB\n\
+                                  • CPU Usage    : {:.3}%\n\
+                                  \n\
+                                  [ CURRENT CONFIG ]\n\
+                                  • Charge Limit : {}%\n\
+                                  • Resume Limit : {}%\n\
+                                  • Thermal Cut  : {}",
                                  if cfg.enabled { "Active (Monitoring)" } else { "Standby (Disabled)" },
                                  pid,
                                  rss,
                                  cpu,
                                  cfg.charge_limit,
                                  cfg.resume_limit,
-                                 if cfg.thermal_cutoff { "ON" } else { "OFF" },
-                                 if cfg.cpu_power_save { "ON" } else { "OFF" }
+                                 if cfg.thermal_cutoff { "ON" } else { "OFF" }
                             )
                         } else {
                             "Error: Failed to lock config".to_string()
@@ -194,10 +194,6 @@ fn handle_client(stream: &mut std::os::unix::net::UnixStream, config: &Arc<RwLoc
                     DaemonCommand::Shutdown => {
                         let _ = stream.write_all(b"OK: Shutting down");
                         let _ = tx.send(&[2]); // 2 = Shutdown
-                        // BUG FIX 3: Remove socket file before forceful exit
-                        let _ = std::fs::remove_file(SOCKET_PATH);
-                        // Exit early via process exit to force immediate shutdown across all threads
-                        std::process::exit(0);
                     }
                 }
             } else {

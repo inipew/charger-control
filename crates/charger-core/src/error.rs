@@ -18,6 +18,9 @@ pub enum ChargerError {
     #[error("Config file read error at {path}: {source}")]
     ConfigRead { path: PathBuf, #[source] source: std::io::Error },
 
+    #[error("Config file write error at {path}: {source}")]
+    ConfigWrite { path: PathBuf, #[source] source: std::io::Error },
+
     #[error("Config parse error: {0}")]
     ConfigParse(String),
 
