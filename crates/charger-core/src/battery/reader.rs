@@ -16,39 +16,45 @@ pub fn read_capacity() -> Result<u8, ChargerError> {
         .map_err(|_| ChargerError::ParseError("capacity"))
 }
 
+pub fn read_capacity_raw() -> Result<f32, ChargerError> {
+    if let Ok(raw) = read_sysfs(Path::new("/sys/class/power_supply/bms/capacity_raw")) {
+        if let Ok(val) = raw.parse::<f32>() {
+            return Ok(if val > 100.0 { val / 100.0 } else { val });
+        }
+    }
+    if let Ok(real) = read_sysfs(Path::new("/sys/class/power_supply/battery/real_soc")) {
+        if let Ok(val) = real.parse::<f32>() {
+            return Ok(val);
+        }
+    }
+    // Fallback to integer capacity
+    read_capacity().map(|v| v as f32)
+}
+
 /// Read input current in microamps from the charger.
 /// Returns positive i64 if power is drawn.
 pub fn read_input_current_ua() -> Result<i64, ChargerError> {
-    let nodes = [
-        "/sys/class/power_supply/main/current_now",
-        "/sys/class/power_supply/main/input_current_now",
-        "/sys/class/power_supply/usb/current_now",
-    ];
-    for p in nodes {
+    for p in crate::battery::nodes::INPUT_CURRENT_NODES {
         if let Ok(raw) = read_sysfs(Path::new(p)) {
             if let Ok(val) = raw.parse::<i64>() {
-                if val != 0 { return Ok(val); }
+                return Ok(val);
             }
         }
     }
-    Ok(0)
+    Err(ChargerError::ParseError("input_current_ua"))
 }
 
 /// Read battery current in microamps.
 /// Returns signed i64 (negative = discharging).
 pub fn read_battery_current_ua() -> Result<i64, ChargerError> {
-    let nodes = [
-        "/sys/class/power_supply/battery/current_now",
-        "/sys/class/power_supply/battery/batt_current_now",
-    ];
-    for p in nodes {
+    for p in crate::battery::nodes::BATTERY_CURRENT_NODES {
         if let Ok(raw) = read_sysfs(Path::new(p)) {
             if let Ok(val) = raw.parse::<i64>() {
-                if val != 0 { return Ok(val); }
+                return Ok(val);
             }
         }
     }
-    Ok(0)
+    Err(ChargerError::ParseError("battery_current_ua"))
 }
 
 pub fn read_voltage_uv() -> Result<u32, ChargerError> {
@@ -124,6 +130,7 @@ pub enum PowerState {
     Attached,
     Connected,
     Charging,
+    Unknown,
 }
 
 impl PowerState {
@@ -135,7 +142,7 @@ impl PowerState {
 /// Get the current 4-Tier power state
 pub fn get_power_state() -> Result<PowerState, ChargerError> {
     // 1. Check AC Online (Source of Truth for Connected)
-    let ac_online = read_sysfs(Path::new("/sys/class/power_supply/ac/online")).unwrap_or_else(|_| "0".into());
+    let ac_online = read_sysfs(Path::new("/sys/class/power_supply/ac/online"))?;
     if ac_online == "1" {
         // Validation: Is it actually charging?
         let status = read_sysfs(Path::new("/sys/class/power_supply/battery/status")).unwrap_or_else(|_| "Unknown".into());
@@ -146,9 +153,10 @@ pub fn get_power_state() -> Result<PowerState, ChargerError> {
     }
     
     // 2. Fallback to early attach hint if AC is offline
-    let typec = read_sysfs(Path::new("/sys/class/power_supply/usb/typec_mode")).unwrap_or_else(|_| "".into());
-    if typec.contains("Source attached") {
-        return Ok(PowerState::Attached);
+    if let Ok(typec) = read_sysfs(Path::new("/sys/class/power_supply/usb/typec_mode")) {
+        if typec.contains("Source attached") {
+            return Ok(PowerState::Attached);
+        }
     }
     
     // 3. Completely disconnected

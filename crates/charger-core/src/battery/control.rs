@@ -111,6 +111,56 @@ pub fn exit_bypass_mode() -> Result<(), ChargerError> {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ActualHardwareMode {
+    Unknown,
+    ChargingEnabled,
+    ChargingDisabled,
+    Bypass,
+    Inconsistent,
+}
+
+pub fn get_actual_charging_state() -> ActualHardwareMode {
+    use crate::battery::reader::read_sysfs;
+    let mut main_charging = None;
+    let mut batt_charging = None;
+    let mut batt_suspend = None;
+    
+    if let Ok(val) = read_sysfs(Path::new("/sys/class/power_supply/main/charging_enabled")) {
+        main_charging = Some(val == "1");
+    }
+    if let Ok(val) = read_sysfs(Path::new("/sys/class/power_supply/battery/charging_enabled")) {
+        batt_charging = Some(val == "1");
+    }
+    if let Ok(val) = read_sysfs(Path::new("/sys/class/power_supply/battery/input_suspend")) {
+        batt_suspend = Some(val == "1");
+    }
+    
+    if batt_charging == Some(false) && batt_suspend == Some(true) {
+        if main_charging == Some(false) {
+            return ActualHardwareMode::Bypass;
+        } else {
+            return ActualHardwareMode::ChargingDisabled;
+        }
+    }
+    
+    // Check Enabled
+    if batt_charging == Some(true) && batt_suspend == Some(false) {
+        return ActualHardwareMode::ChargingEnabled;
+    }
+    
+    // If not matching, it's either inconsistent or unknown
+    if batt_charging.is_none() && batt_suspend.is_none() {
+        ActualHardwareMode::Unknown
+    } else {
+        ActualHardwareMode::Inconsistent
+    }
+}
+
+pub fn has_distinct_bypass_node() -> bool {
+    Path::new("/sys/class/power_supply/main/charging_enabled").exists()
+}
+
 #[cfg(unix)]
 pub fn grant_node_permissions() -> Result<(), ChargerError> {
     use std::os::unix::fs::PermissionsExt;
@@ -125,6 +175,15 @@ pub fn grant_node_permissions() -> Result<(), ChargerError> {
                 perms.set_mode(0o644);
                 let _ = fs::set_permissions(path, perms);
             }
+        }
+    }
+    // Also include battery/charging_enabled since bypass needs it
+    let path = Path::new("/sys/class/power_supply/battery/charging_enabled");
+    if path.exists() {
+        if let Ok(metadata) = fs::metadata(path) {
+            let mut perms = metadata.permissions();
+            perms.set_mode(0o644);
+            let _ = fs::set_permissions(path, perms);
         }
     }
 
