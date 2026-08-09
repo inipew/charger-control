@@ -4,7 +4,7 @@ use charger_core::config::schema::{Config, DEFAULT_CONFIG_PATH};
 use crate::display;
 
 pub fn limit(value: u8) -> Result<(), ChargerError> {
-    if value < 50 || value > 100 {
+    if !(50..=100).contains(&value) {
         display::error("Limit must be between 50 and 100");
         return Ok(());
     }
@@ -27,7 +27,7 @@ pub fn limit(value: u8) -> Result<(), ChargerError> {
 }
 
 pub fn resume(value: u8) -> Result<(), ChargerError> {
-    if value < 40 || value > 99 {
+    if !(40..=99).contains(&value) {
         display::error("Resume limit must be between 40 and 99%");
         return Ok(());
     }
@@ -58,7 +58,7 @@ pub fn thermal(enabled: bool) -> Result<(), ChargerError> {
 }
 
 pub fn max_temp(value: i32) -> Result<(), ChargerError> {
-    if value < 30 || value > 60 {
+    if !(30..=60).contains(&value) {
         display::error("Max temp must be between 30 and 60 °C");
         return Ok(());
     }

@@ -80,7 +80,7 @@ fn main() {
     let (tx, rx) = std::os::unix::net::UnixDatagram::pair().expect("Failed to create UnixDatagram pair for IPC");
     
     // Spawn Background Thread for SIGTERM / SIGINT Signal Handling
-    if let Ok(mut signals) = signal_hook::iterator::Signals::new(&[
+    if let Ok(mut signals) = signal_hook::iterator::Signals::new([
         signal_hook::consts::signal::SIGTERM,
         signal_hook::consts::signal::SIGINT,
     ]) {

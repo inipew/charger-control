@@ -48,7 +48,7 @@ fn start_daemon() {
                 
                 // 2. Double-Fork Magic (Mencegah re-attachment terminal)
                 match libc::fork() {
-                    -1 => return Err(std::io::Error::last_os_error()),
+                    -1 => Err(std::io::Error::last_os_error()),
                     0 => Ok(()), // Cucu (Grandchild) melanjutkan proses execve ke charger-daemon
                     _pid => libc::_exit(0), // Anak pertama langsung bunuh diri
                 }
