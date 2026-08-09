@@ -121,11 +121,6 @@ fn main() -> Result<(), ChargerError> {
             println!("Charging nodes: {:?}", charging);
 
             println!("Suspend nodes : {:?}", suspend);
-
-            println!(
-                "Main charging : {}",
-                std::path::Path::new(charger_core::battery::nodes::MAIN_CHARGING_NODE).exists()
-            );
         }
 
         Commands::GrantPerms => {

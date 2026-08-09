@@ -2,6 +2,9 @@ use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 
 pub const DEFAULT_CONFIG_PATH: &str = "/data/adb/charger-control/config.toml";
+pub const DEFAULT_PID_PATH: &str = "/data/adb/charger-control/daemon.pid";
+pub const DEFAULT_LOCK_PATH: &str = "/data/adb/charger-control/daemon.lock";
+pub const DEFAULT_SOCKET_PATH: &str = "/data/adb/charger-control/daemon.sock";
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
