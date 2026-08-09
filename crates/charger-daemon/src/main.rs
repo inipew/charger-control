@@ -85,16 +85,15 @@ fn main() {
         signal_hook::consts::signal::SIGTERM,
         signal_hook::consts::signal::SIGINT,
     ]) {
+        let tx_signal = tx.try_clone().expect("Failed to clone UnixDatagram for signals");
         std::thread::spawn(move || {
             if let Some(sig) = signals.forever().next() {
                 tracing::info!(
-                    "Received signal {}, restoring charging state and exiting...",
+                    "Received signal {}, initiating graceful shutdown...",
                     sig
                 );
-                let _ = charger_core::battery::control::set_charging(true);
-                let _ = std::fs::remove_file(ipc::SOCKET_PATH);
-                let _ = std::fs::remove_file("/data/adb/charger-control/daemon.lock");
-                std::process::exit(0);
+                let _ = tx_signal.send(&[2]);
+                // The main thread will receive this, restore hardware, and exit
             }
         });
     }

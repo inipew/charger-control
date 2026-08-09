@@ -137,17 +137,31 @@ fn handle_client(
                 tracing::info!("Received IPC command: {:?}", cmd);
                 match cmd {
                     DaemonCommand::BypassOn => {
-                        if let Err(e) = charger_core::battery::control::enter_bypass_mode() {
-                            let _ = stream.write_all(format!("Error: {e}").as_bytes());
-                        } else {
-                            let _ = stream.write_all(b"OK: Bypass ON");
+                        match charger_core::battery::control::enter_bypass_mode() {
+                            Ok(res) if res.all_succeeded() => {
+                                let _ = stream.write_all(b"OK: Bypass ON");
+                            }
+                            Ok(res) => {
+                                let msg = format!("Error: Partial failure ({} succeeded, {} failed)", res.succeeded, res.failed);
+                                let _ = stream.write_all(msg.as_bytes());
+                            }
+                            Err(e) => {
+                                let _ = stream.write_all(format!("Error: {e}").as_bytes());
+                            }
                         }
                     }
                     DaemonCommand::BypassOff => {
-                        if let Err(e) = charger_core::battery::control::exit_bypass_mode() {
-                            let _ = stream.write_all(format!("Error: {e}").as_bytes());
-                        } else {
-                            let _ = stream.write_all(b"OK: Bypass OFF");
+                        match charger_core::battery::control::exit_bypass_mode() {
+                            Ok(res) if res.all_succeeded() => {
+                                let _ = stream.write_all(b"OK: Bypass OFF");
+                            }
+                            Ok(res) => {
+                                let msg = format!("Error: Partial failure ({} succeeded, {} failed)", res.succeeded, res.failed);
+                                let _ = stream.write_all(msg.as_bytes());
+                            }
+                            Err(e) => {
+                                let _ = stream.write_all(format!("Error: {e}").as_bytes());
+                            }
                         }
                     }
                     DaemonCommand::Reload => {

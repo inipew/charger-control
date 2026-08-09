@@ -32,8 +32,6 @@ enum Commands {
     },
     /// Find available charging nodes
     Nodes,
-    /// Grant permissions to charging nodes
-    GrantPerms,
 }
 
 #[derive(Subcommand)]
@@ -66,10 +64,6 @@ fn main() -> Result<(), ChargerError> {
             );
             println!("Charging node: {:?}", chg);
             println!("Suspend node: {:?}", sus);
-        }
-        Commands::GrantPerms => {
-            charger_core::battery::control::grant_node_permissions()?;
-            println!("Granted 0644 to sysfs charging nodes");
         }
     }
 

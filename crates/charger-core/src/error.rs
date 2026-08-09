@@ -41,4 +41,11 @@ pub enum ChargerError {
 
     #[error("Daemon not running (no socket at {0})")]
     DaemonNotRunning(String),
+
+    #[error("Persistent state error at {path}: {source}")]
+    StateError {
+        path: PathBuf,
+        #[source]
+        source: std::io::Error,
+    },
 }

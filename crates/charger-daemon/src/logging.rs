@@ -1,5 +1,6 @@
 use std::path::Path;
 use tracing_subscriber::{fmt, EnvFilter};
+use tracing_subscriber::fmt::time::LocalTime;
 
 pub fn init_logger(log_path: &Path) -> Result<(), std::io::Error> {
     if let Some(parent) = log_path.parent() {
@@ -14,6 +15,7 @@ pub fn init_logger(log_path: &Path) -> Result<(), std::io::Error> {
     let subscriber = fmt::Subscriber::builder()
         .with_env_filter(EnvFilter::from_default_env().add_directive(tracing::Level::INFO.into()))
         .with_writer(file)
+        .with_timer(LocalTime::rfc_3339())
         .with_ansi(false) // No colors in file
         .finish();
 
