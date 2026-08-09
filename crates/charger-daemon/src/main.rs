@@ -1,12 +1,20 @@
+#[cfg(any(target_os = "linux", target_os = "android"))]
 mod ipc;
+#[cfg(any(target_os = "linux", target_os = "android"))]
 mod logging;
+#[cfg(any(target_os = "linux", target_os = "android"))]
 mod monitor;
 
+#[cfg(any(target_os = "linux", target_os = "android"))]
 use charger_core::config::schema::{Config, DEFAULT_CONFIG_PATH};
+#[cfg(any(target_os = "linux", target_os = "android"))]
 use std::os::unix::io::AsRawFd;
+#[cfg(any(target_os = "linux", target_os = "android"))]
 use std::path::Path;
+#[cfg(any(target_os = "linux", target_os = "android"))]
 use std::sync::{Arc, RwLock};
 
+#[cfg(any(target_os = "linux", target_os = "android"))]
 fn setup_environment() {
     unsafe {
         libc::umask(0o022);
@@ -14,6 +22,7 @@ fn setup_environment() {
     }
 }
 
+#[cfg(any(target_os = "linux", target_os = "android"))]
 fn acquire_lock() -> Result<std::fs::File, String> {
     let lock_path = "/data/adb/charger-control/daemon.lock";
     if let Some(p) = std::path::Path::new(lock_path).parent() {
@@ -37,7 +46,14 @@ fn acquire_lock() -> Result<std::fs::File, String> {
     Ok(file)
 }
 
+// 1. SATU fungsi main tanpa kondisi apa pun
 fn main() {
+    run_daemon();
+}
+
+// 2. Fungsi run_daemon khusus Linux & Android
+#[cfg(any(target_os = "linux", target_os = "android"))]
+fn run_daemon() {
     setup_environment();
 
     // Simpan file lock agar tidak di-drop selama daemon hidup
@@ -108,4 +124,11 @@ fn main() {
     monitor::run_monitor_loop(shared_config, rx);
 
     tracing::info!("Daemon exited gracefully");
+}
+
+// 3. Fallback jika BUKAN Linux dan BUKAN Android
+#[cfg(not(any(target_os = "linux", target_os = "android")))]
+fn run_daemon() {
+    eprintln!("charger-daemon is only supported on Linux and Android.");
+    std::process::exit(1);
 }

@@ -1,4 +1,4 @@
-use crate::{battery::nodes::*, error::ChargerError};
+use crate::{hardware::profile::*, error::ChargerError};
 use std::{fs, path::Path};
 
 /// Status of the battery from sysfs
@@ -31,11 +31,11 @@ pub fn read_capacity() -> Result<u8, ChargerError> {
 
 /// Read current in mA from first available node based on priority.
 /// Returns signed i32 (negative = discharging).
-pub fn read_current_ma() -> Result<i32, ChargerError> {
+pub fn read_current_ma(profile: &crate::hardware::profile::HardwareProfile) -> Result<i32, ChargerError> {
     let mut best_val: Option<i32> = None;
     let mut highest_prio: Option<u8> = None;
 
-    for node in CURRENT_NODES {
+    for node in profile.current_nodes {
         if let Ok(raw) = read_sysfs(Path::new(node.path)) {
             if let Ok(value) = raw.parse::<i64>() {
                 if value == 0 {
@@ -57,7 +57,7 @@ pub fn read_current_ma() -> Result<i32, ChargerError> {
         }
     }
 
-    Ok(best_val.ok_or(ChargerError::ParseError("No valid current reading found"))?)
+    best_val.ok_or(ChargerError::ParseError("No valid current reading found"))
 }
 
 pub fn read_voltage_uv() -> Result<u32, ChargerError> {
@@ -197,6 +197,8 @@ struct OnlineFd {
 }
 
 pub struct CachedReader {
+    profile: &'static crate::hardware::profile::HardwareProfile,
+
     capacity: BatteryFd,
     temperature: BatteryFd,
     status: BatteryFd,
@@ -237,18 +239,13 @@ pub struct CachedReader {
     next_online_rescan: Instant,
 }
 
-impl Default for CachedReader {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
 impl CachedReader {
-    pub fn new() -> Self {
+    pub fn new(profile: &'static crate::hardware::profile::HardwareProfile) -> Self {
         let mut reader = Self {
-            capacity: BatteryFd { path: "/sys/class/power_supply/battery/capacity", file: None },
-            temperature: BatteryFd { path: "/sys/class/power_supply/battery/temp", file: None },
-            status: BatteryFd { path: "/sys/class/power_supply/battery/status", file: None },
+            profile,
+            capacity: BatteryFd { path: profile.capacity_path, file: None },
+            temperature: BatteryFd { path: profile.temperature_path, file: None },
+            status: BatteryFd { path: profile.status_path, file: None },
 
             current_fds: Vec::new(),
             online_fds: Vec::new(),
@@ -304,7 +301,7 @@ impl CachedReader {
          */
         self.current_fds.clear();
 
-        for config in CURRENT_NODES {
+        for config in self.profile.current_nodes {
             match File::open(config.path) {
                 Ok(file) => {
                     self.current_fds.push(CurrentFd { config: *config, file });
@@ -325,7 +322,7 @@ impl CachedReader {
     fn rescan_online_nodes(&mut self) {
         self.online_fds.clear();
 
-        for config in ONLINE_NODES {
+        for config in self.profile.online_nodes {
             match File::open(config.path) {
                 Ok(file) => {
                     self.online_fds.push(OnlineFd { file });
@@ -517,7 +514,7 @@ impl CachedReader {
             );
         }
 
-        Ok(best_val.ok_or(ChargerError::ParseError("No valid current reading found in cache"))?)
+        best_val.ok_or(ChargerError::ParseError("No valid current reading found in cache"))
     }
 
     // ========================================================================

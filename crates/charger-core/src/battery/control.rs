@@ -1,12 +1,11 @@
-use crate::{battery::nodes::*, error::ChargerError};
-use std::{fs, path::Path};
+use crate::error::ChargerError;
+use std::path::Path;
+
+use crate::hardware::io::HardwareIo;
 
 /// Write a value to a sysfs node with proper error context.
-pub fn write_sysfs(path: &Path, value: &str) -> Result<(), ChargerError> {
-    fs::write(path, value).map_err(|e| ChargerError::SysfsWrite {
-        path: path.to_owned(),
-        source: e,
-    })
+pub fn write_sysfs(path: &Path, value: &str, io: &dyn HardwareIo) -> Result<(), ChargerError> {
+    io.write(path, value)
 }
 
 /// Result of attempting to write all charging-control nodes.
@@ -61,7 +60,7 @@ impl ChargingWriteResult {
 ///
 /// This is important because a partial write means the hardware may be in
 /// a mixed state and should not be treated as a fully successful operation.
-pub fn set_charging(enable: bool) -> Result<ChargingWriteResult, ChargerError> {
+pub fn set_charging(enable: bool, profile: &crate::hardware::profile::HardwareProfile, io: &dyn HardwareIo) -> Result<ChargingWriteResult, ChargerError> {
     let charge_val = if enable { "1" } else { "0" };
     let suspend_val = if enable { "0" } else { "1" };
 
@@ -74,16 +73,17 @@ pub fn set_charging(enable: bool) -> Result<ChargingWriteResult, ChargerError> {
     let mut last_error: Option<ChargerError> = None;
 
     // charging_enabled-style nodes.
-    for node in CHARGING_NODES {
+    for node in profile.charging_nodes {
         let path = Path::new(node);
 
-        if !path.exists() {
+
+        if !io.exists(path) {
             continue;
         }
 
         result.attempted += 1;
 
-        match write_sysfs(path, charge_val) {
+        match write_sysfs(path, charge_val, io) {
             Ok(()) => {
                 result.succeeded += 1;
                 tracing::debug!(
@@ -108,16 +108,16 @@ pub fn set_charging(enable: bool) -> Result<ChargingWriteResult, ChargerError> {
     }
 
     // input_suspend-style nodes.
-    for node in SUSPEND_NODES {
+    for node in profile.suspend_nodes {
         let path = Path::new(node);
 
-        if !path.exists() {
+        if !io.exists(path) {
             continue;
         }
 
         result.attempted += 1;
 
-        match write_sysfs(path, suspend_val) {
+        match write_sysfs(path, suspend_val, io) {
             Ok(()) => {
                 result.succeeded += 1;
                 tracing::debug!(
@@ -159,8 +159,7 @@ pub fn set_charging(enable: bool) -> Result<ChargingWriteResult, ChargerError> {
         // least one error should have been recorded.
         return Err(ChargerError::SysfsWrite {
             path: Path::new("charging_nodes").to_path_buf(),
-            source: std::io::Error::new(
-                std::io::ErrorKind::Other,
+            source: std::io::Error::other(
                 "All charging node writes failed",
             ),
         });
@@ -190,7 +189,7 @@ pub fn set_charging(enable: bool) -> Result<ChargingWriteResult, ChargerError> {
 }
 
 /// Activate bypass mode (disconnect input power from battery).
-pub fn enter_bypass_mode() -> Result<ChargingWriteResult, ChargerError> {
+pub fn enter_bypass_mode(io: &dyn HardwareIo) -> Result<ChargingWriteResult, ChargerError> {
     let nodes = [
         ("/sys/class/power_supply/battery/input_suspend", "1"),
         ("/sys/class/power_supply/battery/charging_enabled", "0"),
@@ -205,9 +204,9 @@ pub fn enter_bypass_mode() -> Result<ChargingWriteResult, ChargerError> {
 
     for (path, val) in &nodes {
         let p = Path::new(path);
-        if p.exists() {
+        if io.exists(p) {
             result.attempted += 1;
-            if let Err(e) = write_sysfs(p, val) {
+            if let Err(e) = write_sysfs(p, val, io) {
                 result.failed += 1;
                 last_error = Some(e);
             } else {
@@ -226,8 +225,7 @@ pub fn enter_bypass_mode() -> Result<ChargingWriteResult, ChargerError> {
         }
         return Err(ChargerError::SysfsWrite {
             path: Path::new("bypass_nodes").to_path_buf(),
-            source: std::io::Error::new(
-                std::io::ErrorKind::Other,
+            source: std::io::Error::other(
                 "All bypass node writes failed",
             ),
         });
@@ -237,7 +235,7 @@ pub fn enter_bypass_mode() -> Result<ChargingWriteResult, ChargerError> {
 }
 
 /// Restore normal charging from bypass mode.
-pub fn exit_bypass_mode() -> Result<ChargingWriteResult, ChargerError> {
+pub fn exit_bypass_mode(io: &dyn HardwareIo) -> Result<ChargingWriteResult, ChargerError> {
     let nodes = [
         ("/sys/class/power_supply/battery/input_suspend", "0"),
         ("/sys/class/power_supply/battery/charging_enabled", "1"),
@@ -252,9 +250,9 @@ pub fn exit_bypass_mode() -> Result<ChargingWriteResult, ChargerError> {
 
     for (path, val) in &nodes {
         let p = Path::new(path);
-        if p.exists() {
+        if io.exists(p) {
             result.attempted += 1;
-            if let Err(e) = write_sysfs(p, val) {
+            if let Err(e) = write_sysfs(p, val, io) {
                 result.failed += 1;
                 last_error = Some(e);
             } else {
@@ -273,8 +271,7 @@ pub fn exit_bypass_mode() -> Result<ChargingWriteResult, ChargerError> {
         }
         return Err(ChargerError::SysfsWrite {
             path: Path::new("bypass_nodes").to_path_buf(),
-            source: std::io::Error::new(
-                std::io::ErrorKind::Other,
+            source: std::io::Error::other(
                 "All bypass node writes failed",
             ),
         });
@@ -336,8 +333,8 @@ impl ChargingNode {
         }
     }
 
-    fn read_state(&self) -> Result<ChargingNodeState, std::io::Error> {
-        let content = fs::read_to_string(self.path)?;
+    fn read_state(&self, io: &dyn HardwareIo) -> Result<ChargingNodeState, std::io::Error> {
+        let content = io.read(Path::new(self.path)).map_err(|e| std::io::Error::other(e.to_string()))?;
         let value = content.trim();
 
         match self.kind {
@@ -365,8 +362,8 @@ impl ChargingNode {
 ///  80 = input suspend
 ///
 /// The exact vendor hierarchy can later be adjusted in one place.
-fn charging_nodes() -> impl Iterator<Item = ChargingNode> {
-    CHARGING_NODES
+fn charging_nodes(profile: &crate::hardware::profile::HardwareProfile) -> impl Iterator<Item = ChargingNode> {
+    profile.charging_nodes
         .iter()
         .copied()
         .map(|path| {
@@ -380,7 +377,7 @@ fn charging_nodes() -> impl Iterator<Item = ChargingNode> {
 
             ChargingNode::charging_enabled(path, priority)
         })
-        .chain(SUSPEND_NODES.iter().copied().map(|path| {
+        .chain(profile.suspend_nodes.iter().copied().map(|path| {
             ChargingNode::input_suspend(path, 80)
         }))
 }
@@ -401,18 +398,18 @@ struct NodeObservation {
 ///
 /// This prevents a stale low-priority vendor node from
 /// overriding the actual primary charging controller.
-pub fn read_charging_state() -> Result<ChargingState, ChargerError> {
+pub fn read_charging_state(profile: &crate::hardware::profile::HardwareProfile, io: &dyn HardwareIo) -> Result<ChargingState, ChargerError> {
     let mut observations: Vec<NodeObservation> =
-        Vec::with_capacity(CHARGING_NODES.len() + SUSPEND_NODES.len());
+        Vec::with_capacity(profile.charging_nodes.len() + profile.suspend_nodes.len());
 
-    for node in charging_nodes() {
+    for node in charging_nodes(profile) {
         let path = Path::new(node.path);
 
-        if !path.exists() {
+        if !io.exists(path) {
             continue;
         }
 
-        let state = match node.read_state() {
+        let state = match node.read_state(io) {
             Ok(state) => state,
 
             Err(e) => {
@@ -523,8 +520,8 @@ pub fn read_charging_state() -> Result<ChargingState, ChargerError> {
 }
 
 /// Compatibility helper.
-pub fn is_charging_enabled() -> Result<bool, ChargerError> {
-    match read_charging_state()? {
+pub fn is_charging_enabled(profile: &crate::hardware::profile::HardwareProfile, io: &dyn HardwareIo) -> Result<bool, ChargerError> {
+    match read_charging_state(profile, io)? {
         ChargingState::Enabled => Ok(true),
         ChargingState::Disabled => Ok(false),
         ChargingState::Mixed | ChargingState::Unknown => {

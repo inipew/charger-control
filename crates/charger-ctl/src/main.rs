@@ -1,16 +1,20 @@
 use charger_core::error::ChargerError;
 use clap::{Parser, Subcommand};
 
+#[cfg(any(target_os = "linux", target_os = "android"))]
 mod cmd;
+#[cfg(any(target_os = "linux", target_os = "android"))]
 mod display;
 
 #[derive(Parser)]
 #[command(name = "charger-ctl", about = "Advanced battery charging control CLI")]
 struct Cli {
+    #[cfg(any(target_os = "linux", target_os = "android"))]
     #[command(subcommand)]
     command: Commands,
 }
 
+#[cfg(any(target_os = "linux", target_os = "android"))]
 #[derive(Subcommand)]
 enum Commands {
     /// Show current battery status
@@ -34,6 +38,7 @@ enum Commands {
     Nodes,
 }
 
+#[cfg(any(target_os = "linux", target_os = "android"))]
 #[derive(Subcommand)]
 enum SetTarget {
     Limit { value: u8 },
@@ -42,7 +47,14 @@ enum SetTarget {
     MaxTemp { value: i32 },
 }
 
+// 1. Buat SATU fungsi main utama tanpa #[cfg]
 fn main() -> Result<(), ChargerError> {
+    run_app()
+}
+
+// 2. Fungsi run_app() khusus untuk Linux & Android
+#[cfg(any(target_os = "linux", target_os = "android"))]
+fn run_app() -> Result<(), ChargerError> {
     let cli = Cli::parse();
 
     match &cli.command {
@@ -56,16 +68,25 @@ fn main() -> Result<(), ChargerError> {
         Commands::Bypass { state } => cmd::bypass::run(state == "on")?,
         Commands::Daemon { action } => cmd::daemon::run(action)?,
         Commands::Nodes => {
-            let chg = charger_core::battery::nodes::detect_node(
-                charger_core::battery::nodes::CHARGING_NODES,
-            );
-            let sus = charger_core::battery::nodes::detect_node(
-                charger_core::battery::nodes::SUSPEND_NODES,
-            );
-            println!("Charging node: {:?}", chg);
-            println!("Suspend node: {:?}", sus);
+            let profile = &charger_core::hardware::profile::GENERIC_PROFILE;
+            println!("Profile: {}", profile.name);
+            println!("Charging nodes ({} configured):", profile.charging_nodes.len());
+            for node in profile.charging_nodes {
+                println!("  - {:?}", node);
+            }
+            println!("Suspend nodes ({} configured):", profile.suspend_nodes.len());
+            for node in profile.suspend_nodes {
+                println!("  - {:?}", node);
+            }
         }
     }
 
     Ok(())
+}
+
+// 3. Fungsi run_app() fallback untuk OS selain Linux & Android
+#[cfg(not(any(target_os = "linux", target_os = "android")))]
+fn run_app() -> Result<(), ChargerError> {
+    eprintln!("charger-ctl is only supported on Linux and Android.");
+    std::process::exit(1);
 }

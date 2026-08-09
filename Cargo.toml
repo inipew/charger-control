@@ -2,7 +2,7 @@
 members = [
     "crates/charger-core",
     "crates/charger-daemon",
-    "crates/charger-ctl",
+    "crates/charger-ctl", "test_os",
 ]
 resolver = "2"
 

@@ -137,7 +137,8 @@ fn handle_client(
                 tracing::info!("Received IPC command: {:?}", cmd);
                 match cmd {
                     DaemonCommand::BypassOn => {
-                        match charger_core::battery::control::enter_bypass_mode() {
+                        let hw_io = charger_core::hardware::io::SysfsIo;
+                        match charger_core::battery::control::enter_bypass_mode(&hw_io) {
                             Ok(res) if res.all_succeeded() => {
                                 let _ = stream.write_all(b"OK: Bypass ON");
                             }
@@ -151,7 +152,8 @@ fn handle_client(
                         }
                     }
                     DaemonCommand::BypassOff => {
-                        match charger_core::battery::control::exit_bypass_mode() {
+                        let hw_io = charger_core::hardware::io::SysfsIo;
+                        match charger_core::battery::control::exit_bypass_mode(&hw_io) {
                             Ok(res) if res.all_succeeded() => {
                                 let _ = stream.write_all(b"OK: Bypass OFF");
                             }

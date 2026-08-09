@@ -1,5 +1,6 @@
 use std::mem;
 
+#[cfg(target_os = "linux")]
 fn main() {
     println!("[*] Menguji Kernel Netlink UEVENT (NETLINK_KOBJECT_UEVENT)...");
     println!("[*] Tekan Ctrl+C untuk berhenti.");
@@ -79,4 +80,10 @@ fn main() {
             break;
         }
     }
+}
+
+#[cfg(not(target_os = "linux"))]
+fn main() {
+    eprintln!("test_poll is only supported on Linux.");
+    std::process::exit(1);
 }
