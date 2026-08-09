@@ -1,4 +1,7 @@
-use std::{fs, path::Path};
+use std::{
+    fs,
+    path::{Path},
+};
 
 use crate::{
     battery::nodes::*,
@@ -12,6 +15,10 @@ const BATTERY_INPUT_SUSPEND_NODE: &str =
     "/sys/class/power_supply/battery/input_suspend";
 
 /// Write a value to a sysfs node.
+///
+/// This function deliberately does not perform existence checks first.
+/// Sysfs nodes can disappear/reappear with driver state changes, so the
+/// write itself is the authoritative operation.
 pub fn write_sysfs(
     path: &Path,
     value: &str,
@@ -26,28 +33,66 @@ pub fn write_sysfs(
 
 /// Write to an optional sysfs node.
 ///
-/// `Ok(false)` means the node does not exist.
-/// `Ok(true)` means the write succeeded.
+/// Returns:
+/// - Ok(false) if the node does not exist
+/// - Ok(true) if the write succeeds
+/// - Err(...) for a real I/O/permission/write failure
 fn write_optional_node(
     path: &str,
     value: &str,
 ) -> Result<bool, ChargerError> {
-    let path = Path::new(path);
+    let path_ref = Path::new(path);
 
-    if !path.exists() {
-        return Ok(false);
+    match write_sysfs(path_ref, value) {
+        Ok(()) => Ok(true),
+
+        Err(ChargerError::SysfsWrite { source, .. })
+            if source.kind() == std::io::ErrorKind::NotFound =>
+        {
+            tracing::debug!(
+                path = path,
+                "optional sysfs node not present"
+            );
+
+            Ok(false)
+        }
+
+        Err(error) => Err(error),
     }
-
-    write_sysfs(path, value)?;
-    Ok(true)
 }
 
-/// Apply a set of sysfs writes.
+/// Read a boolean sysfs node.
 ///
 /// Returns:
-/// - Ok(()) when all available nodes succeeded
-/// - PartialWriteFailure when some nodes failed
-/// - NoChargingNodeFound when no node exists
+/// - Some(true) for "1"
+/// - Some(false) for "0"
+/// - None when unavailable or invalid
+fn read_bool_node(path: &str) -> Option<bool> {
+    match fs::read_to_string(path) {
+        Ok(value) => match value.trim() {
+            "1" => Some(true),
+            "0" => Some(false),
+            _ => None,
+        },
+
+        Err(_) => None,
+    }
+}
+
+/// Apply a sequence of sysfs writes.
+///
+/// The order of nodes is intentional.
+///
+/// We do not try to make sysfs transactional because sysfs itself does not
+/// provide transactions. Instead, callers provide a safe ordering so that
+/// partial failure leaves the hardware in the least dangerous state.
+///
+/// Returns:
+/// - Ok(()) when at least one available node was written successfully and
+///   no available node failed.
+/// - NoChargingNodeFound when none of the requested nodes exists.
+/// - PartialWriteFailure when one or more nodes succeeded but another
+///   available node failed.
 fn apply_nodes(
     nodes: &[(&str, &str)],
     operation: &str,
@@ -69,20 +114,18 @@ fn apply_nodes(
             }
 
             Ok(false) => {
-                tracing::debug!(
-                    operation = operation,
-                    path = path,
-                    "sysfs node not present"
-                );
+                // Optional node simply does not exist.
+                continue;
             }
 
-            Err(e) => {
+            Err(error) => {
                 failed += 1;
 
                 tracing::warn!(
                     operation = operation,
                     path = path,
-                    error = %e,
+                    value = value,
+                    error = %error,
                     "sysfs write failed"
                 );
             }
@@ -103,44 +146,72 @@ fn apply_nodes(
     Ok(())
 }
 
-/// Enable or disable normal charging.
+/// Apply charging ON.
 ///
-/// Enable:
-///     charging_enabled = 1
-///     input_suspend    = 0
+/// Safe ordering:
 ///
-/// Disable:
-///     charging_enabled = 0
-///     input_suspend    = 1
+/// 1. Enable charging control.
+/// 2. Remove input suspend.
 ///
-/// The function intentionally writes all known nodes instead of stopping
-/// after the first successful write.
-pub fn set_charging(enable: bool) -> Result<(), ChargerError> {
-    let charging_value = if enable { "1" } else { "0" };
-    let suspend_value = if enable { "0" } else { "1" };
-
+/// This avoids briefly exposing a state where input is enabled while the
+/// charging control is still explicitly disabled.
+fn enable_charging_nodes() -> Result<(), ChargerError> {
     let nodes = [
-        (BATTERY_CHARGING_NODE, charging_value),
-        (BATTERY_INPUT_SUSPEND_NODE, suspend_value),
+        (BATTERY_CHARGING_NODE, "1"),
+        (MAIN_CHARGING_NODE, "1"),
+        (BATTERY_INPUT_SUSPEND_NODE, "0"),
     ];
 
-    apply_nodes(
-        &nodes,
-        if enable {
-            "charging_on"
-        } else {
-            "charging_off"
-        },
-    )
+    apply_nodes(&nodes, "charging_on")
+}
+
+/// Apply charging OFF.
+///
+/// Safe ordering:
+///
+/// 1. Suspend battery input.
+/// 2. Disable battery charging.
+/// 3. Disable main charging control.
+///
+/// Suspending input first reduces the chance of a transient charging state
+/// while the other control nodes are being updated.
+fn disable_charging_nodes() -> Result<(), ChargerError> {
+    let nodes = [
+        (BATTERY_INPUT_SUSPEND_NODE, "1"),
+        (BATTERY_CHARGING_NODE, "0"),
+        (MAIN_CHARGING_NODE, "0"),
+    ];
+
+    apply_nodes(&nodes, "charging_off")
+}
+
+/// Enable or disable normal charging.
+///
+/// The function intentionally does not perform a read-before-write.
+/// The monitor already performs hardware reconciliation and avoids calling
+/// this function when the requested state is already known to be correct.
+///
+/// Keeping this function write-oriented also avoids an extra set of sysfs
+/// reads during every policy transition.
+pub fn set_charging(
+    enable: bool,
+) -> Result<(), ChargerError> {
+    if enable {
+        enable_charging_nodes()
+    } else {
+        disable_charging_nodes()
+    }
 }
 
 /// Enter bypass mode.
 ///
-/// If `main/charging_enabled` exists, it is disabled too.
+/// Bypass is represented by:
 ///
-/// This gives devices with a distinct main charging control node a true
-/// bypass state while still supporting devices that only expose battery
-/// charging nodes.
+///     input_suspend    = 1
+///     charging_enabled = 0
+///     main/charging    = 0   (when available)
+///
+/// The suspend operation is deliberately performed first.
 pub fn enter_bypass_mode() -> Result<(), ChargerError> {
     let nodes = [
         (BATTERY_INPUT_SUSPEND_NODE, "1"),
@@ -151,12 +222,21 @@ pub fn enter_bypass_mode() -> Result<(), ChargerError> {
     apply_nodes(&nodes, "bypass_on")
 }
 
-/// Exit bypass mode and restore normal charging.
+/// Exit bypass mode.
+///
+/// Restore order:
+///
+///     charging_enabled = 1
+///     main/charging    = 1   (when available)
+///     input_suspend    = 0
+///
+/// Input suspend is removed last so that charging controls are already
+/// enabled before power input is allowed again.
 pub fn exit_bypass_mode() -> Result<(), ChargerError> {
     let nodes = [
-        (BATTERY_INPUT_SUSPEND_NODE, "0"),
         (BATTERY_CHARGING_NODE, "1"),
         (MAIN_CHARGING_NODE, "1"),
+        (BATTERY_INPUT_SUSPEND_NODE, "0"),
     ];
 
     apply_nodes(&nodes, "bypass_off")
@@ -173,42 +253,47 @@ pub enum ActualHardwareMode {
 
 /// Read the actual charging state from sysfs.
 ///
-/// The daemon should use this function for reconciliation instead of
-/// trusting its own previous desired state.
+/// Important:
+/// - battery/charging_enabled + input_suspend are the primary pair.
+/// - main/charging_enabled is optional.
+/// - absence of the optional main node must NOT turn an otherwise valid
+///   battery state into Unknown.
+///
+/// Classification:
+///
+/// ChargingEnabled:
+///     charging_enabled = 1
+///     input_suspend    = 0
+///     optional main node, if present, must be 1
+///
+/// ChargingDisabled:
+///     charging_enabled = 0
+///     input_suspend    = 1
+///
+/// Bypass:
+///     charging_enabled = 0
+///     input_suspend    = 1
+///     main/charging_enabled = 0
+///
+/// Inconsistent:
+///     readable nodes disagree.
+///
+/// Unknown:
+///     no useful charging-control information can be read.
 pub fn get_actual_charging_state() -> ActualHardwareMode {
-    use crate::battery::reader::read_sysfs;
+    let battery_charging =
+        read_bool_node(BATTERY_CHARGING_NODE);
 
-    let battery_charging = read_sysfs(
-        Path::new(BATTERY_CHARGING_NODE),
-    )
-    .ok()
-    .and_then(|v| match v.as_str() {
-        "1" => Some(true),
-        "0" => Some(false),
-        _ => None,
-    });
+    let battery_suspend =
+        read_bool_node(BATTERY_INPUT_SUSPEND_NODE);
 
-    let battery_suspend = read_sysfs(
-        Path::new(BATTERY_INPUT_SUSPEND_NODE),
-    )
-    .ok()
-    .and_then(|v| match v.as_str() {
-        "1" => Some(true),
-        "0" => Some(false),
-        _ => None,
-    });
+    let main_charging =
+        read_bool_node(MAIN_CHARGING_NODE);
 
-    let main_charging = read_sysfs(
-        Path::new(MAIN_CHARGING_NODE),
-    )
-    .ok()
-    .and_then(|v| match v.as_str() {
-        "1" => Some(true),
-        "0" => Some(false),
-        _ => None,
-    });
-
+    // ---------------------------------------------------------
     // Nothing readable.
+    // ---------------------------------------------------------
+
     if battery_charging.is_none()
         && battery_suspend.is_none()
         && main_charging.is_none()
@@ -216,62 +301,79 @@ pub fn get_actual_charging_state() -> ActualHardwareMode {
         return ActualHardwareMode::Unknown;
     }
 
-    let battery_off = battery_charging == Some(false);
-    let suspended = battery_suspend == Some(true);
-    let main_off = main_charging == Some(false);
+    // ---------------------------------------------------------
+    // BYPASS / CHARGING DISABLED
+    // ---------------------------------------------------------
 
-    // Distinct bypass:
-    //
-    // battery charging = OFF
-    // input suspend     = ON
-    // main charging     = OFF
-    //
-    // Only classify as distinct bypass when main node exists/readable.
-    if battery_off
-        && suspended
-        && main_off
-    {
-        return ActualHardwareMode::Bypass;
+    let battery_off =
+        battery_charging == Some(false);
+
+    let suspended =
+        battery_suspend == Some(true);
+
+    if battery_off && suspended {
+        // A readable main node with value 0 distinguishes
+        // the dedicated bypass state.
+        if main_charging == Some(false) {
+            return ActualHardwareMode::Bypass;
+        }
+
+        // If main node does not exist, this is ordinary charging
+        // disabled on a device without a distinct bypass control.
+        if main_charging.is_none()
+            || main_charging == Some(true)
+        {
+            return ActualHardwareMode::ChargingDisabled;
+        }
+
+        return ActualHardwareMode::Inconsistent;
     }
 
-    // Normal charging enabled.
-    //
-    // Battery nodes are the minimum authoritative pair.
+    // ---------------------------------------------------------
+    // CHARGING ENABLED
+    // ---------------------------------------------------------
+
     if battery_charging == Some(true)
         && battery_suspend == Some(false)
     {
-        // If main node exists, it must also be enabled.
-        if let Some(main) = main_charging {
-            if main {
+        // If main charging exists, it must agree.
+        match main_charging {
+            Some(true) => {
                 return ActualHardwareMode::ChargingEnabled;
             }
 
-            return ActualHardwareMode::Inconsistent;
+            None => {
+                return ActualHardwareMode::ChargingEnabled;
+            }
+
+            Some(false) => {
+                return ActualHardwareMode::Inconsistent;
+            }
         }
-
-        return ActualHardwareMode::ChargingEnabled;
     }
 
-    // Normal charging disabled.
-    if battery_off && suspended {
-        return ActualHardwareMode::ChargingDisabled;
-    }
+    // ---------------------------------------------------------
+    // PARTIAL / CONFLICTING STATE
+    // ---------------------------------------------------------
 
     ActualHardwareMode::Inconsistent
 }
 
 /// Returns true when the device exposes a distinct main charging node.
 ///
-/// This is used only to distinguish BYPASS from normal charging-disabled
-/// state. It does not itself prove that bypass is currently active.
+/// This function only checks whether the node exists. It does not claim
+/// that bypass is currently active.
 pub fn has_distinct_bypass_node() -> bool {
     Path::new(MAIN_CHARGING_NODE).exists()
 }
 
 /// Grant write permission to all known charging nodes.
 ///
-/// This is intended for environments where the daemon is responsible for
-/// preparing sysfs permissions before using the nodes.
+/// This should normally be called once during daemon initialization,
+/// not from the monitor loop.
+///
+/// Changing sysfs permissions is intentionally kept outside normal
+/// charging transitions to avoid unnecessary filesystem operations.
 #[cfg(unix)]
 pub fn grant_node_permissions() -> Result<(), ChargerError> {
     use std::os::unix::fs::PermissionsExt;
@@ -287,33 +389,48 @@ pub fn grant_node_permissions() -> Result<(), ChargerError> {
     for node in nodes {
         let path = Path::new(node);
 
-        if !path.exists() {
-            continue;
-        }
+        let metadata = match fs::metadata(path) {
+            Ok(metadata) => metadata,
+
+            Err(error)
+                if error.kind()
+                    == std::io::ErrorKind::NotFound =>
+            {
+                continue;
+            }
+
+            Err(error) => {
+                tracing::warn!(
+                    path = node,
+                    error = %error,
+                    "Failed to read sysfs metadata"
+                );
+
+                continue;
+            }
+        };
 
         any_found = true;
 
-        match fs::metadata(path) {
-            Ok(metadata) => {
-                let mut permissions = metadata.permissions();
-                permissions.set_mode(0o644);
+        let mut permissions =
+            metadata.permissions();
 
-                if let Err(e) = fs::set_permissions(path, permissions) {
-                    tracing::warn!(
-                        path = node,
-                        error = %e,
-                        "Failed to set sysfs permissions"
-                    );
-                }
-            }
+        // Keep the existing daemon behaviour.
+        //
+        // NOTE:
+        // If the daemon is intended for production/root environments,
+        // a udev/init/device-specific permission setup is preferable to
+        // chmod 0644 from the daemon itself.
+        permissions.set_mode(0o644);
 
-            Err(e) => {
-                tracing::warn!(
-                    path = node,
-                    error = %e,
-                    "Failed to read sysfs metadata"
-                );
-            }
+        if let Err(error) =
+            fs::set_permissions(path, permissions)
+        {
+            tracing::warn!(
+                path = node,
+                error = %error,
+                "Failed to set sysfs permissions"
+            );
         }
     }
 

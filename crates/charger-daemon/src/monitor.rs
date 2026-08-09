@@ -9,22 +9,75 @@ use charger_core::{
     config::schema::Config,
 };
 
+// ============================================================
+// SLEEP-FRIENDLY TIMING
+// ============================================================
+//
+// Prinsip:
+//   1. Event Netlink = fast path.
+//   2. Timer hanya safety/reconciliation fallback.
+//   3. Stable state = heartbeat panjang.
+//   4. Near limit / thermal = heartbeat pendek.
+//   5. Jangan pernah busy-loop.
+//
+
 const MIN_INTERVAL: Duration = Duration::from_secs(2);
-const MAX_INTERVAL: Duration = Duration::from_secs(90);
 
-const UNPLUGGED_HEARTBEAT: Duration = Duration::from_secs(600);
+// Safety heartbeat maksimum.
+// 15 menit cukup sebagai fallback bila driver gagal mengirim uevent.
+const MAX_INTERVAL: Duration = Duration::from_secs(15 * 60);
 
-const NETLINK_COALESCE: Duration = Duration::from_millis(100);
+// Stable plugged-in heartbeat.
+const STABLE_HEARTBEAT: Duration = Duration::from_secs(5 * 60);
 
+// Saat charger baru attach dan AC belum online.
+const ATTACHED_HEARTBEAT: Duration = Duration::from_secs(30);
+
+// Bypass perlu direkonsiliasi, tetapi tidak perlu polling agresif.
+const BYPASS_HEARTBEAT: Duration = Duration::from_secs(5 * 60);
+
+// Saat dekat charge limit.
+const NEAR_LIMIT_HEARTBEAT: Duration = Duration::from_secs(60);
+
+// Saat sangat dekat limit.
+const CRITICAL_LIMIT_HEARTBEAT: Duration = Duration::from_secs(15);
+
+// Thermal dekat cutoff.
+const THERMAL_HEARTBEAT: Duration = Duration::from_secs(30);
+
+// Saat thermal protection sedang aktif.
+const THERMAL_BLOCKED_HEARTBEAT: Duration = Duration::from_secs(60);
+
+// Limit sedang aktif.
+const LIMIT_BLOCKED_HEARTBEAT: Duration = Duration::from_secs(2 * 60);
+
+// Tidak ada charger.
+// Event plug-in tetap akan membangunkan daemon.
+const UNPLUGGED_HEARTBEAT: Duration = Duration::from_secs(15 * 60);
+
+// Netlink event coalescing.
+const NETLINK_COALESCE: Duration = Duration::from_millis(150);
+
+// Hysteresis temperature: 2.0 C.
 const THERMAL_HYSTERESIS_DC: i32 = 20;
 
+// EMA.
 const EMA_ALPHA: f32 = 0.30;
 
+// History kecil.
 const MAX_HISTORY: usize = 5;
 
-/// Interval minimum yang masih diperbolehkan untuk polling normal.
-/// Event Netlink tetap bisa memaksa evaluasi instan.
-const DEFAULT_POLL_INTERVAL: Duration = Duration::from_secs(10);
+// Poll interval dari config hanya digunakan sebagai upper/lower
+// scheduling hint, bukan sebagai alasan melakukan busy polling.
+const DEFAULT_POLL_INTERVAL: Duration = Duration::from_secs(5 * 60);
+
+// Error recovery backoff.
+const ERROR_RETRY_MIN: Duration = Duration::from_secs(10);
+const ERROR_RETRY_MAX: Duration = Duration::from_secs(5 * 60);
+
+// ============================================================
+// SAMPLE
+// ============================================================
 
 #[derive(Clone, Debug)]
 struct Sample {
@@ -34,288 +87,19 @@ struct Sample {
     ts: Instant,
 }
 
-struct AdaptiveScheduler {
-    limit: f32,
-    thermal_cutoff: f32,
-
-    /// Interval normal dari config.
-    configured_interval: Duration,
-
-    history: VecDeque<Sample>,
-
-    ema_cap_rate: f32,
-    ema_temp_rate: f32,
-
-    last_interval: Duration,
-}
-
-impl AdaptiveScheduler {
-    fn new(
-        limit: u8,
-        thermal_cutoff_dc: i32,
-        poll_interval_secs: u64,
-    ) -> Self {
-        let configured_interval =
-            Self::normalize_configured_interval(poll_interval_secs);
-
-        Self {
-            limit: limit.min(100) as f32,
-            thermal_cutoff: thermal_cutoff_dc as f32 / 10.0,
-
-            configured_interval,
-
-            history: VecDeque::with_capacity(MAX_HISTORY),
-
-            ema_cap_rate: 0.0,
-            ema_temp_rate: 0.0,
-
-            last_interval: MIN_INTERVAL,
-        }
-    }
-
-    fn normalize_configured_interval(seconds: u64) -> Duration {
-        let seconds = if seconds == 0 {
-            DEFAULT_POLL_INTERVAL.as_secs()
-        } else {
-            seconds
-        };
-
-        Duration::from_secs(seconds).clamp(MIN_INTERVAL, MAX_INTERVAL)
-    }
-
-    fn update_config(
-        &mut self,
-        limit: u8,
-        thermal_cutoff_dc: i32,
-        poll_interval_secs: u64,
-    ) {
-        self.limit = limit.min(100) as f32;
-        self.thermal_cutoff = thermal_cutoff_dc as f32 / 10.0;
-
-        self.configured_interval =
-            Self::normalize_configured_interval(poll_interval_secs);
-
-        // Jangan biarkan interval lama melebihi konfigurasi baru.
-        if self.last_interval > self.configured_interval {
-            self.last_interval = self.configured_interval;
-        }
-    }
-
-    fn reset(&mut self) {
-        self.history.clear();
-
-        self.ema_cap_rate = 0.0;
-        self.ema_temp_rate = 0.0;
-
-        self.last_interval = MIN_INTERVAL;
-    }
-
-    fn push_sample(&mut self, sample: Sample) {
-        if let Some(prev) = self.history.back() {
-            let dt = (sample.ts - prev.ts).as_secs_f32();
-
-            // Event burst / Netlink duplicate.
-            if dt < 0.5 {
-                self.history.push_back(sample);
-
-                if self.history.len() > MAX_HISTORY {
-                    self.history.pop_front();
-                }
-
-                return;
-            }
-
-            // Deep sleep / Doze recovery.
-            //
-            // Jangan memakai data sebelum sleep untuk memprediksi
-            // charging rate setelah wake-up.
-            if dt > 300.0 {
-                self.reset();
-
-                self.history.push_back(sample);
-
-                return;
-            }
-
-            let capacity_delta = sample.capacity - prev.capacity;
-
-            let capacity_rate =
-                capacity_delta.abs() / dt.max(0.1);
-
-            // Abaikan perubahan SOC yang tidak masuk akal.
-            if capacity_rate <= 1.0 {
-                let new_cap_rate =
-                    EMA_ALPHA * (capacity_delta / dt)
-                        + (1.0 - EMA_ALPHA) * self.ema_cap_rate;
-
-                let temp_delta = sample.temp - prev.temp;
-
-                let new_temp_rate =
-                    EMA_ALPHA * (temp_delta / dt)
-                        + (1.0 - EMA_ALPHA) * self.ema_temp_rate;
-
-                if new_cap_rate.is_finite() {
-                    self.ema_cap_rate = new_cap_rate;
-                }
-
-                if new_temp_rate.is_finite() {
-                    self.ema_temp_rate = new_temp_rate;
-                }
-            }
-        }
-
-        self.history.push_back(sample);
-
-        if self.history.len() > MAX_HISTORY {
-            self.history.pop_front();
-        }
-    }
-
-    fn next_interval(
-        &mut self,
-        limit_blocked: bool,
-        thermal_blocked: bool,
-        thermal_protection_enabled: bool,
-        operating_mode: OperatingMode,
-    ) -> Duration {
-        let sample = match self.history.back() {
-            Some(sample) => sample,
-            None => return self.configured_interval,
-        };
-
-        match sample.power_state {
-            reader::PowerState::Disconnected => {
-                self.last_interval = UNPLUGGED_HEARTBEAT;
-
-                return self.last_interval;
-            }
-
-            reader::PowerState::Attached => {
-                self.last_interval = MIN_INTERVAL;
-
-                return self.last_interval;
-            }
-
-            _ => {}
-        }
-
-        // Bypass perlu tetap direkonsiliasi secara berkala.
-        if operating_mode == OperatingMode::Bypass {
-            self.last_interval = Duration::from_secs(15);
-
-            return self.last_interval;
-        }
-
-        let dist_to_limit =
-            (self.limit - sample.capacity).max(0.0);
-
-        let dist_to_thermal =
-            (self.thermal_cutoff - sample.temp).max(0.0);
-
-        // =========================================================
-        // HIGH RISK
-        // =========================================================
-
-        let mut danger =
-            dist_to_limit < 2.0 && !limit_blocked;
-
-        if thermal_protection_enabled {
-            danger = danger
-                || (
-                    (dist_to_thermal < 3.0
-                        || self.ema_temp_rate > 0.15)
-                    && !thermal_blocked
-                );
-        }
-
-        if danger {
-            self.last_interval = MIN_INTERVAL;
-
-            return self.last_interval;
-        }
-
-        // =========================================================
-        // BLOCKED STATES
-        // =========================================================
-
-        if thermal_blocked {
-            self.last_interval = Duration::from_secs(10);
-
-            return self.last_interval;
-        }
-
-        if limit_blocked {
-            self.last_interval = Duration::from_secs(15);
-
-            return self.last_interval;
-        }
-
-        // =========================================================
-        // PREDICTIVE SCHEDULING
-        // =========================================================
-
-        let predicted = if sample.power_state
-            == reader::PowerState::Charging
-            && self.ema_cap_rate > 0.01
-            && dist_to_limit > 0.0
-        {
-            let seconds =
-                dist_to_limit / self.ema_cap_rate * 0.5;
-
-            Duration::from_secs_f32(seconds.max(0.0))
-        } else {
-            self.configured_interval
-        };
-
-        let target = predicted
-            .max(self.configured_interval)
-            .clamp(MIN_INTERVAL, MAX_INTERVAL);
-
-        // Jangan polling normal lebih lambat daripada konfigurasi
-        // hanya karena prediksi terlalu agresif.
-        let target = target.min(MAX_INTERVAL);
-
-        // =========================================================
-        // ASYMMETRIC ADAPTATION
-        // =========================================================
-
-        // Turun cepat ketika mendekati limit/thermal.
-        if target < self.last_interval {
-            self.last_interval = target;
-
-            return self.last_interval;
-        }
-
-        // Naik perlahan untuk menghindari polling terlalu jarang
-        // secara tiba-tiba.
-        self.last_interval = self
-            .last_interval
-            .mul_f32(1.5)
-            .max(self.configured_interval)
-            .min(target)
-            .min(MAX_INTERVAL);
-
-        self.last_interval
-    }
-}
-
-struct NetlinkFd(RawFd);
-
-impl Drop for NetlinkFd {
-    fn drop(&mut self) {
-        if self.0 >= 0 {
-            unsafe {
-                libc::close(self.0);
-            }
-        }
-    }
-}
+// ============================================================
+// OPERATING MODE
+// ============================================================
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum OperatingMode {
     Normal,
     Bypass,
 }
+
+// ============================================================
+// POLICY
+// ============================================================
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct PolicyState {
@@ -332,108 +116,381 @@ impl PolicyState {
     }
 }
 
-/// Unified policy engine.
-///
-/// Charge limit:
-///
-///   level >= charge_limit
-///       -> charging OFF
-///
-/// Resume:
-///
-///   level > resume_limit
-///       -> tetap OFF setelah sebelumnya mencapai limit
-///
-///   level <= resume_limit
-///       -> charging ON
-///
-/// Jika resume_limit invalid / 0:
-///
-///   fallback = charge_limit - 1
-fn evaluate_policy(
-    power_state: reader::PowerState,
-    level: f32,
-    temp_dc: i32,
-    previous: PolicyState,
-    cfg: &Config,
-) -> PolicyState {
-    // Tidak ada charger.
-    //
-    // Jangan mempertahankan limit block karena ketika charger
-    // dipasang kembali kita ingin policy dievaluasi dari SOC aktual.
-    if power_state == reader::PowerState::Disconnected {
-        return PolicyState::clear();
-    }
+// ============================================================
+// ADAPTIVE SCHEDULER
+// ============================================================
 
-    let mut thermal_blocked = previous.thermal_blocked;
-    let mut limit_blocked = previous.limit_blocked;
+struct AdaptiveScheduler {
+    limit: f32,
+    thermal_cutoff: f32,
 
-    if !power_state.is_plugged_in() {
-        return PolicyState {
-            thermal_blocked,
-            limit_blocked,
-        };
-    }
+    configured_interval: Duration,
 
-    // =========================================================
-    // THERMAL POLICY
-    // =========================================================
+    history: VecDeque<Sample>,
 
-    if !cfg.thermal_cutoff {
-        thermal_blocked = false;
-    } else {
-        let max_temp_dc = cfg.max_temp_dc;
+    ema_cap_rate: f32,
+    ema_temp_rate: f32,
 
-        let thermal_resume_dc =
-            max_temp_dc.saturating_sub(THERMAL_HYSTERESIS_DC);
+    last_interval: Duration,
+}
 
-        if temp_dc >= max_temp_dc {
-            thermal_blocked = true;
-        } else if previous.thermal_blocked
-            && temp_dc <= thermal_resume_dc
-        {
-            thermal_blocked = false;
+impl AdaptiveScheduler {
+    fn new(
+        limit: u8,
+        thermal_cutoff_dc: i32,
+        poll_interval_secs: u64,
+    ) -> Self {
+        Self {
+            limit: limit.min(100) as f32,
+            thermal_cutoff: thermal_cutoff_dc as f32 / 10.0,
+
+            configured_interval:
+                Self::normalize_configured_interval(
+                    poll_interval_secs,
+                ),
+
+            history: VecDeque::with_capacity(MAX_HISTORY),
+
+            ema_cap_rate: 0.0,
+            ema_temp_rate: 0.0,
+
+            last_interval: STABLE_HEARTBEAT,
         }
     }
 
-    // =========================================================
-    // CHARGE LIMIT POLICY
-    // =========================================================
-
-    let limit = cfg.charge_limit.min(100) as f32;
-
-    // Hard upper boundary.
-    //
-    // charge_limit = 100 tetap berarti 100% adalah batas.
-    if level >= limit {
-        limit_blocked = true;
-    } else if previous.limit_blocked {
-        // =====================================================
-        // RESUME HYSTERESIS
-        // =====================================================
-
-        let resume = if cfg.resume_limit > 0
-            && cfg.resume_limit < cfg.charge_limit
-        {
-            cfg.resume_limit as f32
+    fn normalize_configured_interval(
+        seconds: u64,
+    ) -> Duration {
+        let requested = if seconds == 0 {
+            DEFAULT_POLL_INTERVAL
         } else {
-            // Fallback aman.
-            //
-            // Contoh:
-            // limit 80 -> resume 79
-            // limit 100 -> resume 99
-            cfg.charge_limit
-                .saturating_sub(1) as f32
+            Duration::from_secs(seconds)
         };
 
-        limit_blocked = level > resume;
+        requested.clamp(
+            Duration::from_secs(10),
+            MAX_INTERVAL,
+        )
     }
 
-    PolicyState {
-        thermal_blocked,
-        limit_blocked,
+    fn update_config(
+        &mut self,
+        limit: u8,
+        thermal_cutoff_dc: i32,
+        poll_interval_secs: u64,
+    ) {
+        self.limit = limit.min(100) as f32;
+        self.thermal_cutoff =
+            thermal_cutoff_dc as f32 / 10.0;
+
+        self.configured_interval =
+            Self::normalize_configured_interval(
+                poll_interval_secs,
+            );
+
+        // Config baru hanya boleh memendekkan interval.
+        if self.last_interval
+            > self.configured_interval
+        {
+            self.last_interval =
+                self.configured_interval;
+        }
+    }
+
+    fn reset(&mut self) {
+        self.history.clear();
+
+        self.ema_cap_rate = 0.0;
+        self.ema_temp_rate = 0.0;
+
+        self.last_interval = STABLE_HEARTBEAT;
+    }
+
+    fn push_sample(&mut self, sample: Sample) {
+        if let Some(prev) = self.history.back() {
+            let dt =
+                (sample.ts - prev.ts).as_secs_f32();
+
+            // Duplicate/burst event.
+            if dt < 0.5 {
+                self.history.push_back(sample);
+
+                if self.history.len()
+                    > MAX_HISTORY
+                {
+                    self.history.pop_front();
+                }
+
+                return;
+            }
+
+            // Device sleep / long suspend recovery.
+            if dt > 300.0 {
+                self.reset();
+
+                self.history.push_back(sample);
+
+                return;
+            }
+
+            let capacity_delta =
+                sample.capacity - prev.capacity;
+
+            let capacity_rate =
+                capacity_delta.abs() / dt.max(0.1);
+
+            // Reject impossible SOC jumps.
+            if capacity_rate <= 1.0 {
+                let rate =
+                    capacity_delta / dt;
+
+                let new_cap_rate =
+                    EMA_ALPHA * rate
+                        + (1.0 - EMA_ALPHA)
+                            * self.ema_cap_rate;
+
+                if new_cap_rate.is_finite() {
+                    self.ema_cap_rate =
+                        new_cap_rate;
+                }
+
+                let temp_delta =
+                    sample.temp - prev.temp;
+
+                let temp_rate =
+                    temp_delta / dt;
+
+                let new_temp_rate =
+                    EMA_ALPHA * temp_rate
+                        + (1.0 - EMA_ALPHA)
+                            * self.ema_temp_rate;
+
+                if new_temp_rate.is_finite() {
+                    self.ema_temp_rate =
+                        new_temp_rate;
+                }
+            }
+        }
+
+        self.history.push_back(sample);
+
+        if self.history.len() > MAX_HISTORY {
+            self.history.pop_front();
+        }
+    }
+
+    fn next_interval(
+        &mut self,
+        limit_blocked: bool,
+        thermal_blocked: bool,
+        thermal_enabled: bool,
+        operating_mode: OperatingMode,
+    ) -> Duration {
+        let sample =
+            match self.history.back() {
+                Some(v) => v,
+                None => {
+                    return self.configured_interval
+                        .min(STABLE_HEARTBEAT);
+                }
+            };
+
+        // --------------------------------------------------------
+        // UNPLUGGED
+        // --------------------------------------------------------
+
+        if sample.power_state
+            == reader::PowerState::Disconnected
+        {
+            self.last_interval =
+                UNPLUGGED_HEARTBEAT;
+
+            return self.last_interval;
+        }
+
+        // --------------------------------------------------------
+        // ATTACHED
+        // --------------------------------------------------------
+
+        if sample.power_state
+            == reader::PowerState::Attached
+        {
+            self.last_interval =
+                ATTACHED_HEARTBEAT;
+
+            return self.last_interval;
+        }
+
+        // --------------------------------------------------------
+        // BYPASS
+        // --------------------------------------------------------
+
+        if operating_mode
+            == OperatingMode::Bypass
+        {
+            self.last_interval =
+                BYPASS_HEARTBEAT;
+
+            return self.last_interval;
+        }
+
+        let dist_limit =
+            (self.limit - sample.capacity)
+                .max(0.0);
+
+        let dist_thermal =
+            (self.thermal_cutoff - sample.temp)
+                .max(0.0);
+
+        // --------------------------------------------------------
+        // CRITICAL CHARGE LIMIT
+        // --------------------------------------------------------
+
+        if !limit_blocked
+            && dist_limit <= 0.5
+        {
+            self.last_interval =
+                CRITICAL_LIMIT_HEARTBEAT;
+
+            return self.last_interval;
+        }
+
+        if !limit_blocked
+            && dist_limit <= 2.0
+        {
+            self.last_interval =
+                NEAR_LIMIT_HEARTBEAT;
+
+            return self.last_interval;
+        }
+
+        // --------------------------------------------------------
+        // THERMAL
+        // --------------------------------------------------------
+
+        if thermal_enabled {
+            if thermal_blocked {
+                self.last_interval =
+                    THERMAL_BLOCKED_HEARTBEAT;
+
+                return self.last_interval;
+            }
+
+            if dist_thermal <= 3.0
+                || self.ema_temp_rate > 0.15
+            {
+                self.last_interval =
+                    THERMAL_HEARTBEAT;
+
+                return self.last_interval;
+            }
+        }
+
+        // --------------------------------------------------------
+        // BLOCKED STATES
+        // --------------------------------------------------------
+
+        if limit_blocked {
+            self.last_interval =
+                LIMIT_BLOCKED_HEARTBEAT;
+
+            return self.last_interval;
+        }
+
+        // --------------------------------------------------------
+        // PREDICTIVE SAFETY
+        // --------------------------------------------------------
+
+        let mut target =
+            STABLE_HEARTBEAT;
+
+        if sample.power_state
+            == reader::PowerState::Charging
+            && self.ema_cap_rate > 0.01
+            && dist_limit > 0.0
+        {
+            let seconds =
+                dist_limit
+                    / self.ema_cap_rate;
+
+            let predicted =
+                Duration::from_secs_f32(
+                    (seconds * 0.5)
+                        .max(
+                            NEAR_LIMIT_HEARTBEAT
+                                .as_secs_f32(),
+                        ),
+                );
+
+            target =
+                predicted.clamp(
+                    NEAR_LIMIT_HEARTBEAT,
+                    MAX_INTERVAL,
+                );
+        }
+
+        // Config interval masih dihormati sebagai
+        // batas minimum safety heartbeat.
+        //
+        // Tetapi kita tidak menggunakan interval
+        // 2-10 detik secara default karena itu buruk
+        // untuk deep sleep.
+        let configured =
+            self.configured_interval
+                .max(Duration::from_secs(30));
+
+        target = target
+            .max(configured)
+            .min(MAX_INTERVAL);
+
+        // Jangan langsung melompat dari 15 menit
+        // ke interval yang terlalu panjang.
+        if target < self.last_interval {
+            self.last_interval = target;
+            return target;
+        }
+
+        self.last_interval =
+            self.last_interval
+                .mul_f32(1.5)
+                .max(configured)
+                .min(target)
+                .min(MAX_INTERVAL);
+
+        self.last_interval
     }
 }
+
+// ============================================================
+// NETLINK FD
+// ============================================================
+
+struct NetlinkFd(RawFd);
+
+impl Drop for NetlinkFd {
+    fn drop(&mut self) {
+        if self.0 >= 0 {
+            unsafe {
+                libc::close(self.0);
+            }
+        }
+    }
+}
+
+// ============================================================
+// NETLINK EVENT
+// ============================================================
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum NetlinkEvent {
+    None,
+    FastPath,
+    Coalesce,
+}
+
+// ============================================================
+// CREATE NETLINK
+// ============================================================
 
 fn create_netlink_socket() -> Option<RawFd> {
     let fd = unsafe {
@@ -448,23 +505,40 @@ fn create_netlink_socket() -> Option<RawFd> {
         return None;
     }
 
-    let mut addr: libc::sockaddr_nl =
+    // Besarkan RX buffer supaya burst uevent tidak
+    // gampang overflow.
+    let rcvbuf: libc::c_int = 64 * 1024;
+
+    unsafe {
+        libc::setsockopt(
+            fd,
+            libc::SOL_SOCKET,
+            libc::SO_RCVBUF,
+            &rcvbuf as *const _ as *const libc::c_void,
+            std::mem::size_of_val(&rcvbuf)
+                as libc::socklen_t,
+        );
+    }
+
+    let mut addr:
+        libc::sockaddr_nl =
         unsafe { std::mem::zeroed() };
 
     addr.nl_family =
         libc::AF_NETLINK as libc::sa_family_t;
 
-    // Kernel memilih port-id.
     addr.nl_pid = 0;
 
-    // Subscribe ke kernel uevent broadcast.
     addr.nl_groups = 1;
 
     let result = unsafe {
         libc::bind(
             fd,
-            &addr as *const _ as *const libc::sockaddr,
-            std::mem::size_of::<libc::sockaddr_nl>() as u32,
+            &addr as *const _
+                as *const libc::sockaddr,
+            std::mem::size_of::<
+                libc::sockaddr_nl,
+            >() as libc::socklen_t,
         )
     };
 
@@ -479,34 +553,24 @@ fn create_netlink_socket() -> Option<RawFd> {
     Some(fd)
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum NetlinkEvent {
-    None,
-    FastPath,
-    Coalesce,
-}
+// ============================================================
+// DRAIN NETLINK
+// ============================================================
 
-/// Drain seluruh queue Netlink.
-///
-/// FastPath:
-/// - AC online
-/// - battery status
-/// - battery capacity
-/// - battery temperature
-/// - USB Type-C state
-///
-/// Coalesce:
-/// - event power_supply lain yang relevan.
-fn drain_and_parse_netlink(fd: RawFd) -> NetlinkEvent {
+fn drain_and_parse_netlink(
+    fd: RawFd,
+) -> NetlinkEvent {
     let mut buf = [0u8; 8192];
 
-    let mut result = NetlinkEvent::None;
+    let mut result =
+        NetlinkEvent::None;
 
     loop {
         let received = unsafe {
             libc::recv(
                 fd,
-                buf.as_mut_ptr() as *mut libc::c_void,
+                buf.as_mut_ptr()
+                    as *mut libc::c_void,
                 buf.len(),
                 libc::MSG_DONTWAIT,
             )
@@ -516,17 +580,25 @@ fn drain_and_parse_netlink(fd: RawFd) -> NetlinkEvent {
             break;
         }
 
-        let data = &buf[..received as usize];
+        let data =
+            &buf[..received as usize];
 
         let mut is_power_supply = false;
         let mut name: &[u8] = b"";
 
         for part in data.split(|b| *b == 0) {
-            if part == b"SUBSYSTEM=power_supply" {
+            if part
+                == b"SUBSYSTEM=power_supply"
+            {
                 is_power_supply = true;
-            } else if part.starts_with(b"POWER_SUPPLY_NAME=") {
+            } else if part.starts_with(
+                b"POWER_SUPPLY_NAME=",
+            ) {
                 name =
-                    &part[b"POWER_SUPPLY_NAME=".len()..];
+                    &part[
+                        b"POWER_SUPPLY_NAME="
+                            .len()..
+                    ];
             }
         }
 
@@ -537,35 +609,30 @@ fn drain_and_parse_netlink(fd: RawFd) -> NetlinkEvent {
         let mut fast = false;
 
         for part in data.split(|b| *b == 0) {
-            // AC online/offline.
             if name == b"ac"
-                && part.starts_with(b"POWER_SUPPLY_ONLINE=")
+                && part.starts_with(
+                    b"POWER_SUPPLY_ONLINE=",
+                )
             {
                 fast = true;
             }
 
-            // Battery charging status.
             if name == b"battery"
-                && part.starts_with(b"POWER_SUPPLY_STATUS=")
+                && (
+                    part.starts_with(
+                        b"POWER_SUPPLY_STATUS=",
+                    )
+                    || part.starts_with(
+                        b"POWER_SUPPLY_CAPACITY=",
+                    )
+                    || part.starts_with(
+                        b"POWER_SUPPLY_TEMP=",
+                    )
+                )
             {
                 fast = true;
             }
 
-            // Battery SOC.
-            if name == b"battery"
-                && part.starts_with(b"POWER_SUPPLY_CAPACITY=")
-            {
-                fast = true;
-            }
-
-            // Battery temperature.
-            if name == b"battery"
-                && part.starts_with(b"POWER_SUPPLY_TEMP=")
-            {
-                fast = true;
-            }
-
-            // USB / Type-C attach state.
             if name == b"usb"
                 && (
                     part.starts_with(
@@ -584,11 +651,14 @@ fn drain_and_parse_netlink(fd: RawFd) -> NetlinkEvent {
         }
 
         if fast {
-            result = NetlinkEvent::FastPath;
+            result =
+                NetlinkEvent::FastPath;
+
             continue;
         }
 
-        if result == NetlinkEvent::None
+        if result
+            == NetlinkEvent::None
             && matches!(
                 name,
                 b"usb"
@@ -601,22 +671,23 @@ fn drain_and_parse_netlink(fd: RawFd) -> NetlinkEvent {
                     | b"mt_charger"
             )
         {
-            result = NetlinkEvent::Coalesce;
+            result =
+                NetlinkEvent::Coalesce;
         }
     }
 
     result
 }
 
-/// Verify that the actual hardware matches the requested state.
-///
-/// Tidak menambah ChargerError baru. Jika verification gagal,
-/// kita hanya mengembalikan false sehingga monitor akan mencoba
-/// reconciliation pada evaluasi berikutnya.
+// ============================================================
+// HARDWARE VERIFICATION
+// ============================================================
+
 fn verify_hardware_state(
     expected: control::ActualHardwareMode,
 ) -> bool {
-    let actual = control::get_actual_charging_state();
+    let actual =
+        control::get_actual_charging_state();
 
     if actual == expected {
         true
@@ -631,14 +702,14 @@ fn verify_hardware_state(
     }
 }
 
-/// Apply charging state and verify it.
-///
-/// Jika write sukses tetapi hardware tidak sesuai setelah read-back,
-/// state dianggap UNKNOWN sehingga evaluasi berikutnya akan mencoba
-/// recovery lagi.
+// ============================================================
+// APPLY CHARGING
+// ============================================================
+
 fn apply_charging_state(
     enable: bool,
-    applied_state: &mut control::ActualHardwareMode,
+    applied_state:
+        &mut control::ActualHardwareMode,
 ) -> bool {
     let expected =
         if enable {
@@ -650,7 +721,8 @@ fn apply_charging_state(
     match control::set_charging(enable) {
         Ok(()) => {
             if verify_hardware_state(expected) {
-                *applied_state = expected;
+                *applied_state =
+                    expected;
 
                 true
             } else {
@@ -676,18 +748,21 @@ fn apply_charging_state(
     }
 }
 
-/// Apply bypass and verify.
-///
-/// `get_actual_charging_state()` dapat membedakan Bypass hanya
-/// jika main/charging_enabled tersedia.
+// ============================================================
+// APPLY BYPASS
+// ============================================================
+
 fn apply_bypass_state(
-    expected: control::ActualHardwareMode,
-    applied_state: &mut control::ActualHardwareMode,
+    expected:
+        control::ActualHardwareMode,
+    applied_state:
+        &mut control::ActualHardwareMode,
 ) -> bool {
     match control::enter_bypass_mode() {
         Ok(()) => {
             if verify_hardware_state(expected) {
-                *applied_state = expected;
+                *applied_state =
+                    expected;
 
                 true
             } else {
@@ -712,21 +787,192 @@ fn apply_bypass_state(
     }
 }
 
+// ============================================================
+// POLICY
+// ============================================================
+
+fn evaluate_policy(
+    power_state: reader::PowerState,
+    level: f32,
+    temp_dc: i32,
+    previous: PolicyState,
+    cfg: &Config,
+) -> PolicyState {
+    if power_state
+        == reader::PowerState::Disconnected
+    {
+        return PolicyState::clear();
+    }
+
+    let mut thermal_blocked =
+        previous.thermal_blocked;
+
+    let mut limit_blocked =
+        previous.limit_blocked;
+
+    if !power_state.is_plugged_in() {
+        return PolicyState {
+            thermal_blocked,
+            limit_blocked,
+        };
+    }
+
+    // --------------------------------------------------------
+    // THERMAL
+    // --------------------------------------------------------
+
+    if !cfg.thermal_cutoff {
+        thermal_blocked = false;
+    } else {
+        let cutoff =
+            cfg.max_temp_dc;
+
+        let resume =
+            cutoff.saturating_sub(
+                THERMAL_HYSTERESIS_DC,
+            );
+
+        if temp_dc >= cutoff {
+            thermal_blocked = true;
+        } else if previous.thermal_blocked
+            && temp_dc <= resume
+        {
+            thermal_blocked = false;
+        }
+    }
+
+    // --------------------------------------------------------
+    // CHARGE LIMIT
+    // --------------------------------------------------------
+
+    let limit =
+        cfg.charge_limit.min(100) as f32;
+
+    if level >= limit {
+        limit_blocked = true;
+    } else if previous.limit_blocked {
+        let resume =
+            if cfg.resume_limit > 0
+                && cfg.resume_limit
+                    < cfg.charge_limit
+            {
+                cfg.resume_limit as f32
+            } else {
+                cfg.charge_limit
+                    .saturating_sub(1)
+                    as f32
+            };
+
+        // Resume hanya jika SOC <= resume.
+        limit_blocked =
+            level > resume;
+    }
+
+    PolicyState {
+        thermal_blocked,
+        limit_blocked,
+    }
+}
+
+// ============================================================
+// ERROR BACKOFF
+// ============================================================
+
+struct ErrorBackoff {
+    current: Duration,
+}
+
+impl ErrorBackoff {
+    fn new() -> Self {
+        Self {
+            current: ERROR_RETRY_MIN,
+        }
+    }
+
+    fn reset(&mut self) {
+        self.current =
+            ERROR_RETRY_MIN;
+    }
+
+    fn next(&mut self) -> Duration {
+        let current =
+            self.current;
+
+        self.current =
+            self.current
+                .mul_f32(2.0)
+                .min(ERROR_RETRY_MAX);
+
+        current
+    }
+}
+
+// ============================================================
+// IPC
+// ============================================================
+
+fn drain_ipc(
+    rx: &UnixDatagram,
+) -> Option<u8> {
+    let mut latest =
+        None;
+
+    let mut buf = [0u8; 1];
+
+    loop {
+        match rx.recv(&mut buf) {
+            Ok(1) => {
+                // Ambil command terakhir.
+                //
+                // Ini penting jika beberapa config reload
+                // masuk sekaligus.
+                latest = Some(buf[0]);
+            }
+
+            Ok(_) => {}
+
+            Err(e)
+                if e.kind()
+                    == std::io::ErrorKind::WouldBlock =>
+            {
+                break;
+            }
+
+            Err(_) => {
+                break;
+            }
+        }
+    }
+
+    latest
+}
+
+// ============================================================
+// MAIN MONITOR
+// ============================================================
+
 pub fn run_monitor_loop(
     config: Arc<RwLock<Config>>,
     rx: UnixDatagram,
 ) {
     tracing::info!(
-        "Monitor loop started (event-driven + adaptive scheduler)"
+        "Monitor loop started (event-driven + deep-sleep scheduler)"
     );
 
-    // =========================================================
+    // --------------------------------------------------------
     // INITIAL CONFIG
-    // =========================================================
+    // --------------------------------------------------------
 
-    let (initial_limit, initial_temp, initial_poll) = {
+    let (
+        initial_limit,
+        initial_temp,
+        initial_poll,
+    ) = {
         let cfg =
-            config.read().unwrap_or_else(|e| e.into_inner());
+            config.read()
+                .unwrap_or_else(
+                    |e| e.into_inner(),
+                );
 
         (
             cfg.charge_limit,
@@ -735,13 +981,29 @@ pub fn run_monitor_loop(
         )
     };
 
-    // =========================================================
+    // --------------------------------------------------------
+    // IPC NONBLOCKING
+    // --------------------------------------------------------
+
+    if let Err(e) =
+        rx.set_nonblocking(true)
+    {
+        tracing::warn!(
+            "Failed to set IPC nonblocking: {}",
+            e
+        );
+    }
+
+    // --------------------------------------------------------
     // NETLINK
-    // =========================================================
+    // --------------------------------------------------------
 
-    let nl_fd = create_netlink_socket().unwrap_or(-1);
+    let nl_fd =
+        create_netlink_socket()
+            .unwrap_or(-1);
 
-    let _nl_fd_guard = NetlinkFd(nl_fd);
+    let _nl_guard =
+        NetlinkFd(nl_fd);
 
     if nl_fd >= 0 {
         tracing::info!(
@@ -749,48 +1011,59 @@ pub fn run_monitor_loop(
         );
     } else {
         tracing::warn!(
-            "Netlink unavailable; using adaptive timer"
+            "Netlink unavailable; safety heartbeat will be used"
         );
     }
 
-    // =========================================================
+    // --------------------------------------------------------
     // SCHEDULER
-    // =========================================================
+    // --------------------------------------------------------
 
-    let mut scheduler = AdaptiveScheduler::new(
-        initial_limit,
-        initial_temp,
-        initial_poll,
-    );
+    let mut scheduler =
+        AdaptiveScheduler::new(
+            initial_limit,
+            initial_temp,
+            initial_poll,
+        );
 
-    // =========================================================
+    // --------------------------------------------------------
     // STATE
-    // =========================================================
+    // --------------------------------------------------------
 
     let mut last_eval_time =
-        Instant::now() - Duration::from_secs(60);
+        Instant::now()
+            - Duration::from_secs(60);
 
-    let mut force_next_eval = true;
-    let mut pending_netlink_eval = false;
+    let mut force_next_eval =
+        true;
+
+    let mut pending_netlink_eval =
+        false;
 
     let mut applied_state =
         control::ActualHardwareMode::Unknown;
 
-    let mut operating_mode = OperatingMode::Normal;
+    let mut operating_mode =
+        OperatingMode::Normal;
 
-    let mut policy_state = PolicyState::clear();
+    let mut policy_state =
+        PolicyState::clear();
 
-    // =========================================================
+    let mut error_backoff =
+        ErrorBackoff::new();
+
+    // --------------------------------------------------------
     // MAIN LOOP
-    // =========================================================
+    // --------------------------------------------------------
 
     loop {
         let cfg = config
             .read()
-            .unwrap_or_else(|e| e.into_inner())
+            .unwrap_or_else(
+                |e| e.into_inner(),
+            )
             .clone();
 
-        // Update scheduler config every loop.
         scheduler.update_config(
             cfg.charge_limit,
             cfg.max_temp_dc,
@@ -812,7 +1085,7 @@ pub fn run_monitor_loop(
                         control::exit_bypass_mode()
                     {
                         tracing::warn!(
-                            "Failed exiting BYPASS while daemon disabled: {}",
+                            "Failed exiting BYPASS while disabled: {}",
                             e
                         );
                     }
@@ -823,59 +1096,69 @@ pub fn run_monitor_loop(
                     &mut applied_state,
                 ) {
                     tracing::info!(
-                        "Daemon disabled: charging restored and verified"
-                    );
-                } else {
-                    tracing::error!(
-                        "Daemon disabled: failed restoring/verifying charging"
+                        "Daemon disabled: charging restored"
                     );
                 }
             }
 
-            operating_mode = OperatingMode::Normal;
-            policy_state = PolicyState::clear();
+            operating_mode =
+                OperatingMode::Normal;
+
+            policy_state =
+                PolicyState::clear();
 
             scheduler.reset();
 
-            // Ketika daemon disabled, jangan polling.
-            // Tunggu IPC/config reload/shutdown.
-            let mut pfds = [libc::pollfd {
-                fd: rx.as_raw_fd(),
-                events: libc::POLLIN,
-                revents: 0,
-            }];
+            // -------------------------------------------------
+            // SLEEP FOREVER UNTIL IPC
+            // -------------------------------------------------
 
-            unsafe {
+            let mut pfd =
+                libc::pollfd {
+                    fd: rx.as_raw_fd(),
+                    events: libc::POLLIN,
+                    revents: 0,
+                };
+
+            let ret = unsafe {
                 libc::poll(
-                    pfds.as_mut_ptr(),
+                    &mut pfd,
                     1,
                     -1,
-                );
+                )
+            };
+
+            if ret < 0 {
+                continue;
             }
 
-            let mut buf = [0u8; 1];
+            if pfd.revents
+                & libc::POLLIN
+                != 0
+            {
+                if let Some(command) =
+                    drain_ipc(&rx)
+                {
+                    match command {
+                        2 => {
+                            tracing::info!(
+                                "Monitor loop shutting down"
+                            );
 
-            if rx.recv(&mut buf).is_ok() {
-                match buf[0] {
-                    // shutdown
-                    2 => {
-                        tracing::info!(
-                            "Monitor loop shutting down"
-                        );
+                            break;
+                        }
 
-                        break;
+                        1 => {
+                            tracing::info!(
+                                "Config reloaded while disabled"
+                            );
+
+                            force_next_eval =
+                                true;
+                        }
+
+                        _ => {}
                     }
-
-                    // config reload
-                    1 => {
-                        tracing::info!(
-                            "Config reloaded while disabled"
-                        );
-
-                        force_next_eval = true;
-                    }
-
-                    _ => {}
                 }
             }
 
@@ -883,37 +1166,39 @@ pub fn run_monitor_loop(
         }
 
         // =====================================================
-        // SCHEDULER
+        // CALCULATE WAIT
         // =====================================================
 
-        let mut timeout = scheduler.next_interval(
-            policy_state.limit_blocked,
-            policy_state.thermal_blocked,
-            cfg.thermal_cutoff,
-            operating_mode,
-        );
+        let mut timeout =
+            scheduler.next_interval(
+                policy_state.limit_blocked,
+                policy_state.thermal_blocked,
+                cfg.thermal_cutoff,
+                operating_mode,
+            );
 
-        // Forced evaluation.
         if force_next_eval {
-            timeout = Duration::ZERO;
-        }
+            timeout =
+                Duration::ZERO;
+        } else if pending_netlink_eval {
+            let elapsed =
+                last_eval_time.elapsed();
 
-        // Deferred Netlink evaluation.
-        else if pending_netlink_eval {
-            let elapsed = last_eval_time.elapsed();
-
-            if elapsed >= NETLINK_COALESCE {
-                timeout = Duration::ZERO;
+            if elapsed
+                >= NETLINK_COALESCE
+            {
+                timeout =
+                    Duration::ZERO;
             } else {
-                let remaining =
-                    NETLINK_COALESCE - elapsed;
-
-                timeout = timeout.min(remaining);
+                timeout = timeout.min(
+                    NETLINK_COALESCE
+                        - elapsed,
+                );
             }
         }
 
         // =====================================================
-        // POLL IPC + NETLINK
+        // POLL
         // =====================================================
 
         let mut pfds = [
@@ -933,10 +1218,17 @@ pub fn run_monitor_loop(
             },
         ];
 
-        let nfds = if nl_fd >= 0 { 2 } else { 1 };
+        let nfds =
+            if nl_fd >= 0 {
+                2
+            } else {
+                1
+            };
 
         let timeout_ms =
-            timeout.as_millis().min(i32::MAX as u128)
+            timeout
+                .as_millis()
+                .min(i32::MAX as u128)
                 as i32;
 
         let ret = unsafe {
@@ -959,27 +1251,31 @@ pub fn run_monitor_loop(
                     error
                 );
 
+                // Jangan retry agresif.
                 std::thread::sleep(
-                    Duration::from_secs(1),
+                    ERROR_RETRY_MIN,
                 );
             }
 
             continue;
         }
 
-        let mut needs_evaluation = ret == 0;
+        let mut needs_evaluation =
+            ret == 0;
 
         // =====================================================
         // IPC
         // =====================================================
 
         if ret > 0
-            && pfds[0].revents & libc::POLLIN != 0
+            && pfds[0].revents
+                & libc::POLLIN
+                != 0
         {
-            let mut buf = [0u8; 1];
-
-            if rx.recv(&mut buf).is_ok() {
-                match buf[0] {
+            if let Some(command) =
+                drain_ipc(&rx)
+            {
+                match command {
                     // shutdown
                     2 => {
                         tracing::info!(
@@ -995,8 +1291,11 @@ pub fn run_monitor_loop(
                             "Config reload requested"
                         );
 
-                        needs_evaluation = true;
-                        force_next_eval = true;
+                        force_next_eval =
+                            true;
+
+                        needs_evaluation =
+                            true;
                     }
 
                     // bypass ON
@@ -1008,7 +1307,11 @@ pub fn run_monitor_loop(
                         operating_mode =
                             OperatingMode::Bypass;
 
-                        needs_evaluation = true;
+                        force_next_eval =
+                            true;
+
+                        needs_evaluation =
+                            true;
                     }
 
                     // bypass OFF
@@ -1020,8 +1323,6 @@ pub fn run_monitor_loop(
                         operating_mode =
                             OperatingMode::Normal;
 
-                        // Jangan langsung menganggap normal
-                        // berhasil. Paksa reconciliation.
                         if let Err(e) =
                             control::exit_bypass_mode()
                         {
@@ -1034,7 +1335,11 @@ pub fn run_monitor_loop(
                         applied_state =
                             control::ActualHardwareMode::Unknown;
 
-                        needs_evaluation = true;
+                        force_next_eval =
+                            true;
+
+                        needs_evaluation =
+                            true;
                     }
 
                     _ => {}
@@ -1048,25 +1353,31 @@ pub fn run_monitor_loop(
 
         if ret > 0
             && nl_fd >= 0
-            && pfds[1].revents & libc::POLLIN != 0
+            && pfds[1].revents
+                & libc::POLLIN
+                != 0
         {
-            match drain_and_parse_netlink(nl_fd) {
+            match drain_and_parse_netlink(
+                nl_fd,
+            ) {
                 NetlinkEvent::FastPath => {
-                    needs_evaluation = true;
-                    pending_netlink_eval = false;
+                    needs_evaluation =
+                        true;
 
-                    tracing::debug!(
-                        "Netlink fast-path evaluation"
-                    );
+                    pending_netlink_eval =
+                        false;
                 }
 
                 NetlinkEvent::Coalesce => {
-                    pending_netlink_eval = true;
+                    pending_netlink_eval =
+                        true;
 
-                    if last_eval_time.elapsed()
+                    if last_eval_time
+                        .elapsed()
                         >= NETLINK_COALESCE
                     {
-                        needs_evaluation = true;
+                        needs_evaluation =
+                            true;
                     }
                 }
 
@@ -1074,66 +1385,102 @@ pub fn run_monitor_loop(
             }
         }
 
-        // Deferred event sekarang sudah cukup umur.
+        // =====================================================
+        // COALESCED EVENT
+        // =====================================================
+
         if pending_netlink_eval
-            && last_eval_time.elapsed()
+            && last_eval_time
+                .elapsed()
                 >= NETLINK_COALESCE
         {
-            needs_evaluation = true;
+            needs_evaluation =
+                true;
         }
 
         if !needs_evaluation {
             continue;
         }
 
-        force_next_eval = false;
-        pending_netlink_eval = false;
+        force_next_eval =
+            false;
+
+        pending_netlink_eval =
+            false;
 
         // =====================================================
-        // READ SOC
+        // READ BATTERY
         // =====================================================
 
-        let level = match reader::read_capacity_raw() {
-            Ok(value) if value.is_finite() => {
-                value.clamp(0.0, 100.0)
-            }
-
-            Ok(value) => {
-                tracing::error!(
-                    "Battery capacity is non-finite: {}",
-                    value
-                );
-
-                last_eval_time = Instant::now();
-
-                continue;
-            }
-
-            Err(e) => {
-                tracing::error!(
-                    "Failed reading capacity: {}",
-                    e
-                );
-
-                last_eval_time = Instant::now();
-
-                // Fail-safe hanya jika charge_limit memang
-                // berada di bawah 100%.
-                if cfg.charge_limit < 100 {
-                    let _ =
-                        control::set_charging(false);
+        let level =
+            match reader::read_capacity_raw()
+            {
+                Ok(value)
+                    if value.is_finite() =>
+                {
+                    value.clamp(
+                        0.0,
+                        100.0,
+                    )
                 }
 
-                continue;
-            }
-        };
+                Ok(value) => {
+                    tracing::error!(
+                        "Battery capacity non-finite: {}",
+                        value
+                    );
+
+                    let delay =
+                        error_backoff.next();
+
+                    last_eval_time =
+                        Instant::now();
+
+                    std::thread::sleep(
+                        delay,
+                    );
+
+                    continue;
+                }
+
+                Err(e) => {
+                    tracing::error!(
+                        "Failed reading capacity: {}",
+                        e
+                    );
+
+                    last_eval_time =
+                        Instant::now();
+
+                    // Fail safe hanya bila memang
+                    // ada limit aktif.
+                    if cfg.charge_limit
+                        < 100
+                        && applied_state
+                            != control::ActualHardwareMode::ChargingDisabled
+                        {
+                            let _ =
+                                apply_charging_state(
+                                    false,
+                                    &mut applied_state,
+                                );
+                        }
+
+                    std::thread::sleep(
+                        error_backoff.next(),
+                    );
+
+                    continue;
+                }
+            };
 
         // =====================================================
-        // READ TEMPERATURE
+        // TEMPERATURE
         // =====================================================
 
         let temp_dc =
-            match reader::read_temperature_dc() {
+            match reader::read_temperature_dc()
+            {
                 Ok(value) => value,
 
                 Err(e) => {
@@ -1142,23 +1489,35 @@ pub fn run_monitor_loop(
                         e
                     );
 
-                    last_eval_time = Instant::now();
+                    last_eval_time =
+                        Instant::now();
 
-                    if cfg.thermal_cutoff {
-                        let _ =
-                            control::set_charging(false);
-                    }
+                    if cfg.thermal_cutoff
+                        && applied_state
+                            != control::ActualHardwareMode::ChargingDisabled
+                        {
+                            let _ =
+                                apply_charging_state(
+                                    false,
+                                    &mut applied_state,
+                                );
+                        }
+
+                    std::thread::sleep(
+                        error_backoff.next(),
+                    );
 
                     continue;
                 }
             };
 
         // =====================================================
-        // READ POWER STATE
+        // POWER STATE
         // =====================================================
 
         let power_state =
-            match reader::get_power_state() {
+            match reader::get_power_state()
+            {
                 Ok(value) => value,
 
                 Err(e) => {
@@ -1167,10 +1526,22 @@ pub fn run_monitor_loop(
                         e
                     );
 
-                    last_eval_time = Instant::now();
+                    last_eval_time =
+                        Instant::now();
 
-                    let _ =
-                        control::set_charging(false);
+                    if applied_state
+                        != control::ActualHardwareMode::ChargingDisabled
+                    {
+                        let _ =
+                            apply_charging_state(
+                                false,
+                                &mut applied_state,
+                            );
+                    }
+
+                    std::thread::sleep(
+                        error_backoff.next(),
+                    );
 
                     continue;
                 }
@@ -1180,36 +1551,52 @@ pub fn run_monitor_loop(
             == reader::PowerState::Unknown
         {
             tracing::error!(
-                "Power state is UNKNOWN"
+                "Power state UNKNOWN"
             );
 
-            last_eval_time = Instant::now();
+            last_eval_time =
+                Instant::now();
 
-            let _ =
-                control::set_charging(false);
+            if applied_state
+                != control::ActualHardwareMode::ChargingDisabled
+            {
+                let _ =
+                    apply_charging_state(
+                        false,
+                        &mut applied_state,
+                    );
+            }
+
+            std::thread::sleep(
+                error_backoff.next(),
+            );
 
             continue;
         }
+
+        // Berhasil membaca semua sumber.
+        error_backoff.reset();
 
         // =====================================================
         // UPDATE SCHEDULER
         // =====================================================
 
-        scheduler.limit =
-            cfg.charge_limit.min(100) as f32;
+        let now =
+            Instant::now();
 
-        scheduler.thermal_cutoff =
-            cfg.max_temp_dc as f32 / 10.0;
-
-        scheduler.push_sample(Sample {
-            capacity: level,
-            temp: temp_dc as f32 / 10.0,
-            power_state,
-            ts: Instant::now(),
-        });
+        scheduler.push_sample(
+            Sample {
+                capacity: level,
+                temp:
+                    temp_dc as f32
+                        / 10.0,
+                power_state,
+                ts: now,
+            },
+        );
 
         // =====================================================
-        // HARDWARE RECONCILIATION
+        // HARDWARE STATE
         // =====================================================
 
         applied_state =
@@ -1226,10 +1613,12 @@ pub fn run_monitor_loop(
         );
 
         // =====================================================
-        // BYPASS MODE
+        // BYPASS
         // =====================================================
 
-        if operating_mode == OperatingMode::Bypass {
+        if operating_mode
+            == OperatingMode::Bypass
+        {
             let expected =
                 if control::has_distinct_bypass_node()
                 {
@@ -1238,22 +1627,18 @@ pub fn run_monitor_loop(
                     control::ActualHardwareMode::ChargingDisabled
                 };
 
-            if applied_state != expected {
-                if apply_bypass_state(
+            if applied_state != expected
+                && apply_bypass_state(
                     expected,
                     &mut applied_state,
                 ) {
                     tracing::info!(
                         "Hardware BYPASS applied and verified"
                     );
-                } else {
-                    tracing::error!(
-                        "Hardware BYPASS failed verification"
-                    );
                 }
-            }
 
-            last_eval_time = Instant::now();
+            last_eval_time =
+                Instant::now();
 
             continue;
         }
@@ -1265,50 +1650,43 @@ pub fn run_monitor_loop(
         if power_state
             == reader::PowerState::Disconnected
         {
-            // Saat charger dicabut, hysteresis limit harus
-            // di-reset.
-            policy_state = PolicyState::clear();
+            policy_state =
+                PolicyState::clear();
 
-            // EMA lama tidak relevan setelah unplug.
             scheduler.reset();
 
             if applied_state
                 != control::ActualHardwareMode::ChargingEnabled
-            {
-                if apply_charging_state(
+                && apply_charging_state(
                     true,
                     &mut applied_state,
                 ) {
                     tracing::info!(
-                        "Charger disconnected: charging restored and verified"
-                    );
-                } else {
-                    tracing::error!(
-                        "Failed restoring charging after unplug"
+                        "Charger disconnected: charging restored"
                     );
                 }
-            }
 
-            last_eval_time = Instant::now();
+            last_eval_time =
+                Instant::now();
 
             continue;
         }
 
         // =====================================================
-        // POLICY EVALUATION
+        // POLICY
         // =====================================================
 
-        let new_policy = evaluate_policy(
-            power_state,
-            level,
-            temp_dc,
-            policy_state,
-            &cfg,
-        );
+        let previous_policy =
+            policy_state;
 
-        let previous_policy = policy_state;
-
-        policy_state = new_policy;
+        policy_state =
+            evaluate_policy(
+                power_state,
+                level,
+                temp_dc,
+                policy_state,
+                &cfg,
+            );
 
         let desired_charging =
             !policy_state.thermal_blocked
@@ -1322,12 +1700,14 @@ pub fn run_monitor_loop(
             };
 
         // =====================================================
-        // POLICY STATE LOGGING
+        // POLICY CHANGE
         // =====================================================
 
-        if previous_policy != policy_state {
+        if previous_policy
+            != policy_state
+        {
             tracing::info!(
-                "Policy changed | SOC={:.2}% | limit_blocked {} -> {} | thermal_blocked {} -> {}",
+                "Policy changed | SOC={:.2}% | limit {} -> {} | thermal {} -> {}",
                 level,
                 previous_policy.limit_blocked,
                 policy_state.limit_blocked,
@@ -1340,18 +1720,20 @@ pub fn run_monitor_loop(
         // HARDWARE ACTION
         // =====================================================
 
-        if applied_state != desired_state {
-            // Jika masih BYPASS, keluar dulu.
+        if applied_state
+            != desired_state
+        {
             if applied_state
                 == control::ActualHardwareMode::Bypass
             {
-                match control::exit_bypass_mode() {
+                match control::exit_bypass_mode()
+                {
                     Ok(()) => {
                         applied_state =
                             control::ActualHardwareMode::Unknown;
 
                         tracing::info!(
-                            "Exited BYPASS before normal charging policy"
+                            "Exited BYPASS before normal policy"
                         );
                     }
 
@@ -1378,84 +1760,65 @@ pub fn run_monitor_loop(
             ) {
                 if desired_charging {
                     tracing::info!(
-                        "Charging ON | SOC={:.2}% | Temp={:.1}C | limit_blocked={} | thermal_blocked={}",
+                        "Charging ON | SOC={:.2}% | Temp={:.1}C",
                         level,
-                        temp_dc as f32 / 10.0,
-                        policy_state.limit_blocked,
-                        policy_state.thermal_blocked
+                        temp_dc as f32
+                            / 10.0
                     );
-                } else {
-                    if policy_state.limit_blocked {
-                        let resume =
-                            if cfg.resume_limit > 0
-                                && cfg.resume_limit
-                                    < cfg.charge_limit
-                            {
-                                cfg.resume_limit
-                            } else {
-                                cfg.charge_limit
-                                    .saturating_sub(1)
-                            };
+                } else if policy_state
+                    .limit_blocked
+                {
+                    let resume =
+                        if cfg.resume_limit
+                            > 0
+                            && cfg.resume_limit
+                                < cfg.charge_limit
+                        {
+                            cfg.resume_limit
+                        } else {
+                            cfg.charge_limit
+                                .saturating_sub(
+                                    1,
+                                )
+                        };
 
-                        tracing::warn!(
-                            "Charging OFF by charge limit | SOC={:.2}% | limit={} | resume_limit={} | Temp={:.1}C",
-                            level,
-                            cfg.charge_limit,
-                            resume,
-                            temp_dc as f32 / 10.0
-                        );
-                    } else if policy_state
-                        .thermal_blocked
-                    {
-                        tracing::warn!(
-                            "Charging OFF by thermal protection | SOC={:.2}% | Temp={:.1}C | cutoff={:.1}C",
-                            level,
-                            temp_dc as f32 / 10.0,
-                            cfg.max_temp_dc as f32 / 10.0
-                        );
-                    } else {
-                        tracing::warn!(
-                            "Charging OFF | SOC={:.2}% | Temp={:.1}C",
-                            level,
-                            temp_dc as f32 / 10.0
-                        );
-                    }
+                    tracing::warn!(
+                        "Charging OFF by limit | SOC={:.2}% | limit={} | resume={} | Temp={:.1}C",
+                        level,
+                        cfg.charge_limit,
+                        resume,
+                        temp_dc as f32
+                            / 10.0
+                    );
+                } else if policy_state
+                    .thermal_blocked
+                {
+                    tracing::warn!(
+                        "Charging OFF by thermal protection | SOC={:.2}% | Temp={:.1}C | cutoff={:.1}C",
+                        level,
+                        temp_dc as f32
+                            / 10.0,
+                        cfg.max_temp_dc as f32
+                            / 10.0
+                    );
                 }
-            } else {
-                tracing::error!(
-                    "Hardware state could not be verified after charging={}",
-                    desired_charging
-                );
             }
         }
 
         // =====================================================
-        // FINAL RECONCILIATION
+        // FINAL STATE
         // =====================================================
-
         //
-        // Jika hardware sebelumnya UNKNOWN/INCONSISTENT,
-        // lakukan satu pembacaan final pada evaluasi ini.
+        // Jangan lakukan read-back ekstra setiap evaluasi.
         //
-        // Ini membuat daemon lebih cepat recover dari kondisi
-        // driver/sysfs yang sempat tidak sinkron.
+        // apply_charging_state() sudah verify.
         //
-        let actual_after =
-            control::get_actual_charging_state();
+        // Kita hanya mempertahankan state yang sudah
+        // diverifikasi agar tidak melakukan sysfs read
+        // tambahan setiap wake-up.
+        //
 
-        if actual_after != desired_state {
-            tracing::warn!(
-                "Final hardware reconciliation mismatch | desired={:?} | actual={:?}",
-                desired_state,
-                actual_after
-            );
-
-            applied_state =
-                control::ActualHardwareMode::Unknown;
-        } else {
-            applied_state = actual_after;
-        }
-
-        last_eval_time = Instant::now();
+        last_eval_time =
+            Instant::now();
     }
 }
