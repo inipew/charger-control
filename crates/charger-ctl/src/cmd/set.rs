@@ -26,58 +26,24 @@ fn save_config(cfg: &Config) -> Result<(), ChargerError> {
 }
 
 fn notify_daemon() {
-    #[cfg(unix)]
-    {
-        use std::io::{Read, Write};
-        use std::os::unix::net::UnixStream;
-        use std::time::Duration;
-
-        let socket =
-            charger_core::config::schema::DEFAULT_CONFIG_PATH.replace("config.toml", "daemon.sock");
-
-        let mut stream = match UnixStream::connect(&socket) {
-            Ok(stream) => stream,
-            Err(_) => {
-                display::warn("Config saved, but daemon is not running.");
-                return;
-            }
-        };
-
-        let _ = stream.set_write_timeout(Some(Duration::from_secs(1)));
-        let _ = stream.set_read_timeout(Some(Duration::from_secs(2)));
-
-        if stream.write_all(b"reload").is_err() {
-            display::warn("Config saved, but failed to notify daemon.");
-            return;
+    match crate::client::IpcClient::send_command(b"reload", std::time::Duration::from_secs(2)) {
+        Ok(response) if response.starts_with("OK") => {
+            display::info("Daemon configuration reloaded.");
         }
-
-        let mut response = String::new();
-
-        match stream.read_to_string(&mut response) {
-            Ok(_) if response.starts_with("OK") => {
-                display::info("Daemon configuration reloaded.");
-            }
-
-            Ok(_) => {
-                display::warn("Config saved, but daemon returned an error.");
-            }
-
-            Err(_) => {
-                display::warn("Config saved, but daemon did not respond.");
-            }
+        Ok(_) => {
+            display::warn("Config saved, but daemon returned an error.");
         }
-    }
-
-    #[cfg(not(unix))]
-    {
-        display::warn("IPC not supported on this platform. Restart daemon manually.");
+        Err(_) => {
+            display::warn("Config saved, but daemon is not running.");
+        }
     }
 }
 
 pub fn limit(value: u8) -> Result<(), ChargerError> {
     if !(50..=100).contains(&value) {
-        display::error("Limit must be between 50 and 100%");
-        return Ok(());
+        let msg = "Limit must be between 50 and 100%";
+        display::error(msg);
+        return Err(ChargerError::InvalidInput(msg.to_string()));
     }
 
     let mut cfg = load_config()?;
@@ -96,8 +62,9 @@ pub fn limit(value: u8) -> Result<(), ChargerError> {
         let new_resume = value.saturating_sub(5).max(40);
 
         if new_resume >= value {
-            display::error("Unable to create a valid resume limit for this charge limit.");
-            return Ok(());
+            let msg = "Unable to create a valid resume limit for this charge limit.";
+            display::error(msg);
+            return Err(ChargerError::InvalidInput(msg.to_string()));
         }
 
         cfg.resume_limit = new_resume;
@@ -122,19 +89,21 @@ pub fn limit(value: u8) -> Result<(), ChargerError> {
 
 pub fn resume(value: u8) -> Result<(), ChargerError> {
     if !(40..=99).contains(&value) {
-        display::error("Resume limit must be between 40 and 99%");
-        return Ok(());
+        let msg = "Resume limit must be between 40 and 99%";
+        display::error(msg);
+        return Err(ChargerError::InvalidInput(msg.to_string()));
     }
 
     let mut cfg = load_config()?;
 
     if value >= cfg.charge_limit {
-        display::error(&format!(
+        let msg = format!(
             "Resume limit ({}%) must be less than charge limit ({}%).",
             value, cfg.charge_limit
-        ));
+        );
+        display::error(&msg);
 
-        return Ok(());
+        return Err(ChargerError::InvalidInput(msg));
     }
 
     cfg.resume_limit = value;
@@ -167,8 +136,9 @@ pub fn thermal(enabled: bool) -> Result<(), ChargerError> {
 
 pub fn max_temp(value: i32) -> Result<(), ChargerError> {
     if !(30..=60).contains(&value) {
-        display::error("Max temp must be between 30 and 60 °C");
-        return Ok(());
+        let msg = "Max temp must be between 30 and 60 °C";
+        display::error(msg);
+        return Err(ChargerError::InvalidInput(msg.to_string()));
     }
 
     let mut cfg = load_config()?;

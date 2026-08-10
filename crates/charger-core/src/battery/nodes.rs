@@ -17,8 +17,10 @@ pub const BATTERY_CURRENT_NODES: &[&str] = &[
 ];
 
 pub const INPUT_CURRENT_NODES: &[&str] = &[
+    // main/current_now: actual current flowing from charger IC to system (0 when discharging).
+    // main/input_current_now is intentionally excluded: it is a driver-configured
+    // input limit (e.g. 2000 mA), not the actual current being drawn.
     "/sys/class/power_supply/main/current_now",
-    "/sys/class/power_supply/main/input_current_now",
     "/sys/class/power_supply/usb/input_current_now",
     "/sys/class/power_supply/usb/current_now",
 ];

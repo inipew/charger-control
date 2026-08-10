@@ -149,34 +149,37 @@ fn main() {
 
     let ipc_shutdown = Arc::new(AtomicBool::new(false));
 
+    let shared_diagnostics = Arc::new(ipc::DaemonDiagnostics::new());
+
+    let tx_for_signal = match tx.try_clone() {
+        Ok(cloned) => Some(cloned),
+        Err(error) => {
+            tracing::warn!("Failed cloning IPC datagram for signal handler: {error}");
+            None
+        }
+    };
+
     /*
      * Signal handling.
      *
-     * SIGTERM/SIGINT are emergency paths.
-     * Normal CLI shutdown goes through IPC.
+     * SIGTERM/SIGINT trigger graceful shutdown via internal IPC.
      */
     if let Ok(mut signals) = signal_hook::iterator::Signals::new([
         signal_hook::consts::signal::SIGTERM,
         signal_hook::consts::signal::SIGINT,
     ]) {
-        std::thread::spawn(move || {
-            if let Some(signal) = signals.forever().next() {
-                tracing::warn!("Received signal {}", signal);
+        let _ = std::thread::Builder::new()
+            .name("signal-handler".to_string())
+            .stack_size(256 * 1024)
+            .spawn(move || {
+                if let Some(signal) = signals.forever().next() {
+                    tracing::warn!("Received signal {}, initiating graceful shutdown", signal);
 
-                let _ = charger_core::battery::control::set_charging(true);
-
-                cleanup_pid_file();
-                let _ = std::fs::remove_file(ipc::SOCKET_PATH);
-
-                /*
-                 * Never remove daemon.lock manually.
-                 *
-                 * flock is released by the kernel when
-                 * this process terminates.
-                 */
-                std::process::exit(0);
-            }
-        });
+                    if let Some(signal_tx) = tx_for_signal {
+                        let _ = signal_tx.send(&[2]);
+                    }
+                }
+            });
     }
 
     /*
@@ -186,14 +189,26 @@ fn main() {
 
     let shutdown_for_ipc = Arc::clone(&ipc_shutdown);
 
-    let ipc_thread = std::thread::spawn(move || {
-        ipc::start_ipc_server(config_for_ipc, tx, shutdown_for_ipc);
-    });
+    let diagnostics_for_ipc = Arc::clone(&shared_diagnostics);
+
+    let ipc_thread = match std::thread::Builder::new()
+        .name("ipc-server".to_string())
+        .stack_size(512 * 1024)
+        .spawn(move || {
+            ipc::start_ipc_server(config_for_ipc, tx, shutdown_for_ipc, diagnostics_for_ipc);
+        }) {
+        Ok(handle) => handle,
+        Err(error) => {
+            tracing::error!(error = %error, "Failed spawning IPC server thread");
+            cleanup_pid_file();
+            return;
+        }
+    };
 
     /*
      * Monitor owns the normal daemon lifecycle.
      */
-    monitor::run_monitor_loop(Arc::clone(&shared_config), rx);
+    monitor::run_monitor_loop(Arc::clone(&shared_config), rx, shared_diagnostics);
 
     tracing::info!("Monitor requested daemon shutdown");
 

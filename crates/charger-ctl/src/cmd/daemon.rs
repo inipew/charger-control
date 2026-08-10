@@ -1,5 +1,4 @@
 use std::{
-    io::{Read, Write},
     process::{Command, Stdio},
     time::{Duration, Instant},
 };
@@ -7,9 +6,6 @@ use std::{
 use charger_core::error::ChargerError;
 
 use crate::display;
-
-#[cfg(unix)]
-use std::os::unix::net::UnixStream;
 
 const CONNECT_TIMEOUT: Duration = Duration::from_millis(300);
 
@@ -37,11 +33,26 @@ fn is_process_alive(pid: u32) -> bool {
         return false;
     }
 
-    unsafe {
+    let alive = unsafe {
         let res = libc::kill(pid as libc::pid_t, 0);
 
         res == 0 || std::io::Error::last_os_error().raw_os_error() == Some(libc::EPERM)
+    };
+
+    if !alive {
+        return false;
     }
+
+    // Verify process name to avoid false positives if PID was reassigned
+    if let Ok(comm) = std::fs::read_to_string(format!("/proc/{}/comm", pid)) {
+        return comm.trim() == "charger-daemon";
+    }
+
+    if let Ok(cmdline) = std::fs::read_to_string(format!("/proc/{}/cmdline", pid)) {
+        return cmdline.contains("charger-daemon");
+    }
+
+    true
 }
 
 #[cfg(not(unix))]
@@ -114,7 +125,9 @@ pub fn run(action: &str) -> Result<(), ChargerError> {
         "reload" => send_cmd(b"reload"),
 
         _ => {
-            display::error("Unknown daemon action");
+            let msg = "Unknown daemon action";
+            display::error(msg);
+            return Err(ChargerError::InvalidInput(msg.to_string()));
         }
     }
 
@@ -147,31 +160,49 @@ fn start_daemon() {
         }
     }
 
+    fn find_daemon_binary() -> Option<std::path::PathBuf> {
+        if let Ok(exe_path) = std::env::current_exe() {
+            let same_dir = exe_path.with_file_name("charger-daemon");
+            if same_dir.exists() {
+                return Some(same_dir);
+            }
+        }
+
+        let magisk_paths = [
+            "/data/adb/modules/charger-control/system/bin/charger-daemon",
+            "/data/adb/modules_update/charger-control/system/bin/charger-daemon",
+        ];
+
+        for path_str in magisk_paths {
+            let path = std::path::PathBuf::from(path_str);
+            if path.exists() {
+                return Some(path);
+            }
+        }
+
+        if let Ok(path_env) = std::env::var("PATH") {
+            for entry in std::env::split_paths(&path_env) {
+                let candidate = entry.join("charger-daemon");
+                if candidate.exists() {
+                    return Some(candidate);
+                }
+            }
+        }
+
+        None
+    }
+
     #[cfg(unix)]
     {
-        let exe_path = match std::env::current_exe() {
-            Ok(path) => path,
-
-            Err(error) => {
-                display::error(&format!(
-                    "Failed to determine charger-ctl path: \
-                             {error}"
-                ));
-
+        let daemon_path = match find_daemon_binary() {
+            Some(path) => path,
+            None => {
+                display::error(
+                    "charger-daemon binary not found in same directory, Magisk paths, or PATH.",
+                );
                 return;
             }
         };
-
-        let daemon_path = exe_path.with_file_name("charger-daemon");
-
-        if !daemon_path.exists() {
-            display::error(&format!(
-                "charger-daemon not found: {}",
-                daemon_path.display()
-            ));
-
-            return;
-        }
 
         use std::os::unix::process::CommandExt;
 
@@ -379,94 +410,26 @@ fn status_daemon() {
     display::warn("Daemon is INACTIVE (Stopped)");
 }
 
-#[cfg(unix)]
 fn daemon_ipc_ready() -> bool {
-    let path = socket_path();
-
-    let mut stream = match UnixStream::connect(&path) {
-        Ok(stream) => stream,
-        Err(_) => return false,
-    };
-
-    if stream.set_read_timeout(Some(CONNECT_TIMEOUT)).is_err() {
-        return false;
-    }
-
-    if stream.set_write_timeout(Some(CONNECT_TIMEOUT)).is_err() {
-        return false;
-    }
-
-    if stream.write_all(b"status").is_err() {
-        return false;
-    }
-
-    let mut response = [0u8; 64];
-
-    match stream.read(&mut response) {
-        Ok(size) if size > 0 => {
-            let response = String::from_utf8_lossy(&response[..size]);
-
-            response.starts_with("OK:")
-        }
-
-        _ => false,
-    }
+    crate::client::IpcClient::is_ready(CONNECT_TIMEOUT)
 }
 
 fn send_cmd(cmd: &[u8]) {
-    #[cfg(unix)]
-    {
-        let path = socket_path();
-
-        let mut stream = match UnixStream::connect(&path) {
-            Ok(stream) => stream,
-
-            Err(_) => {
-                display::error("Daemon is not running or IPC socket is unavailable.");
-
-                return;
-            }
-        };
-
-        let _ = stream.set_write_timeout(Some(COMMAND_TIMEOUT));
-
-        let _ = stream.set_read_timeout(Some(COMMAND_TIMEOUT));
-
-        if let Err(error) = stream.write_all(cmd) {
-            display::error(&format!("Failed to send daemon command: {error}"));
-
-            return;
-        }
-
-        let mut response = String::new();
-
-        match stream.read_to_string(&mut response) {
-            Ok(_) => {
-                let response = response.trim();
-
-                if response.starts_with("OK:") {
-                    let message = response.strip_prefix("OK:").unwrap_or(response).trim();
-
-                    display::success(message);
-                } else if response.starts_with("OK") {
-                    display::success(response);
-                } else if response.is_empty() {
-                    display::error("Daemon returned an empty response.");
-                } else {
-                    display::error(response);
-                }
-            }
-
-            Err(error) => {
-                display::error(&format!("Failed to read daemon response: {error}"));
+    match crate::client::IpcClient::send_command(cmd, COMMAND_TIMEOUT) {
+        Ok(response) => {
+            if response.starts_with("OK:") {
+                let message = response.strip_prefix("OK:").unwrap_or(&response).trim();
+                display::success(message);
+            } else if response.starts_with("OK") {
+                display::success(&response);
+            } else if response.is_empty() {
+                display::error("Daemon returned an empty response.");
+            } else {
+                display::error(&response);
             }
         }
-    }
-
-    #[cfg(not(unix))]
-    {
-        let _ = cmd;
-
-        display::error("IPC is only supported on UNIX/Android.");
+        Err(err) => {
+            display::error(&err);
+        }
     }
 }

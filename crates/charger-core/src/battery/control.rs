@@ -1,4 +1,8 @@
-use std::{fs, path::Path};
+use std::{
+    fs,
+    path::Path,
+    sync::atomic::{AtomicUsize, Ordering},
+};
 
 use crate::{
     battery::nodes::{CHARGING_NODES, SUSPEND_NODES},
@@ -15,8 +19,7 @@ use crate::{
 /// - `ChargingEnabled` = `charging_enabled=1` + `input_suspend=0`
 /// - `ChargingDisabled` = `charging_enabled=0` + `input_suspend=1`
 /// - `Bypass` = not physically distinguishable from `ChargingDisabled`
-/// - `Inconsistent` = both nodes are readable but contain an unexpected
-///                    combination
+/// - `Inconsistent` = both nodes are readable but contain an unexpected combination
 /// - `Unknown` = one or both nodes cannot be read
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ActualHardwareMode {
@@ -173,13 +176,61 @@ fn apply_nodes(nodes: &[(&str, &str)], operation: &'static str) -> Result<(), Ch
 ///
 /// The current platform exposes exactly one authoritative node. Keeping this
 /// helper based on `CHARGING_NODES` avoids duplicating the path in control.rs.
+static CHARGING_NODE_IDX: AtomicUsize = AtomicUsize::new(usize::MAX);
+static SUSPEND_NODE_IDX: AtomicUsize = AtomicUsize::new(usize::MAX);
+
+fn detect_node_cached(
+    category: &'static str,
+    candidates: &[&'static str],
+    cached_idx: &AtomicUsize,
+) -> Option<&'static str> {
+    let idx = cached_idx.load(Ordering::Relaxed);
+    if idx < candidates.len() {
+        /*
+         * Return the cached path unconditionally — no exists() probe.
+         *
+         * write_optional_node() handles ENOENT gracefully (returns Ok(false)).
+         * If the node has disappeared since it was cached, apply_nodes() will
+         * report NoChargingNodeFound and the monitor will call
+         * reset_node_caches(), which sets both indices back to usize::MAX so
+         * the next call re-discovers the active node.
+         */
+        return Some(candidates[idx]);
+    }
+
+    /*
+     * No valid cache yet. Scan candidates with a lightweight metadata probe.
+     * This path is only taken once per boot (or after cache invalidation).
+     */
+    for (i, &path) in candidates.iter().enumerate() {
+        if Path::new(path).exists() {
+            let prev = cached_idx.swap(i, Ordering::Relaxed);
+            if prev != i {
+                tracing::info!(category, path, "active control sysfs node resolved");
+            }
+            return Some(path);
+        }
+    }
+
+    None
+}
+
 fn charging_node() -> Option<&'static str> {
-    CHARGING_NODES.first().copied()
+    detect_node_cached("charging_control", CHARGING_NODES, &CHARGING_NODE_IDX)
 }
 
 /// Return the primary input-suspend control node.
 fn suspend_node() -> Option<&'static str> {
-    SUSPEND_NODES.first().copied()
+    detect_node_cached("input_suspend", SUSPEND_NODES, &SUSPEND_NODE_IDX)
+}
+
+/// Invalidate the cached node indices for both charging and suspend nodes.
+///
+/// Call this when a write operation returns `NoChargingNodeFound` so that
+/// the next evaluation re-discovers which nodes are physically available.
+pub fn reset_node_caches() {
+    CHARGING_NODE_IDX.store(usize::MAX, Ordering::Relaxed);
+    SUSPEND_NODE_IDX.store(usize::MAX, Ordering::Relaxed);
 }
 
 /// Enable normal charging.

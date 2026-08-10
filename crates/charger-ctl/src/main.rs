@@ -1,6 +1,7 @@
 use charger_core::error::ChargerError;
 use clap::{Parser, Subcommand};
 
+mod client;
 mod cmd;
 mod display;
 
@@ -14,7 +15,11 @@ struct Cli {
 #[derive(Subcommand)]
 enum Commands {
     /// Show current battery status
-    Status,
+    Status {
+        /// Output status in JSON format
+        #[arg(long)]
+        json: bool,
+    },
 
     /// Setup charging parameters
     Set {
@@ -79,8 +84,8 @@ fn main() -> Result<(), ChargerError> {
     let cli = Cli::parse();
 
     match &cli.command {
-        Commands::Status => {
-            cmd::status::run()?;
+        Commands::Status { json } => {
+            cmd::status::run(*json)?;
         }
 
         Commands::Set { target } => match target {

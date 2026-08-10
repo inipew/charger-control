@@ -1,5 +1,17 @@
 use charger_core::error::ChargerError;
 
+struct NetlinkFd(libc::c_int);
+
+impl Drop for NetlinkFd {
+    fn drop(&mut self) {
+        if self.0 >= 0 {
+            unsafe {
+                libc::close(self.0);
+            }
+        }
+    }
+}
+
 pub fn run_uevent_dumper() -> Result<(), ChargerError> {
     println!("=== UEVENT DUMPER ===");
     println!("Listening for netlink broadcast (uevent) messages...");
@@ -16,6 +28,8 @@ pub fn run_uevent_dumper() -> Result<(), ChargerError> {
     if fd < 0 {
         return Err(ChargerError::ParseError("Failed to create netlink socket"));
     }
+
+    let _guard = NetlinkFd(fd);
 
     let mut addr: libc::sockaddr_nl = unsafe { std::mem::zeroed() };
     addr.nl_family = libc::AF_NETLINK as libc::sa_family_t;

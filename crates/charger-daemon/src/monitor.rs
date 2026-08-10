@@ -6,6 +6,7 @@ use std::{
     time::{Duration, Instant},
 };
 
+use crate::ipc::DaemonDiagnostics;
 use charger_core::{
     battery::{control, reader},
     config::schema::Config,
@@ -14,8 +15,11 @@ use charger_core::{
 const MIN_INTERVAL: Duration = Duration::from_secs(2);
 const MAX_INTERVAL: Duration = Duration::from_secs(90);
 
+/// Fallback heartbeat saat Netlink tidak tersedia.
+///
+/// Digunakan agar daemon tetap mendeteksi perubahan status charger
+/// pada perangkat yang tidak mendukung Netlink uevent.
 const FALLBACK_HEARTBEAT: Duration = Duration::from_secs(600);
-const ATTACHED_SETTLE_INTERVAL: Duration = Duration::from_secs(3);
 
 const NETLINK_COALESCE: Duration = Duration::from_millis(100);
 
@@ -99,62 +103,41 @@ impl DesiredHardwareState {
     }
 }
 
-#[derive(Debug)]
-struct MonitorState {
-    operating_mode: OperatingMode,
-
-    policy: PolicyState,
-
-    hardware: control::ActualHardwareMode,
-
-    power_state: reader::PowerState,
-
-    last_evaluation: Instant,
-
-    last_hardware_reconcile: Instant,
-
-    attach_started: Option<Instant>,
-
-    hardware_event_pending: bool,
-
-    pending_netlink: bool,
-
-    force_evaluation: bool,
-
-    error_backoff: Duration,
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum FailureKind {
+    Snapshot,
+    Hardware,
 }
 
-impl MonitorState {
+#[derive(Debug)]
+struct SchedulingState {
+    /// Instant of the last completed evaluation.
+    last_evaluation: Instant,
+
+    /// Whether a Netlink coalesced event is pending coalesce window.
+    pending_netlink: bool,
+
+    /// Whether an evaluation must run on the next loop iteration.
+    force_evaluation: bool,
+
+    snapshot_backoff: Duration,
+    next_snapshot_retry_at: Option<Instant>,
+
+    hardware_backoff: Duration,
+    next_hardware_retry_at: Option<Instant>,
+}
+
+impl SchedulingState {
     fn new() -> Self {
-        let now = Instant::now();
-
         Self {
-            operating_mode: OperatingMode::Normal,
-
-            policy: PolicyState::clear(),
-
-            hardware: control::ActualHardwareMode::Unknown,
-
-            power_state: reader::PowerState::Unknown,
-
-            last_evaluation: now - Duration::from_secs(60),
-
-            last_hardware_reconcile: now - HARDWARE_RECONCILE_INTERVAL,
-
-            attach_started: None,
-
-            hardware_event_pending: false,
-
+            last_evaluation: Instant::now() - Duration::from_secs(60),
             pending_netlink: false,
-
             force_evaluation: true,
-
-            error_backoff: ERROR_BACKOFF_INITIAL,
+            snapshot_backoff: ERROR_BACKOFF_INITIAL,
+            next_snapshot_retry_at: None,
+            hardware_backoff: ERROR_BACKOFF_INITIAL,
+            next_hardware_retry_at: None,
         }
-    }
-
-    fn mark_hardware_changed(&mut self) {
-        self.hardware_event_pending = true;
     }
 
     fn mark_force_evaluation(&mut self) {
@@ -166,27 +149,146 @@ impl MonitorState {
         self.pending_netlink = false;
     }
 
-    fn mark_success(&mut self) {
-        self.error_backoff = ERROR_BACKOFF_INITIAL;
+    fn mark_success(&mut self, kind: FailureKind) {
+        match kind {
+            FailureKind::Snapshot => {
+                self.snapshot_backoff = ERROR_BACKOFF_INITIAL;
+                self.next_snapshot_retry_at = None;
+            }
+            FailureKind::Hardware => {
+                self.hardware_backoff = ERROR_BACKOFF_INITIAL;
+                self.next_hardware_retry_at = None;
+            }
+        }
     }
 
-    fn mark_failure(&mut self) {
-        self.error_backoff = (self.error_backoff * 2).min(ERROR_BACKOFF_MAX);
+    fn mark_success_all(&mut self) {
+        self.mark_success(FailureKind::Snapshot);
+        self.mark_success(FailureKind::Hardware);
     }
 
-    fn hardware_reconcile_due(&self) -> bool {
-        self.hardware_event_pending
-            || self.last_hardware_reconcile.elapsed() >= HARDWARE_RECONCILE_INTERVAL
+    fn mark_failure(&mut self, kind: FailureKind) {
+        match kind {
+            FailureKind::Snapshot => {
+                self.next_snapshot_retry_at = Some(Instant::now() + self.snapshot_backoff);
+
+                self.snapshot_backoff = (self.snapshot_backoff * 2).min(ERROR_BACKOFF_MAX);
+            }
+
+            FailureKind::Hardware => {
+                self.next_hardware_retry_at = Some(Instant::now() + self.hardware_backoff);
+
+                self.hardware_backoff = (self.hardware_backoff * 2).min(ERROR_BACKOFF_MAX);
+            }
+        }
+    }
+}
+
+#[derive(Debug)]
+struct HardwareTrack {
+    /// Last known physical hardware charging mode.
+    mode: control::ActualHardwareMode,
+
+    /// Set when hardware state has changed and reconciliation is due.
+    event_pending: bool,
+
+    /// Instant of the last hardware reconciliation read.
+    last_reconcile: Instant,
+}
+
+impl HardwareTrack {
+    fn new() -> Self {
+        Self {
+            mode: control::ActualHardwareMode::Unknown,
+            event_pending: false,
+            last_reconcile: Instant::now() - HARDWARE_RECONCILE_INTERVAL,
+        }
+    }
+
+    fn reconcile_due(&self) -> bool {
+        self.event_pending || self.last_reconcile.elapsed() >= HARDWARE_RECONCILE_INTERVAL
+    }
+
+    fn mark_changed(&mut self) {
+        self.event_pending = true;
     }
 
     fn mark_reconciled(&mut self) {
-        self.last_hardware_reconcile = Instant::now();
-        self.hardware_event_pending = false;
+        self.last_reconcile = Instant::now();
+        self.event_pending = false;
+    }
+}
+
+#[derive(Debug)]
+struct MonitorState {
+    operating_mode: OperatingMode,
+
+    policy: PolicyState,
+
+    power_state: reader::PowerState,
+
+    attach_started: Option<Instant>,
+
+    /// Hardware mode tracking, reconciliation, and event flags.
+    hw: HardwareTrack,
+
+    /// Scheduling, retry windows, and netlink coalescing.
+    sched: SchedulingState,
+}
+
+impl MonitorState {
+    fn new() -> Self {
+        Self {
+            operating_mode: OperatingMode::Normal,
+
+            policy: PolicyState::clear(),
+
+            power_state: reader::PowerState::Unknown,
+
+            attach_started: None,
+
+            hw: HardwareTrack::new(),
+
+            sched: SchedulingState::new(),
+        }
+    }
+
+    fn mark_hardware_changed(&mut self) {
+        self.hw.mark_changed();
+    }
+
+    fn mark_force_evaluation(&mut self) {
+        self.sched.mark_force_evaluation();
+    }
+
+    fn clear_evaluation_request(&mut self) {
+        self.sched.clear_evaluation_request();
+    }
+
+    fn mark_success(&mut self, kind: FailureKind) {
+        self.sched.mark_success(kind);
+    }
+
+    fn mark_success_all(&mut self) {
+        self.sched.mark_success_all();
+    }
+
+    fn mark_failure(&mut self, kind: FailureKind) {
+        self.sched.mark_failure(kind);
+    }
+
+    fn hardware_reconcile_due(&self) -> bool {
+        self.hw.reconcile_due()
+    }
+
+    fn mark_reconciled(&mut self) {
+        self.hw.mark_reconciled();
     }
 
     fn reset_charger_state(&mut self) {
         self.policy = PolicyState::clear();
         self.attach_started = None;
+        self.sched.mark_success_all();
     }
 }
 
@@ -274,11 +376,21 @@ impl AdaptiveScheduler {
                 let rate = capacity_delta / seconds;
 
                 self.ema_capacity_rate = ema(self.ema_capacity_rate, rate);
+            }
 
-                let temperature_delta = sample.temperature_c - previous.temperature_c;
+            /*
+             * Temperature rate is independent of SOC validity.
+             *
+             * A sudden SOC correction (e.g. BMS re-calibration) should not
+             * cause a valid temperature reading to be discarded.
+             */
+            let temperature_delta = sample.temperature_c - previous.temperature_c;
+            let temperature_rate = temperature_delta / seconds;
 
-                let temperature_rate = temperature_delta / seconds;
-
+            // Clamp to a physically plausible range: Li-ion cells rarely
+            // change faster than 2 °C/s even under extreme abuse.
+            const MAX_VALID_TEMP_RATE_C_PER_S: f32 = 2.0;
+            if temperature_rate.abs() <= MAX_VALID_TEMP_RATE_C_PER_S {
                 self.ema_temperature_rate = ema(self.ema_temperature_rate, temperature_rate);
             }
         }
@@ -299,18 +411,9 @@ impl AdaptiveScheduler {
             return self.configured_interval;
         };
 
-        match sample.power_state {
-            reader::PowerState::Disconnected => {
-                self.last_interval = FALLBACK_HEARTBEAT;
-                return self.last_interval;
-            }
-
-            reader::PowerState::Attached => {
-                self.last_interval = ATTACHED_SETTLE_INTERVAL;
-                return self.last_interval;
-            }
-
-            _ => {}
+        if sample.power_state == reader::PowerState::Disconnected {
+            self.last_interval = FALLBACK_HEARTBEAT;
+            return self.last_interval;
         }
 
         if operating_mode == OperatingMode::Bypass {
@@ -429,6 +532,17 @@ fn create_netlink_socket() -> Option<RawFd> {
         return None;
     }
 
+    let rcvbuf: libc::c_int = 256 * 1024;
+    unsafe {
+        libc::setsockopt(
+            fd,
+            libc::SOL_SOCKET,
+            libc::SO_RCVBUF,
+            &rcvbuf as *const _ as *const libc::c_void,
+            std::mem::size_of::<libc::c_int>() as u32,
+        );
+    }
+
     let mut address: libc::sockaddr_nl = unsafe { std::mem::zeroed() };
 
     address.nl_family = libc::AF_NETLINK as libc::sa_family_t;
@@ -456,7 +570,7 @@ fn create_netlink_socket() -> Option<RawFd> {
 }
 
 fn drain_netlink(fd: RawFd) -> NetlinkEvent {
-    let mut buffer = [0u8; 8192];
+    let mut buffer = [0u8; 16384];
 
     let mut result = NetlinkEvent::None;
 
@@ -505,22 +619,24 @@ fn drain_netlink(fd: RawFd) -> NetlinkEvent {
 }
 
 fn is_fast_power_supply_event(name: &[u8], data: &[u8]) -> bool {
-    data.split(|byte| *byte == 0).any(|part| match name {
-        b"ac" => part.starts_with(b"POWER_SUPPLY_ONLINE="),
+    data.split(|byte| *byte == 0).any(|part| {
+        part.starts_with(b"POWER_SUPPLY_ONLINE=")
+            || part.starts_with(b"POWER_SUPPLY_PRESENT=")
+            || part.starts_with(b"POWER_SUPPLY_STATUS=")
+            // Charging control node changes must be fast-pathed:
+            // these are exactly what the daemon writes and reads back.
+            || part.starts_with(b"POWER_SUPPLY_CHARGING_ENABLED=")
+            || part.starts_with(b"POWER_SUPPLY_INPUT_SUSPEND=")
+            || match name {
+                b"battery" => {
+                    part.starts_with(b"POWER_SUPPLY_CAPACITY=")
+                        || part.starts_with(b"POWER_SUPPLY_TEMP=")
+                }
 
-        b"battery" => {
-            part.starts_with(b"POWER_SUPPLY_STATUS=")
-                || part.starts_with(b"POWER_SUPPLY_CAPACITY=")
-                || part.starts_with(b"POWER_SUPPLY_TEMP=")
-        }
+                b"usb" | b"charger" | b"typec" => part.starts_with(b"POWER_SUPPLY_TYPEC_MODE="),
 
-        b"usb" => {
-            part.starts_with(b"POWER_SUPPLY_TYPEC_MODE=")
-                || part.starts_with(b"POWER_SUPPLY_ONLINE=")
-                || part.starts_with(b"POWER_SUPPLY_PRESENT=")
-        }
-
-        _ => false,
+                _ => false,
+            }
     })
 }
 
@@ -532,20 +648,30 @@ fn is_relevant_power_supply(name: &[u8]) -> bool {
             | b"main"
             | b"ac"
             | b"wireless"
+            | b"wls"
             | b"bms"
             | b"mtk-charger"
             | b"mt_charger"
+            | b"charger"
+            | b"sec-charger"
+            | b"pd-charger"
+            | b"typec"
+            | b"tcpc"
+            | b"dc"
     )
 }
 
-fn duration_to_poll_ms(duration: Duration) -> i32 {
-    duration.as_millis().min(i32::MAX as u128) as i32
+fn timeout_to_poll_ms(timeout: Option<Duration>) -> i32 {
+    match timeout {
+        None => -1,
+        Some(duration) => duration.as_millis().min(i32::MAX as u128) as i32,
+    }
 }
 
 #[derive(Debug, Clone, Copy)]
 struct MonitorSnapshot {
     capacity: f32,
-    temperature_dc: i32,
+    temperature_c: f32,
     power_state: reader::PowerState,
 }
 
@@ -558,8 +684,8 @@ fn read_monitor_snapshot() -> Result<MonitorSnapshot, &'static str> {
 
     let capacity = capacity.clamp(0.0, 100.0);
 
-    let temperature_dc =
-        reader::read_temperature_dc().map_err(|_| "battery_temperature_read_failed")?;
+    let temperature_c =
+        reader::read_temperature_c().map_err(|_| "battery_temperature_read_failed")?;
 
     let power_state = reader::get_power_state().map_err(|_| "power_state_read_failed")?;
 
@@ -569,7 +695,7 @@ fn read_monitor_snapshot() -> Result<MonitorSnapshot, &'static str> {
 
     Ok(MonitorSnapshot {
         capacity,
-        temperature_dc,
+        temperature_c,
         power_state,
     })
 }
@@ -584,7 +710,7 @@ fn evaluate_policy(snapshot: MonitorSnapshot, previous: PolicyState, cfg: &Confi
     }
 
     let thermal_blocked =
-        evaluate_thermal_policy(snapshot.temperature_dc, previous.thermal_blocked, cfg);
+        evaluate_thermal_policy(snapshot.temperature_c, previous.thermal_blocked, cfg);
 
     let limit_blocked = evaluate_limit_policy(snapshot.capacity, previous.limit_blocked, cfg);
 
@@ -594,19 +720,21 @@ fn evaluate_policy(snapshot: MonitorSnapshot, previous: PolicyState, cfg: &Confi
     }
 }
 
-fn evaluate_thermal_policy(temperature_dc: i32, previous_blocked: bool, cfg: &Config) -> bool {
+fn evaluate_thermal_policy(temperature_c: f32, previous_blocked: bool, cfg: &Config) -> bool {
     if !cfg.thermal_cutoff {
         return false;
     }
 
-    if temperature_dc >= cfg.max_temp_dc {
+    let max_temp_c = cfg.max_temp_dc as f32 / 10.0;
+
+    if temperature_c >= max_temp_c {
         return true;
     }
 
     if previous_blocked {
-        let resume = cfg.max_temp_dc.saturating_sub(THERMAL_HYSTERESIS_DC);
+        let resume_c = (cfg.max_temp_dc.saturating_sub(THERMAL_HYSTERESIS_DC)) as f32 / 10.0;
 
-        return temperature_dc > resume;
+        return temperature_c > resume_c;
     }
 
     false
@@ -700,6 +828,15 @@ fn apply_charging(enable: bool, hardware: &mut control::ActualHardwareMode) -> b
                 "failed to apply charging state"
             );
 
+            // If no charging node was found at all, the cached paths are
+            // stale. Invalidate them so the next evaluation re-discovers.
+            if matches!(
+                error,
+                charger_core::error::ChargerError::NoChargingNodeFound
+            ) {
+                control::reset_node_caches();
+            }
+
             *hardware = control::ActualHardwareMode::Unknown;
             false
         }
@@ -738,87 +875,70 @@ fn apply_bypass(
     }
 }
 
-/// Reconcile hardware against the desired state.
-///
-/// Important invariant:
-///
-/// A single evaluation performs at most one `get_actual_charging_state()`
-/// operation. If a read discovers drift, application is deferred to the next
-/// evaluation.
-fn reconcile_hardware(desired: DesiredHardwareState, state: &mut MonitorState) -> ReconcileResult {
-    let expected = desired.hardware_mode(control::has_distinct_bypass_node());
+fn reconcile_known_stable(
+    expected: control::ActualHardwareMode,
+    state: &mut MonitorState,
+) -> ReconcileResult {
+    if !state.hardware_reconcile_due() {
+        return ReconcileResult::Stable;
+    }
 
-    let reconcile_due = state.hardware_reconcile_due();
+    let actual = control::get_actual_charging_state();
+    state.mark_reconciled();
+
+    if actual == expected {
+        state.hw.mode = actual;
+        return ReconcileResult::Stable;
+    }
+
+    tracing::warn!(
+        ?expected,
+        ?actual,
+        "hardware drift detected; deferring apply"
+    );
+
+    state.hw.mode = control::ActualHardwareMode::Unknown;
 
     /*
-     * Known-good state.
+     * A verification read already happened.
+     * Force another evaluation where the write can happen.
      */
-    if state.hardware == expected {
-        if !reconcile_due {
-            return ReconcileResult::Stable;
-        }
+    ReconcileResult::NeedsNextEvaluation
+}
 
-        let actual = control::get_actual_charging_state();
+fn reconcile_unknown_or_inconsistent(
+    expected: control::ActualHardwareMode,
+    state: &mut MonitorState,
+) -> ReconcileResult {
+    let actual = control::get_actual_charging_state();
+    state.mark_reconciled();
 
-        state.mark_reconciled();
-
-        if actual == expected {
-            state.hardware = actual;
-            return ReconcileResult::Stable;
-        }
-
-        tracing::warn!(
-            ?expected,
-            ?actual,
-            "hardware drift detected; deferring apply"
-        );
-
-        state.hardware = control::ActualHardwareMode::Unknown;
-
-        /*
-         * A verification read already happened.
-         * Force another evaluation where the write can happen.
-         */
-        return ReconcileResult::NeedsNextEvaluation;
+    if actual == expected {
+        state.hw.mode = actual;
+        return ReconcileResult::Stable;
     }
 
     /*
-     * Unknown/inconsistent state.
-     *
-     * Probe first. Never write after a probe in the same evaluation.
+     * We now have authoritative knowledge that hardware differs.
      */
-    if matches!(
-        state.hardware,
-        control::ActualHardwareMode::Unknown | control::ActualHardwareMode::Inconsistent
-    ) {
-        let actual = control::get_actual_charging_state();
+    state.hw.mode = actual;
+    ReconcileResult::NeedsNextEvaluation
+}
 
-        state.mark_reconciled();
-
-        if actual == expected {
-            state.hardware = actual;
-            return ReconcileResult::Stable;
-        }
-
-        /*
-         * We now have authoritative knowledge that hardware differs.
-         */
-        state.hardware = actual;
-
-        return ReconcileResult::NeedsNextEvaluation;
-    }
-
+fn reconcile_apply(
+    desired: DesiredHardwareState,
+    expected: control::ActualHardwareMode,
+    state: &mut MonitorState,
+) -> ReconcileResult {
     /*
      * Hardware is known and differs from desired.
      *
      * No read is necessary. Apply directly.
      */
     let success = match desired {
-        DesiredHardwareState::ChargingEnabled => apply_charging(true, &mut state.hardware),
-
-        DesiredHardwareState::ChargingDisabled => apply_charging(false, &mut state.hardware),
-
-        DesiredHardwareState::Bypass => apply_bypass(expected, &mut state.hardware),
+        DesiredHardwareState::ChargingEnabled => apply_charging(true, &mut state.hw.mode),
+        DesiredHardwareState::ChargingDisabled => apply_charging(false, &mut state.hw.mode),
+        DesiredHardwareState::Bypass => apply_bypass(expected, &mut state.hw.mode),
     };
 
     state.mark_reconciled();
@@ -830,6 +950,30 @@ fn reconcile_hardware(desired: DesiredHardwareState, state: &mut MonitorState) -
     }
 }
 
+/// Reconcile hardware against the desired state.
+///
+/// Important invariant:
+///
+/// A single evaluation performs at most one `get_actual_charging_state()`
+/// operation. If a read discovers drift, application is deferred to the next
+/// evaluation.
+fn reconcile_hardware(desired: DesiredHardwareState, state: &mut MonitorState) -> ReconcileResult {
+    let expected = desired.hardware_mode(control::has_distinct_bypass_node());
+
+    if state.hw.mode == expected {
+        return reconcile_known_stable(expected, state);
+    }
+
+    if matches!(
+        state.hw.mode,
+        control::ActualHardwareMode::Unknown | control::ActualHardwareMode::Inconsistent
+    ) {
+        return reconcile_unknown_or_inconsistent(expected, state);
+    }
+
+    reconcile_apply(desired, expected, state)
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ReconcileResult {
     Stable,
@@ -839,7 +983,7 @@ enum ReconcileResult {
 }
 
 fn restore_normal_charging(state: &mut MonitorState) -> bool {
-    match state.hardware {
+    match state.hw.mode {
         control::ActualHardwareMode::ChargingEnabled => true,
 
         control::ActualHardwareMode::Bypass => {
@@ -849,7 +993,7 @@ fn restore_normal_charging(state: &mut MonitorState) -> bool {
                      * exit_bypass_mode() does not verify hardware.
                      * Force a reconciliation on the next evaluation.
                      */
-                    state.hardware = control::ActualHardwareMode::Unknown;
+                    state.hw.mode = control::ActualHardwareMode::Unknown;
 
                     state.mark_hardware_changed();
 
@@ -862,10 +1006,10 @@ fn restore_normal_charging(state: &mut MonitorState) -> bool {
                         "failed to exit bypass"
                     );
 
-                    state.hardware = control::ActualHardwareMode::Unknown;
+                    state.hw.mode = control::ActualHardwareMode::Unknown;
 
                     state.mark_hardware_changed();
-                    state.mark_failure();
+                    state.mark_failure(FailureKind::Hardware);
 
                     false
                 }
@@ -881,7 +1025,7 @@ fn restore_normal_charging(state: &mut MonitorState) -> bool {
              * The next normal evaluation must obtain a fresh snapshot
              * and evaluate thermal/limit policy first.
              */
-            state.hardware = control::ActualHardwareMode::Unknown;
+            state.hw.mode = control::ActualHardwareMode::Unknown;
 
             state.mark_hardware_changed();
             state.mark_force_evaluation();
@@ -904,18 +1048,18 @@ fn handle_disabled(rx: &UnixDatagram, state: &mut MonitorState) -> bool {
     state.operating_mode = OperatingMode::Normal;
     state.policy = PolicyState::clear();
     state.attach_started = None;
-    state.pending_netlink = false;
-    state.force_evaluation = false;
+    state.sched.pending_netlink = false;
+    state.sched.force_evaluation = false;
 
     /*
      * Do NOT discard hardware_event_pending if hardware is still
      * unknown/inconsistent. It must survive until the monitor resumes.
      */
     if matches!(
-        state.hardware,
+        state.hw.mode,
         control::ActualHardwareMode::Unknown | control::ActualHardwareMode::Inconsistent
     ) {
-        state.hardware_event_pending = true;
+        state.hw.event_pending = true;
     }
 
     let mut pollfd = libc::pollfd {
@@ -976,7 +1120,7 @@ fn handle_disabled(rx: &UnixDatagram, state: &mut MonitorState) -> bool {
         }
 
         if reload {
-            state.force_evaluation = true;
+            state.sched.force_evaluation = true;
         }
 
         return false;
@@ -1091,22 +1235,95 @@ fn calculate_timeout(
     state: &MonitorState,
     scheduler: &mut AdaptiveScheduler,
     netlink_available: bool,
-) -> Duration {
-    if state.force_evaluation {
-        return Duration::ZERO;
+    diagnostics: &DaemonDiagnostics,
+) -> Option<Duration> {
+    diagnostics.is_idle.store(
+        state.power_state.is_disconnected(),
+        std::sync::atomic::Ordering::Relaxed,
+    );
+    let max_backoff = state
+        .sched
+        .snapshot_backoff
+        .max(state.sched.hardware_backoff);
+    diagnostics.error_backoff_ms.store(
+        max_backoff.as_millis() as u64,
+        std::sync::atomic::Ordering::Relaxed,
+    );
+
+    if state.sched.force_evaluation {
+        /*
+         * Respect active retry windows for snapshot and hardware failures.
+         * If both are active, take the earliest retry time so we resume as
+         * soon as the first retry window expires.
+         */
+        let now = Instant::now();
+        let retry_at = match (
+            state.sched.next_snapshot_retry_at,
+            state.sched.next_hardware_retry_at,
+        ) {
+            (Some(s), Some(h)) => Some(s.min(h)),
+            (Some(s), None) => Some(s),
+            (None, Some(h)) => Some(h),
+            (None, None) => None,
+        };
+
+        if let Some(retry_at) = retry_at {
+            if now < retry_at {
+                let wait = retry_at - now;
+                diagnostics.poll_interval_ms.store(
+                    wait.as_millis() as u64,
+                    std::sync::atomic::Ordering::Relaxed,
+                );
+                return Some(wait);
+            }
+        }
+
+        diagnostics
+            .poll_interval_ms
+            .store(0, std::sync::atomic::Ordering::Relaxed);
+        return Some(Duration::ZERO);
+    }
+
+    /*
+     * Ultra-Low-Power Idle saat charger terlepas.
+     *
+     * Dua jalur:
+     *
+     * a) Netlink tersedia → timeout INFINITE (None / poll -1).
+     *    Kernel membangunkan poll hanya saat ada uevent.
+     *    CPU usage = 0.00%.
+     *
+     * b) Netlink tidak tersedia → FALLBACK_HEARTBEAT.
+     *    Pemeriksaan berkala ringan sebagai safeguard.
+     *
+     * pending_netlink hanya mungkin true di sini jika uevent
+     * baru saja diterima; dalam kasus itu kita tidak idle.
+     */
+    if state.power_state.is_disconnected() && !state.sched.pending_netlink {
+        if netlink_available {
+            diagnostics
+                .poll_interval_ms
+                .store(u64::MAX, std::sync::atomic::Ordering::Relaxed);
+            return None;
+        } else {
+            diagnostics.poll_interval_ms.store(
+                FALLBACK_HEARTBEAT.as_millis() as u64,
+                std::sync::atomic::Ordering::Relaxed,
+            );
+            return Some(FALLBACK_HEARTBEAT);
+        }
     }
 
     let mut timeout = scheduler.next_interval(state.policy, state.operating_mode);
 
-    if state.power_state.is_disconnected() && netlink_available && !state.pending_netlink {
-        timeout = Duration::from_secs(u64::MAX / 2);
-    }
-
-    if state.pending_netlink {
-        let elapsed = state.last_evaluation.elapsed();
+    if state.sched.pending_netlink {
+        let elapsed = state.sched.last_evaluation.elapsed();
 
         if elapsed >= NETLINK_COALESCE {
-            return Duration::ZERO;
+            diagnostics
+                .poll_interval_ms
+                .store(0, std::sync::atomic::Ordering::Relaxed);
+            return Some(Duration::ZERO);
         }
 
         timeout = timeout.min(NETLINK_COALESCE - elapsed);
@@ -1120,34 +1337,27 @@ fn calculate_timeout(
         }
     }
 
-    if state.error_backoff > ERROR_BACKOFF_INITIAL {
-        timeout = timeout.max(state.error_backoff);
-    }
+    diagnostics.poll_interval_ms.store(
+        timeout.as_millis() as u64,
+        std::sync::atomic::Ordering::Relaxed,
+    );
 
-    timeout
+    Some(timeout)
 }
 
 fn handle_netlink(fd: RawFd, state: &mut MonitorState) {
     match drain_netlink(fd) {
         NetlinkEvent::Fast => {
-            /*
-             * A fast event means that an important power-supply
-             * attribute may have changed.
-             *
-             * It does NOT necessarily mean that a charger was attached.
-             * Attach timing is derived exclusively from PowerState
-             * transitions in handle_power_transition().
-             */
-            state.pending_netlink = false;
+            state.sched.pending_netlink = false;
             state.mark_hardware_changed();
             state.mark_force_evaluation();
         }
 
         NetlinkEvent::Coalesced => {
-            state.pending_netlink = true;
+            state.sched.pending_netlink = true;
             state.mark_hardware_changed();
 
-            if state.last_evaluation.elapsed() >= NETLINK_COALESCE {
+            if state.sched.last_evaluation.elapsed() >= NETLINK_COALESCE {
                 state.mark_force_evaluation();
             }
         }
@@ -1185,6 +1395,8 @@ fn handle_power_transition(
 
         state.mark_hardware_changed();
 
+        state.mark_success_all();
+
         scheduler.reset();
     }
 }
@@ -1196,7 +1408,7 @@ fn log_policy_change(previous: PolicyState, current: PolicyState, snapshot: Moni
 
     tracing::info!(
         soc = snapshot.capacity,
-        temperature_c = snapshot.temperature_dc as f32 / 10.0,
+        temperature_c = snapshot.temperature_c,
         limit_blocked_previous = previous.limit_blocked,
         limit_blocked = current.limit_blocked,
         thermal_blocked_previous = previous.thermal_blocked,
@@ -1209,17 +1421,54 @@ fn log_apply_result(desired: DesiredHardwareState, snapshot: MonitorSnapshot, po
     tracing::info!(
         ?desired,
         soc = snapshot.capacity,
-        temperature_c = snapshot.temperature_dc as f32 / 10.0,
+        temperature_c = snapshot.temperature_c,
         limit_blocked = policy.limit_blocked,
         thermal_blocked = policy.thermal_blocked,
         "charging hardware state applied"
     );
 }
 
+/// Fail-safe helper invoked when a monitor snapshot cannot be read.
+/// If charging is currently enabled, attempts to disable charging for safety.
+fn apply_thermal_failsafe(state: &mut MonitorState, cfg: &Config) {
+    if !cfg.thermal_cutoff {
+        state.hw.mode = control::ActualHardwareMode::Unknown;
+        return;
+    }
+
+    match control::set_charging(false) {
+        Ok(()) => {
+            let actual = control::get_actual_charging_state();
+
+            if actual == control::ActualHardwareMode::ChargingDisabled {
+                state.hw.mode = actual;
+
+                tracing::warn!("thermal fail-safe charging disable verified");
+            } else {
+                state.hw.mode = control::ActualHardwareMode::Unknown;
+
+                tracing::error!(
+                    ?actual,
+                    "thermal fail-safe charging disable could not be verified"
+                );
+            }
+        }
+
+        Err(error) => {
+            tracing::error!(
+                error = %error,
+                "failed fail-safe charging disable"
+            );
+
+            state.hw.mode = control::ActualHardwareMode::Unknown;
+        }
+    }
+}
+
 fn evaluate_once(cfg: &Config, state: &mut MonitorState, scheduler: &mut AdaptiveScheduler) {
     let snapshot = match read_monitor_snapshot() {
         Ok(snapshot) => {
-            state.mark_success();
+            state.mark_success(FailureKind::Snapshot);
             snapshot
         }
 
@@ -1230,47 +1479,23 @@ fn evaluate_once(cfg: &Config, state: &mut MonitorState, scheduler: &mut Adaptiv
              * We cannot safely evaluate normal policy without a
              * valid snapshot.
              *
-             * Thermal protection therefore fails closed.
+             * Thermal protection fails closed by attempting to disable charging.
              */
-            if cfg.thermal_cutoff {
-                match control::set_charging(false) {
-                    Ok(()) => {
-                        let actual = control::get_actual_charging_state();
+            if state.hw.mode.is_charging_enabled() {
+                tracing::warn!("snapshot unreadable while charging — attempting fail-safe disable");
 
-                        if actual == control::ActualHardwareMode::ChargingDisabled {
-                            state.hardware = actual;
-
-                            tracing::warn!("thermal fail-safe charging disable verified");
-                        } else {
-                            state.hardware = control::ActualHardwareMode::Unknown;
-
-                            tracing::error!(
-                                ?actual,
-                                "thermal fail-safe charging disable could not be verified"
-                            );
-                        }
-                    }
-
-                    Err(error) => {
-                        tracing::error!(
-                            error = %error,
-                            "failed fail-safe charging disable"
-                        );
-
-                        state.hardware = control::ActualHardwareMode::Unknown;
-                    }
-                }
+                apply_thermal_failsafe(state, cfg);
             } else {
-                state.hardware = control::ActualHardwareMode::Unknown;
+                state.hw.mode = control::ActualHardwareMode::Unknown;
             }
 
             /*
              * Keep hardware reconciliation alive after a read failure.
              */
             state.mark_hardware_changed();
-            state.mark_failure();
+            state.mark_failure(FailureKind::Snapshot);
 
-            state.last_evaluation = Instant::now();
+            state.sched.last_evaluation = Instant::now();
 
             return;
         }
@@ -1280,7 +1505,7 @@ fn evaluate_once(cfg: &Config, state: &mut MonitorState, scheduler: &mut Adaptiv
 
     let sample = Sample {
         capacity: snapshot.capacity,
-        temperature_c: snapshot.temperature_dc as f32 / 10.0,
+        temperature_c: snapshot.temperature_c,
         power_state: snapshot.power_state,
         timestamp: Instant::now(),
     };
@@ -1302,11 +1527,11 @@ fn evaluate_once(cfg: &Config, state: &mut MonitorState, scheduler: &mut Adaptiv
             ReconcileResult::Applied => {
                 log_apply_result(desired, snapshot, state.policy);
 
-                state.mark_success();
+                state.mark_success(FailureKind::Hardware);
             }
 
             ReconcileResult::Failed => {
-                state.mark_failure();
+                state.mark_failure(FailureKind::Hardware);
                 state.mark_force_evaluation();
             }
 
@@ -1322,7 +1547,7 @@ fn evaluate_once(cfg: &Config, state: &mut MonitorState, scheduler: &mut Adaptiv
             ReconcileResult::Stable => {}
         }
 
-        state.last_evaluation = Instant::now();
+        state.sched.last_evaluation = Instant::now();
 
         return;
     }
@@ -1330,36 +1555,37 @@ fn evaluate_once(cfg: &Config, state: &mut MonitorState, scheduler: &mut Adaptiv
     /*
      * Disconnect:
      *
-     * Clear policy, but do not blindly enable charging.
+     * Clear policy, tetapi JANGAN langsung mengaktifkan charging.
+     *
+     * Reset pending_netlink agar calculate_timeout bisa masuk
+     * ke mode idle infinite pada iterasi loop berikutnya.
      */
     if snapshot.power_state.is_disconnected() {
         state.policy = PolicyState::clear();
+        state.sched.pending_netlink = false;
 
         scheduler.reset();
 
-        /*
-         * If hardware is in bypass, exit it.
-         * Otherwise leave charging state alone until a valid
-         * attached snapshot establishes the next desired state.
-         */
-        if state.hardware == control::ActualHardwareMode::Bypass {
+        if state.hw.mode == control::ActualHardwareMode::Bypass {
             if let Err(error) = control::exit_bypass_mode() {
                 tracing::warn!(
                     error = %error,
-                    "failed to exit bypass while disconnected"
+                    "failed to exit bypass mode while disabled"
                 );
 
-                state.hardware = control::ActualHardwareMode::Unknown;
+                state.hw.mode = control::ActualHardwareMode::Unknown;
 
-                state.mark_failure();
+                state.mark_failure(FailureKind::Hardware);
             } else {
-                state.hardware = control::ActualHardwareMode::Unknown;
+                state.hw.mode = control::ActualHardwareMode::Unknown;
 
                 state.mark_hardware_changed();
             }
         }
 
-        state.last_evaluation = Instant::now();
+        state.sched.last_evaluation = Instant::now();
+
+        tracing::debug!("charger disconnected — entering ultra-low-power idle");
 
         return;
     }
@@ -1381,11 +1607,11 @@ fn evaluate_once(cfg: &Config, state: &mut MonitorState, scheduler: &mut Adaptiv
         ReconcileResult::Applied => {
             log_apply_result(desired, snapshot, state.policy);
 
-            state.mark_success();
+            state.mark_success(FailureKind::Hardware);
         }
 
         ReconcileResult::Failed => {
-            state.mark_failure();
+            state.mark_failure(FailureKind::Hardware);
 
             /*
              * Retry even when there is no new netlink event.
@@ -1400,7 +1626,7 @@ fn evaluate_once(cfg: &Config, state: &mut MonitorState, scheduler: &mut Adaptiv
         ReconcileResult::Stable => {}
     }
 
-    state.last_evaluation = Instant::now();
+    state.sched.last_evaluation = Instant::now();
 }
 
 /// Main charger monitor loop.
@@ -1412,7 +1638,11 @@ fn evaluate_once(cfg: &Config, state: &mut MonitorState, scheduler: &mut Adaptiv
 ///
 /// The monitor owns logical state. `reader` only reads hardware inputs and
 /// `control` only manipulates hardware outputs.
-pub fn run_monitor_loop(config: Arc<RwLock<Config>>, rx: UnixDatagram) {
+pub fn run_monitor_loop(
+    config: Arc<RwLock<Config>>,
+    rx: UnixDatagram,
+    diagnostics: Arc<DaemonDiagnostics>,
+) {
     tracing::info!("charger monitor started");
 
     let initial_config = {
@@ -1427,6 +1657,10 @@ pub fn run_monitor_loop(config: Arc<RwLock<Config>>, rx: UnixDatagram) {
     let _netlink_guard = NetlinkFd(nl_fd);
 
     let netlink_available = nl_fd >= 0;
+
+    diagnostics
+        .netlink_available
+        .store(netlink_available, std::sync::atomic::Ordering::Relaxed);
 
     if netlink_available {
         tracing::info!("netlink power-supply events enabled");
@@ -1457,7 +1691,7 @@ pub fn run_monitor_loop(config: Arc<RwLock<Config>>, rx: UnixDatagram) {
             continue;
         }
 
-        let timeout = calculate_timeout(&state, &mut scheduler, netlink_available);
+        let timeout = calculate_timeout(&state, &mut scheduler, netlink_available, &diagnostics);
 
         let mut pollfds = [
             libc::pollfd {
@@ -1474,7 +1708,7 @@ pub fn run_monitor_loop(config: Arc<RwLock<Config>>, rx: UnixDatagram) {
 
         let nfds = if netlink_available { 2 } else { 1 };
 
-        let timeout_ms = duration_to_poll_ms(timeout);
+        let timeout_ms = timeout_to_poll_ms(timeout);
 
         let result = unsafe { libc::poll(pollfds.as_mut_ptr(), nfds, timeout_ms) };
 
@@ -1503,15 +1737,27 @@ pub fn run_monitor_loop(config: Arc<RwLock<Config>>, rx: UnixDatagram) {
             handle_netlink(nl_fd, &mut state);
         }
 
-        if state.pending_netlink && state.last_evaluation.elapsed() >= NETLINK_COALESCE {
+        if state.sched.pending_netlink && state.sched.last_evaluation.elapsed() >= NETLINK_COALESCE
+        {
             state.mark_force_evaluation();
         }
 
+        /*
+         * result == 0 berarti poll timeout habis (tidak ada event).
+         *
+         * Saat Disconnected + Netlink tersedia, timeout = infinite (-1)
+         * sehingga result == 0 hanya terjadi jika Netlink tidak tersedia
+         * dan FALLBACK_HEARTBEAT habis. Dalam kasus itu kita perlu evaluasi
+         * untuk mendeteksi apakah charger sudah terpasang kembali.
+         *
+         * Saat charger terpasang (Connected), result == 0 berarti interval
+         * normal habis dan evaluasi pengisian perlu dilakukan.
+         */
         if result == 0 {
             state.mark_force_evaluation();
         }
 
-        if !state.force_evaluation {
+        if !state.sched.force_evaluation {
             continue;
         }
 
@@ -1519,9 +1765,6 @@ pub fn run_monitor_loop(config: Arc<RwLock<Config>>, rx: UnixDatagram) {
 
         evaluate_once(&cfg, &mut state, &mut scheduler);
 
-        /*
-         * If attach settle window has expired, remove it.
-         */
         if let Some(attached_at) = state.attach_started {
             if attached_at.elapsed() >= ATTACH_SETTLE_WINDOW {
                 state.attach_started = None;

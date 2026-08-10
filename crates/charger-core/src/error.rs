@@ -46,8 +46,8 @@ pub enum ChargerError {
     #[error("Config serialize error: {0}")]
     ConfigSerialize(String),
 
-    #[error("IPC error: {0}")]
-    Ipc(String),
+    #[error("Invalid input: {0}")]
+    InvalidInput(String),
 
     #[error("Daemon not running (no socket at {0})")]
     DaemonNotRunning(String),

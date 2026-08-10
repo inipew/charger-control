@@ -3,7 +3,7 @@ use std::{
     os::unix::net::{UnixDatagram, UnixListener, UnixStream},
     path::Path,
     sync::{
-        atomic::{AtomicBool, Ordering},
+        atomic::{AtomicBool, AtomicU64, Ordering},
         Arc, RwLock,
     },
     time::Duration,
@@ -21,12 +21,38 @@ const IPC_WRITE_TIMEOUT: Duration = Duration::from_secs(2);
 
 const IPC_POLL_TIMEOUT_MS: i32 = 250;
 
+#[derive(Debug)]
+pub struct DaemonDiagnostics {
+    pub netlink_available: AtomicBool,
+    pub is_idle: AtomicBool,
+    pub poll_interval_ms: AtomicU64,
+    pub error_backoff_ms: AtomicU64,
+}
+
+impl DaemonDiagnostics {
+    pub fn new() -> Self {
+        Self {
+            netlink_available: AtomicBool::new(false),
+            is_idle: AtomicBool::new(false),
+            poll_interval_ms: AtomicU64::new(0),
+            error_backoff_ms: AtomicU64::new(0),
+        }
+    }
+}
+
+impl Default for DaemonDiagnostics {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DaemonCommand {
     BypassOn,
     BypassOff,
     Reload,
     Status,
+    StatusJson,
     Shutdown,
 }
 
@@ -39,6 +65,7 @@ impl DaemonCommand {
             "bypass off" => Some(Self::BypassOff),
             "reload" => Some(Self::Reload),
             "status" => Some(Self::Status),
+            "status json" | "status_json" => Some(Self::StatusJson),
             "shutdown" => Some(Self::Shutdown),
             _ => None,
         }
@@ -137,7 +164,12 @@ fn read_cpu_percent() -> f32 {
 /// 1. the listener has stopped;
 /// 2. the listener has been dropped;
 /// 3. the socket has been cleaned up.
-pub fn start_ipc_server(config: Arc<RwLock<Config>>, tx: UnixDatagram, shutdown: Arc<AtomicBool>) {
+pub fn start_ipc_server(
+    config: Arc<RwLock<Config>>,
+    tx: UnixDatagram,
+    shutdown: Arc<AtomicBool>,
+    diagnostics: Arc<DaemonDiagnostics>,
+) {
     let socket_path = Path::new(SOCKET_PATH);
 
     if !prepare_socket_path(socket_path) {
@@ -215,7 +247,7 @@ pub fn start_ipc_server(config: Arc<RwLock<Config>>, tx: UnixDatagram, shutdown:
         loop {
             match listener.accept() {
                 Ok((mut stream, _)) => {
-                    handle_client(&mut stream, &config, &tx, &shutdown);
+                    handle_client(&mut stream, &config, &tx, &shutdown, &diagnostics);
 
                     if shutdown.load(Ordering::Acquire) {
                         break;
@@ -248,18 +280,13 @@ pub fn start_ipc_server(config: Arc<RwLock<Config>>, tx: UnixDatagram, shutdown:
 fn prepare_socket_path(path: &Path) -> bool {
     if path.exists() {
         match std::fs::remove_file(path) {
-            Ok(()) => {
-                tracing::debug!(
-                    path = %path.display(),
-                    "Removed stale IPC socket"
-                );
-            }
+            Ok(()) => {}
 
             Err(error) => {
                 tracing::error!(
                     path = %path.display(),
                     error = %error,
-                    "Failed to remove stale IPC socket"
+                    "Failed removing stale IPC socket"
                 );
 
                 return false;
@@ -272,7 +299,7 @@ fn prepare_socket_path(path: &Path) -> bool {
             tracing::error!(
                 path = %parent.display(),
                 error = %error,
-                "Failed to create IPC directory"
+                "Failed creating IPC socket directory"
             );
 
             return false;
@@ -287,43 +314,30 @@ fn set_socket_permissions(path: &Path) {
     {
         use std::os::unix::fs::PermissionsExt;
 
-        match std::fs::metadata(path) {
-            Ok(metadata) => {
-                let mut permissions = metadata.permissions();
+        let permissions = std::fs::Permissions::from_mode(0o666);
 
-                permissions.set_mode(0o666);
-
-                if let Err(error) = std::fs::set_permissions(path, permissions) {
-                    tracing::warn!(
-                        path = %path.display(),
-                        error = %error,
-                        "Failed to set IPC permissions"
-                    );
-                }
-            }
-
-            Err(error) => {
-                tracing::warn!(
-                    path = %path.display(),
-                    error = %error,
-                    "Failed to read IPC socket metadata"
-                );
-            }
+        if let Err(error) = std::fs::set_permissions(path, permissions) {
+            tracing::warn!(
+                path = %path.display(),
+                error = %error,
+                "Failed setting IPC socket permissions"
+            );
         }
+    }
+
+    #[cfg(not(unix))]
+    {
+        let _ = path;
     }
 }
 
 fn cleanup_socket(path: &Path) {
-    match std::fs::remove_file(path) {
-        Ok(()) => {}
-
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-
-        Err(error) => {
-            tracing::debug!(
+    if path.exists() {
+        if let Err(error) = std::fs::remove_file(path) {
+            tracing::warn!(
                 path = %path.display(),
                 error = %error,
-                "Failed to remove IPC socket"
+                "Failed cleaning up IPC socket"
             );
         }
     }
@@ -334,17 +348,18 @@ fn handle_client(
     config: &Arc<RwLock<Config>>,
     tx: &UnixDatagram,
     shutdown: &Arc<AtomicBool>,
+    diagnostics: &Arc<DaemonDiagnostics>,
 ) {
     let _ = stream.set_read_timeout(Some(IPC_READ_TIMEOUT));
 
     let _ = stream.set_write_timeout(Some(IPC_WRITE_TIMEOUT));
 
-    let mut buffer = [0u8; 1024];
+    let mut buffer = [0u8; 128];
 
     let size = match stream.read(&mut buffer) {
-        Ok(0) => return,
+        Ok(size) if size > 0 => size,
 
-        Ok(size) => size,
+        Ok(_) => return,
 
         Err(error) => {
             tracing::debug!(
@@ -411,15 +426,14 @@ fn handle_client(
         }
 
         DaemonCommand::Status => {
-            handle_status(stream, config);
+            handle_status(stream, config, diagnostics);
+        }
+
+        DaemonCommand::StatusJson => {
+            handle_status_json(stream, config, diagnostics);
         }
 
         DaemonCommand::Shutdown => {
-            /*
-             * ACK FIRST.
-             *
-             * charger-ctl waits for this response.
-             */
             if let Err(error) = stream.write_all(b"OK: Shutting down") {
                 tracing::warn!(
                     error = %error,
@@ -427,9 +441,6 @@ fn handle_client(
                 );
             }
 
-            /*
-             * Tell monitor to exit gracefully.
-             */
             if let Err(error) = tx.send(&[2]) {
                 tracing::error!(
                     error = %error,
@@ -437,9 +448,6 @@ fn handle_client(
                 );
             }
 
-            /*
-             * Stop accepting new IPC clients.
-             */
             shutdown.store(true, Ordering::Release);
 
             tracing::info!("Graceful shutdown requested through IPC");
@@ -486,7 +494,11 @@ fn handle_reload(stream: &mut UnixStream, config: &Arc<RwLock<Config>>, tx: &Uni
     }
 }
 
-fn handle_status(stream: &mut UnixStream, config: &Arc<RwLock<Config>>) {
+fn handle_status(
+    stream: &mut UnixStream,
+    config: &Arc<RwLock<Config>>,
+    diagnostics: &Arc<DaemonDiagnostics>,
+) {
     let (pid, rss, cpu) = get_process_stats();
 
     let config_guard = match config.read() {
@@ -516,6 +528,35 @@ fn handle_status(stream: &mut UnixStream, config: &Arc<RwLock<Config>>) {
         .map(|value| format!("{value:?}"))
         .unwrap_or_else(|| "Unknown".to_string());
 
+    let netlink_available = diagnostics.netlink_available.load(Ordering::Relaxed);
+    let is_idle = diagnostics.is_idle.load(Ordering::Relaxed);
+    let interval_ms = diagnostics.poll_interval_ms.load(Ordering::Relaxed);
+    let backoff_ms = diagnostics.error_backoff_ms.load(Ordering::Relaxed);
+
+    let mode_str = if !config_guard.enabled {
+        "Disabled (Standby)"
+    } else if is_idle {
+        "Ultra-Low-Power Idle"
+    } else {
+        "Active Monitoring"
+    };
+
+    let netlink_str = if netlink_available {
+        "Enabled"
+    } else {
+        "Unavailable (Fallback poll)"
+    };
+
+    let interval_str = if is_idle && netlink_available {
+        "Infinite (-1 / kernel sleep)".to_string()
+    } else if interval_ms == u64::MAX {
+        "Infinite (-1)".to_string()
+    } else {
+        format!("{:.1}s", interval_ms as f32 / 1000.0)
+    };
+
+    let backoff_str = format!("{:.1}s", backoff_ms as f32 / 1000.0);
+
     let message = format!(
         "OK:\n\
          [ DAEMON STATUS ]\n\
@@ -524,6 +565,12 @@ fn handle_status(stream: &mut UnixStream, config: &Arc<RwLock<Config>>) {
          • Memory (RSS) : {:.2} MB\n\
          • CPU Average  : {:.3}%\n\
          • Hardware     : {:?}\n\
+         \n\
+         [ MONITOR DIAGNOSTICS ]\n\
+         • Mode         : {}\n\
+         • Netlink      : {}\n\
+         • Poll Interval: {}\n\
+         • Error Backoff: {}\n\
          \n\
          [ BATTERY ]\n\
          • Level        : {}\n\
@@ -545,6 +592,10 @@ fn handle_status(stream: &mut UnixStream, config: &Arc<RwLock<Config>>) {
         rss,
         cpu,
         hardware,
+        mode_str,
+        netlink_str,
+        interval_str,
+        backoff_str,
         battery,
         temperature,
         power_state,
@@ -560,4 +611,87 @@ fn handle_status(stream: &mut UnixStream, config: &Arc<RwLock<Config>>) {
     );
 
     let _ = stream.write_all(message.as_bytes());
+}
+
+#[derive(serde::Serialize)]
+pub struct DaemonStatusResponse {
+    pub pid: u32,
+    pub memory_rss_mb: f32,
+    pub cpu_percent: f32,
+    pub enabled: bool,
+    pub mode: String,
+    pub netlink_available: bool,
+    pub poll_interval_ms: u64,
+    pub error_backoff_ms: u64,
+    pub battery_level_percent: Option<u8>,
+    pub battery_temperature_c: Option<f32>,
+    pub power_state: String,
+    pub charge_limit: u8,
+    pub resume_limit: u8,
+    pub thermal_cutoff: bool,
+    pub max_temp_c: f32,
+}
+
+fn handle_status_json(
+    stream: &mut UnixStream,
+    config: &Arc<RwLock<Config>>,
+    diagnostics: &Arc<DaemonDiagnostics>,
+) {
+    let (pid, rss, cpu) = get_process_stats();
+
+    let config_guard = match config.read() {
+        Ok(config) => config,
+        Err(_) => {
+            write_error(stream, "Error: Failed to lock config");
+            return;
+        }
+    };
+
+    let battery = reader::read_capacity().ok();
+    let temperature = reader::read_temperature_dc().ok().map(|v| v as f32 / 10.0);
+    let power_state = reader::get_power_state()
+        .ok()
+        .map(|v| format!("{v:?}"))
+        .unwrap_or_else(|| "Unknown".to_string());
+
+    let netlink_available = diagnostics.netlink_available.load(Ordering::Relaxed);
+    let is_idle = diagnostics.is_idle.load(Ordering::Relaxed);
+    let interval_ms = diagnostics.poll_interval_ms.load(Ordering::Relaxed);
+    let backoff_ms = diagnostics.error_backoff_ms.load(Ordering::Relaxed);
+
+    let mode_str = if !config_guard.enabled {
+        "Disabled (Standby)"
+    } else if is_idle {
+        "Ultra-Low-Power Idle"
+    } else {
+        "Active Monitoring"
+    };
+
+    let status_data = DaemonStatusResponse {
+        pid,
+        memory_rss_mb: rss,
+        cpu_percent: cpu,
+        enabled: config_guard.enabled,
+        mode: mode_str.to_string(),
+        netlink_available,
+        poll_interval_ms: interval_ms,
+        error_backoff_ms: backoff_ms,
+        battery_level_percent: battery,
+        battery_temperature_c: temperature,
+        power_state,
+        charge_limit: config_guard.charge_limit,
+        resume_limit: config_guard.resume_limit,
+        thermal_cutoff: config_guard.thermal_cutoff,
+        max_temp_c: config_guard.max_temp_dc as f32 / 10.0,
+    };
+
+    match serde_json::to_string_pretty(&status_data) {
+        Ok(json) => {
+            let response = format!("OK:\n{json}");
+            let _ = stream.write_all(response.as_bytes());
+        }
+        Err(err) => {
+            write_error(stream, &format!("Error serializing json: {err}"));
+        }
+    }
 }
