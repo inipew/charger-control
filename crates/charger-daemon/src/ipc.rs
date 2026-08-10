@@ -240,7 +240,13 @@ pub fn start_ipc_server(
             continue;
         }
 
-        if poll_fd.revents & POLLIN == 0 {
+        let revents = poll_fd.revents;
+        if revents & (libc::POLLERR | libc::POLLHUP | libc::POLLNVAL) != 0 {
+            tracing::error!(revents, "IPC listener socket error; stopping IPC server thread");
+            break;
+        }
+
+        if revents & POLLIN == 0 {
             continue;
         }
 
