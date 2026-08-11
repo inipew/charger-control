@@ -50,6 +50,9 @@ where
                 return Ok(value);
             }
         }
+        // Cached node read or parse failed — invalidate stale cache index
+        // so candidate scanning can resolve a new working sysfs node.
+        cached_idx.store(usize::MAX, Ordering::Relaxed);
     }
 
     for (i, path) in paths.iter().enumerate() {

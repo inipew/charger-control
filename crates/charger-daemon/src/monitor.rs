@@ -619,46 +619,38 @@ fn drain_netlink(fd: RawFd) -> NetlinkEvent {
 }
 
 fn is_fast_power_supply_event(name: &[u8], data: &[u8]) -> bool {
-    data.split(|byte| *byte == 0).any(|part| {
-        part.starts_with(b"POWER_SUPPLY_ONLINE=")
-            || part.starts_with(b"POWER_SUPPLY_PRESENT=")
-            || part.starts_with(b"POWER_SUPPLY_STATUS=")
-            // Charging control node changes must be fast-pathed:
-            // these are exactly what the daemon writes and reads back.
-            || part.starts_with(b"POWER_SUPPLY_CHARGING_ENABLED=")
-            || part.starts_with(b"POWER_SUPPLY_INPUT_SUSPEND=")
-            || match name {
-                b"battery" => {
-                    part.starts_with(b"POWER_SUPPLY_CAPACITY=")
-                        || part.starts_with(b"POWER_SUPPLY_TEMP=")
-                }
+    match name {
+        // Physical AC charger connection transition.
+        b"ac" => data
+            .split(|byte| *byte == 0)
+            .any(|part| part.starts_with(b"POWER_SUPPLY_ONLINE=")),
 
-                b"usb" | b"charger" | b"typec" => part.starts_with(b"POWER_SUPPLY_TYPEC_MODE="),
+        // USB/Type-C attach/detach/role transition.
+        b"usb" | b"charger" | b"typec" => data.split(|byte| *byte == 0).any(|part| {
+            part.starts_with(b"POWER_SUPPLY_TYPEC_MODE=")
+                || part.starts_with(b"POWER_SUPPLY_ONLINE=")
+                || part.starts_with(b"POWER_SUPPLY_PRESENT=")
+        }),
 
-                _ => false,
-            }
-    })
+        // Battery and BMS telemetry/status must NOT wake the monitor via Fast events.
+        b"battery" | b"bms" => false,
+
+        _ => false,
+    }
 }
 
 fn is_relevant_power_supply(name: &[u8]) -> bool {
-    matches!(
-        name,
-        b"usb"
-            | b"battery"
-            | b"main"
-            | b"ac"
-            | b"wireless"
-            | b"wls"
-            | b"bms"
-            | b"mtk-charger"
-            | b"mt_charger"
-            | b"charger"
-            | b"sec-charger"
-            | b"pd-charger"
-            | b"typec"
-            | b"tcpc"
-            | b"dc"
-    )
+    let s = std::str::from_utf8(name).unwrap_or("");
+    s.contains("usb")
+        || s.contains("batt")
+        || s.contains("main")
+        || s.contains("ac")
+        || s.contains("wls")
+        || s.contains("bms")
+        || s.contains("charger")
+        || s.contains("typec")
+        || s.contains("tcpc")
+        || s.contains("dc")
 }
 
 fn timeout_to_poll_ms(timeout: Option<Duration>) -> i32 {
@@ -996,6 +988,7 @@ fn restore_normal_charging(state: &mut MonitorState) -> bool {
                     state.hw.mode = control::ActualHardwareMode::Unknown;
 
                     state.mark_hardware_changed();
+                    state.mark_force_evaluation();
 
                     true
                 }
@@ -1354,6 +1347,13 @@ fn handle_netlink(fd: RawFd, state: &mut MonitorState) {
         }
 
         NetlinkEvent::Coalesced => {
+            // When disconnected, telemetry / coalesced events should be ignored
+            // so the daemon remains sleeping in poll(-1).
+            if state.power_state.is_disconnected() {
+                state.sched.pending_netlink = false;
+                return;
+            }
+
             state.sched.pending_netlink = true;
             state.mark_hardware_changed();
 
@@ -1436,20 +1436,20 @@ fn apply_thermal_failsafe(state: &mut MonitorState, cfg: &Config) {
         return;
     }
 
-    match control::set_charging(false) {
+    match control::emergency_disable_charging() {
         Ok(()) => {
             let actual = control::get_actual_charging_state();
 
             if actual == control::ActualHardwareMode::ChargingDisabled {
                 state.hw.mode = actual;
 
-                tracing::warn!("thermal fail-safe charging disable verified");
+                tracing::warn!("thermal fail-safe emergency charging disable verified");
             } else {
-                state.hw.mode = control::ActualHardwareMode::Unknown;
+                state.hw.mode = actual;
 
-                tracing::error!(
+                tracing::warn!(
                     ?actual,
-                    "thermal fail-safe charging disable could not be verified"
+                    "thermal fail-safe emergency disable applied; hardware mode updated"
                 );
             }
         }
@@ -1457,12 +1457,20 @@ fn apply_thermal_failsafe(state: &mut MonitorState, cfg: &Config) {
         Err(error) => {
             tracing::error!(
                 error = %error,
-                "failed fail-safe charging disable"
+                "failed fail-safe emergency charging disable"
             );
 
             state.hw.mode = control::ActualHardwareMode::Unknown;
         }
     }
+}
+
+fn should_trigger_failsafe(
+    hw_mode: control::ActualHardwareMode,
+    power_state: reader::PowerState,
+    thermal_cutoff: bool,
+) -> bool {
+    thermal_cutoff && !power_state.is_disconnected() && !hw_mode.is_charging_disabled()
 }
 
 fn evaluate_once(cfg: &Config, state: &mut MonitorState, scheduler: &mut AdaptiveScheduler) {
@@ -1479,14 +1487,21 @@ fn evaluate_once(cfg: &Config, state: &mut MonitorState, scheduler: &mut Adaptiv
              * We cannot safely evaluate normal policy without a
              * valid snapshot.
              *
-             * Thermal protection fails closed by attempting to disable charging.
+             * Thermal protection fails closed by attempting to disable charging
+             * if charging is active or hardware state is unverified while plugged in.
              */
-            if state.hw.mode.is_charging_enabled() {
-                tracing::warn!("snapshot unreadable while charging — attempting fail-safe disable");
+            if should_trigger_failsafe(state.hw.mode, state.power_state, cfg.thermal_cutoff) {
+                tracing::warn!(
+                    hw_mode = ?state.hw.mode,
+                    power_state = ?state.power_state,
+                    "snapshot unreadable while potential charging active — attempting fail-safe thermal disable"
+                );
 
                 apply_thermal_failsafe(state, cfg);
             } else {
-                state.hw.mode = control::ActualHardwareMode::Unknown;
+                if !state.hw.mode.is_charging_disabled() {
+                    state.hw.mode = control::ActualHardwareMode::Unknown;
+                }
             }
 
             /*
@@ -1772,3 +1787,54 @@ pub fn run_monitor_loop(
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_should_trigger_failsafe() {
+        // Charging enabled + plugged in + thermal cutoff on -> failsafe triggers
+        assert!(should_trigger_failsafe(
+            control::ActualHardwareMode::ChargingEnabled,
+            reader::PowerState::Charging,
+            true
+        ));
+
+        // Hardware mode Unknown + plugged in + thermal cutoff on -> failsafe triggers for safety
+        assert!(should_trigger_failsafe(
+            control::ActualHardwareMode::Unknown,
+            reader::PowerState::Charging,
+            true
+        ));
+
+        // Hardware mode Inconsistent + plugged in + thermal cutoff on -> failsafe triggers
+        assert!(should_trigger_failsafe(
+            control::ActualHardwareMode::Inconsistent,
+            reader::PowerState::Connected,
+            true
+        ));
+
+        // Hardware verified ChargingDisabled -> no need to trigger failsafe
+        assert!(!should_trigger_failsafe(
+            control::ActualHardwareMode::ChargingDisabled,
+            reader::PowerState::Charging,
+            true
+        ));
+
+        // Disconnected -> no failsafe needed
+        assert!(!should_trigger_failsafe(
+            control::ActualHardwareMode::ChargingEnabled,
+            reader::PowerState::Disconnected,
+            true
+        ));
+
+        // Thermal cutoff disabled -> failsafe does not trigger
+        assert!(!should_trigger_failsafe(
+            control::ActualHardwareMode::ChargingEnabled,
+            reader::PowerState::Charging,
+            false
+        ));
+    }
+}
+

@@ -286,6 +286,39 @@ pub fn set_charging(enable: bool) -> Result<(), ChargerError> {
     }
 }
 
+/// Emergency disable charging for thermal or safety failsafe.
+///
+/// Unlike `disable_charging_nodes()`, which requires all candidate control nodes
+/// to be successfully updated and verified, `emergency_disable_charging()` attempts
+/// to write to input_suspend and charging_enabled independently.
+///
+/// It returns `Ok(())` if AT LEAST ONE disable operation succeeded, ensuring that
+/// a partial write failure does not cause safety failsafe logic to treat an effective
+/// hardware suspend as a complete failure.
+pub fn emergency_disable_charging() -> Result<(), ChargerError> {
+    let mut any_succeeded = false;
+
+    if let Some(suspend) = suspend_node() {
+        if write_optional_node(suspend, "1").unwrap_or(false) {
+            tracing::info!(path = suspend, "emergency input suspend written");
+            any_succeeded = true;
+        }
+    }
+
+    if let Some(charging) = charging_node() {
+        if write_optional_node(charging, "0").unwrap_or(false) {
+            tracing::info!(path = charging, "emergency charging disable written");
+            any_succeeded = true;
+        }
+    }
+
+    if any_succeeded {
+        Ok(())
+    } else {
+        Err(ChargerError::NoChargingNodeFound)
+    }
+}
+
 /// Enter logical bypass.
 ///
 /// This platform does not expose a separate physical bypass node.
