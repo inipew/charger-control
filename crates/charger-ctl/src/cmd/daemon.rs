@@ -11,6 +11,7 @@ const CONNECT_TIMEOUT: Duration = Duration::from_millis(300);
 
 const COMMAND_TIMEOUT: Duration = Duration::from_secs(2);
 
+#[allow(dead_code)]
 const START_TIMEOUT: Duration = Duration::from_secs(5);
 
 const STOP_TIMEOUT: Duration = Duration::from_secs(5);
@@ -160,6 +161,7 @@ fn start_daemon() {
         }
     }
 
+    #[cfg(unix)]
     fn find_daemon_binary() -> Option<std::path::PathBuf> {
         if let Ok(exe_path) = std::env::current_exe() {
             let same_dir = exe_path.with_file_name("charger-daemon");

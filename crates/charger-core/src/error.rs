@@ -20,6 +20,12 @@ pub enum ChargerError {
     #[error("No known charging control node found on this device")]
     NoChargingNodeFound,
 
+    #[error("Hardware actuator error: {0}")]
+    HardwareError(&'static str),
+
+    #[error("Hardware reconcile operation timed out")]
+    HardwareTimeout,
+
     #[error("Partial write failure: {succeeded} succeeded, {failed} failed")]
     PartialWriteFailure { succeeded: usize, failed: usize },
 

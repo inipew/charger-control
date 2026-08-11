@@ -64,9 +64,28 @@ impl Default for Config {
 }
 
 impl Config {
+    /// Validasi dan sanitasi nilai konfigurasi agar aman dari nilai tidak valid.
+    pub fn validate(&mut self) {
+        // Clamp charge_limit antara 50% hingga 100%
+        self.charge_limit = self.charge_limit.clamp(50, 100);
+
+        // Resume limit harus lebih kecil dari charge_limit jika diaktifkan (> 0)
+        if self.resume_limit > 0 && self.resume_limit >= self.charge_limit {
+            self.resume_limit = self.charge_limit.saturating_sub(2);
+        }
+
+        // Maximum temperature dc (30.0°C hingga 60.0°C -> 300 hingga 600)
+        self.max_temp_dc = self.max_temp_dc.clamp(300, 600);
+
+        // Polling interval antara 1 hingga 300 detik
+        self.poll_interval_secs = self.poll_interval_secs.clamp(1, 300);
+    }
+
     pub fn load(path: &PathBuf) -> Result<Self, crate::error::ChargerError> {
         if !path.exists() {
-            return Ok(Self::default());
+            let mut cfg = Self::default();
+            cfg.validate();
+            return Ok(cfg);
         }
 
         let raw =
@@ -75,7 +94,10 @@ impl Config {
                 source: e,
             })?;
 
-        toml::from_str(&raw).map_err(|e| crate::error::ChargerError::ConfigParse(e.to_string()))
+        let mut config: Self = toml::from_str(&raw)
+            .map_err(|e| crate::error::ChargerError::ConfigParse(e.to_string()))?;
+        config.validate();
+        Ok(config)
     }
 
     pub fn save(&self, path: &PathBuf) -> Result<(), crate::error::ChargerError> {
@@ -86,5 +108,37 @@ impl Config {
             path: path.clone(),
             source: e,
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_config_validation_clamping() {
+        let mut cfg = Config {
+            enabled: true,
+            charge_limit: 150, // invalid > 100
+            resume_limit: 98, // invalid >= charge_limit (which will be clamped to 100, so 98 is valid for 100, but if charge_limit=80, 98 > 80)
+            thermal_cutoff: true,
+            max_temp_dc: 800,      // invalid > 600
+            poll_interval_secs: 0, // invalid < 1
+            log_path: PathBuf::from("/tmp/test.log"),
+        };
+
+        cfg.validate();
+        assert_eq!(cfg.charge_limit, 100);
+        assert_eq!(cfg.max_temp_dc, 600);
+        assert_eq!(cfg.poll_interval_secs, 1);
+
+        let mut invalid_resume = Config {
+            charge_limit: 80,
+            resume_limit: 85, // resume_limit > charge_limit
+            ..Config::default()
+        };
+        invalid_resume.validate();
+        assert_eq!(invalid_resume.charge_limit, 80);
+        assert_eq!(invalid_resume.resume_limit, 78);
     }
 }

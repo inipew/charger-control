@@ -1,6 +1,7 @@
+#[cfg(unix)]
+use std::os::unix::net::{UnixDatagram, UnixListener, UnixStream};
 use std::{
     io::{Read, Write},
-    os::unix::net::{UnixDatagram, UnixListener, UnixStream},
     path::Path,
     sync::{
         atomic::{AtomicBool, AtomicU64, Ordering},
@@ -11,6 +12,7 @@ use std::{
 
 use charger_core::battery::{control, reader};
 use charger_core::config::schema::Config;
+#[cfg(unix)]
 use libc::{poll, pollfd, POLLIN};
 
 pub const SOCKET_PATH: &str = charger_core::config::schema::DEFAULT_SOCKET_PATH;
@@ -19,7 +21,7 @@ const IPC_READ_TIMEOUT: Duration = Duration::from_millis(750);
 
 const IPC_WRITE_TIMEOUT: Duration = Duration::from_secs(2);
 
-const IPC_POLL_TIMEOUT_MS: i32 = 250;
+const IPC_POLL_TIMEOUT_MS: i32 = -1;
 
 #[derive(Debug)]
 pub struct DaemonDiagnostics {
@@ -50,6 +52,8 @@ impl Default for DaemonDiagnostics {
 pub enum DaemonCommand {
     BypassOn,
     BypassOff,
+    DisableOn,
+    DisableOff,
     Reload,
     Status,
     StatusJson,
@@ -63,6 +67,8 @@ impl DaemonCommand {
         match command {
             "bypass on" => Some(Self::BypassOn),
             "bypass off" => Some(Self::BypassOff),
+            "disable on" | "disable" => Some(Self::DisableOn),
+            "disable off" | "enable" => Some(Self::DisableOff),
             "reload" => Some(Self::Reload),
             "status" => Some(Self::Status),
             "status json" | "status_json" => Some(Self::StatusJson),
@@ -100,28 +106,36 @@ fn read_cpu_percent() -> f32 {
         Err(_) => return 0.0,
     };
 
-    let parts: Vec<&str> = stat.split_whitespace().collect();
+    let after_comm = match stat.rfind(')') {
+        Some(idx) => &stat[idx + 1..],
+        None => return 0.0,
+    };
 
-    if parts.len() < 22 {
+    let parts: Vec<&str> = after_comm.split_whitespace().collect();
+
+    if parts.len() < 20 {
         return 0.0;
     }
 
-    let utime = match parts[13].parse::<f64>() {
+    let utime = match parts[11].parse::<f64>() {
         Ok(value) => value,
         Err(_) => return 0.0,
     };
 
-    let stime = match parts[14].parse::<f64>() {
+    let stime = match parts[12].parse::<f64>() {
         Ok(value) => value,
         Err(_) => return 0.0,
     };
 
-    let starttime = match parts[21].parse::<f64>() {
+    let starttime = match parts[19].parse::<f64>() {
         Ok(value) => value,
         Err(_) => return 0.0,
     };
 
+    #[cfg(unix)]
     let clk_tck = unsafe { libc::sysconf(libc::_SC_CLK_TCK) };
+    #[cfg(not(unix))]
+    let clk_tck = 100;
 
     if clk_tck <= 0 {
         return 0.0;
@@ -164,6 +178,7 @@ fn read_cpu_percent() -> f32 {
 /// 1. the listener has stopped;
 /// 2. the listener has been dropped;
 /// 3. the socket has been cleaned up.
+#[cfg(unix)]
 pub fn start_ipc_server(
     config: Arc<RwLock<Config>>,
     tx: UnixDatagram,
@@ -277,6 +292,14 @@ pub fn start_ipc_server(
     tracing::info!("IPC server stopped");
 }
 
+#[cfg(not(unix))]
+pub fn start_ipc_server(
+    _config: Arc<RwLock<Config>>,
+    _shutdown: Arc<AtomicBool>,
+    _diagnostics: Arc<DaemonDiagnostics>,
+) {
+}
+
 fn prepare_socket_path(path: &Path) -> bool {
     if path.exists() {
         match std::fs::remove_file(path) {
@@ -314,7 +337,7 @@ fn set_socket_permissions(path: &Path) {
     {
         use std::os::unix::fs::PermissionsExt;
 
-        let permissions = std::fs::Permissions::from_mode(0o666);
+        let permissions = std::fs::Permissions::from_mode(0o660);
 
         if let Err(error) = std::fs::set_permissions(path, permissions) {
             tracing::warn!(
@@ -343,6 +366,7 @@ fn cleanup_socket(path: &Path) {
     }
 }
 
+#[cfg(unix)]
 fn handle_client(
     stream: &mut UnixStream,
     config: &Arc<RwLock<Config>>,
@@ -387,39 +411,25 @@ fn handle_client(
     );
 
     match command {
-        DaemonCommand::BypassOn => match control::enter_bypass_mode() {
-            Ok(()) => {
-                let _ = tx.send(&[3]);
+        DaemonCommand::BypassOn => {
+            let _ = tx.send(&[3]);
+            let _ = stream.write_all(b"OK: Bypass ON");
+        }
 
-                let _ = stream.write_all(b"OK: Bypass ON");
-            }
+        DaemonCommand::BypassOff => {
+            let _ = tx.send(&[4]);
+            let _ = stream.write_all(b"OK: Bypass OFF");
+        }
 
-            Err(error) => {
-                tracing::error!(
-                    error = %error,
-                    "Failed enabling bypass"
-                );
+        DaemonCommand::DisableOn => {
+            let _ = tx.send(&[5]);
+            let _ = stream.write_all(b"OK: Daemon Disabled");
+        }
 
-                write_error(stream, &format!("Error: {error}"));
-            }
-        },
-
-        DaemonCommand::BypassOff => match control::exit_bypass_mode() {
-            Ok(()) => {
-                let _ = tx.send(&[4]);
-
-                let _ = stream.write_all(b"OK: Bypass OFF");
-            }
-
-            Err(error) => {
-                tracing::error!(
-                    error = %error,
-                    "Failed disabling bypass"
-                );
-
-                write_error(stream, &format!("Error: {error}"));
-            }
-        },
+        DaemonCommand::DisableOff => {
+            let _ = tx.send(&[6]);
+            let _ = stream.write_all(b"OK: Daemon Enabled");
+        }
 
         DaemonCommand::Reload => {
             handle_reload(stream, config, tx);
@@ -455,10 +465,12 @@ fn handle_client(
     }
 }
 
+#[cfg(unix)]
 fn write_error(stream: &mut UnixStream, message: &str) {
     let _ = stream.write_all(message.as_bytes());
 }
 
+#[cfg(unix)]
 fn handle_reload(stream: &mut UnixStream, config: &Arc<RwLock<Config>>, tx: &UnixDatagram) {
     let config_path = std::path::PathBuf::from(charger_core::config::schema::DEFAULT_CONFIG_PATH);
 
@@ -494,6 +506,7 @@ fn handle_reload(stream: &mut UnixStream, config: &Arc<RwLock<Config>>, tx: &Uni
     }
 }
 
+#[cfg(unix)]
 fn handle_status(
     stream: &mut UnixStream,
     config: &Arc<RwLock<Config>>,
@@ -632,6 +645,7 @@ pub struct DaemonStatusResponse {
     pub max_temp_c: f32,
 }
 
+#[cfg(unix)]
 fn handle_status_json(
     stream: &mut UnixStream,
     config: &Arc<RwLock<Config>>,

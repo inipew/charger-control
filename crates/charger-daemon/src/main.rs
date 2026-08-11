@@ -2,8 +2,9 @@ mod ipc;
 mod logging;
 mod monitor;
 
+#[cfg(unix)]
+use std::os::unix::io::AsRawFd;
 use std::{
-    os::unix::io::AsRawFd,
     path::Path,
     sync::{
         atomic::{AtomicBool, Ordering},
@@ -13,6 +14,7 @@ use std::{
 
 use charger_core::config::schema::{Config, DEFAULT_CONFIG_PATH};
 
+#[cfg(unix)]
 fn setup_environment() {
     unsafe {
         libc::umask(0o022);
@@ -23,6 +25,7 @@ fn setup_environment() {
     }
 }
 
+#[cfg(unix)]
 fn acquire_lock() -> Result<std::fs::File, String> {
     let lock_path = charger_core::config::schema::DEFAULT_LOCK_PATH;
     let pid_path = charger_core::config::schema::DEFAULT_PID_PATH;
@@ -55,19 +58,15 @@ fn acquire_lock() -> Result<std::fs::File, String> {
     Ok(file)
 }
 
+#[cfg(unix)]
 fn cleanup_pid_file() {
     let _ = std::fs::remove_file(charger_core::config::schema::DEFAULT_PID_PATH);
 }
 
+#[cfg(unix)]
 fn main() {
     setup_environment();
 
-    /*
-     * Keep the lock alive for the entire process lifetime.
-     *
-     * The lock file itself is NOT authoritative.
-     * Kernel flock is authoritative.
-     */
     let _lock_file = match acquire_lock() {
         Ok(file) => file,
 
@@ -159,11 +158,6 @@ fn main() {
         }
     };
 
-    /*
-     * Signal handling.
-     *
-     * SIGTERM/SIGINT trigger graceful shutdown via internal IPC.
-     */
     if let Ok(mut signals) = signal_hook::iterator::Signals::new([
         signal_hook::consts::signal::SIGTERM,
         signal_hook::consts::signal::SIGINT,
@@ -182,9 +176,6 @@ fn main() {
             });
     }
 
-    /*
-     * Start IPC server.
-     */
     let config_for_ipc = Arc::clone(&shared_config);
 
     let shutdown_for_ipc = Arc::clone(&ipc_shutdown);
@@ -205,16 +196,10 @@ fn main() {
         }
     };
 
-    /*
-     * Monitor owns the normal daemon lifecycle.
-     */
     monitor::run_monitor_loop(Arc::clone(&shared_config), rx, shared_diagnostics);
 
     tracing::info!("Monitor requested daemon shutdown");
 
-    /*
-     * Restore safe charging state.
-     */
     if let Err(error) = charger_core::battery::control::set_charging(true) {
         tracing::error!(
             error = %error,
@@ -224,27 +209,20 @@ fn main() {
         tracing::info!("Charging restored successfully");
     }
 
-    /*
-     * Stop IPC server.
-     */
     ipc_shutdown.store(true, Ordering::Release);
+    let _ = std::os::unix::net::UnixStream::connect(ipc::SOCKET_PATH);
 
-    /*
-     * Wait until IPC has:
-     *
-     * - stopped accepting clients;
-     * - dropped listener;
-     * - removed socket.
-     */
     if let Err(error) = ipc_thread.join() {
         tracing::error!(?error, "IPC thread terminated unexpectedly");
     }
 
-    /*
-     * Defensive cleanup only.
-     */
     cleanup_pid_file();
     let _ = std::fs::remove_file(ipc::SOCKET_PATH);
 
     tracing::info!("ChargerControl daemon exited gracefully");
+}
+
+#[cfg(not(unix))]
+fn main() {
+    eprintln!("charger-daemon is only supported on Linux/Android.");
 }

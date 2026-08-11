@@ -1,7 +1,9 @@
 use charger_core::error::ChargerError;
 
+#[cfg(unix)]
 struct NetlinkFd(libc::c_int);
 
+#[cfg(unix)]
 impl Drop for NetlinkFd {
     fn drop(&mut self) {
         if self.0 >= 0 {
@@ -12,6 +14,7 @@ impl Drop for NetlinkFd {
     }
 }
 
+#[cfg(unix)]
 pub fn run_uevent_dumper() -> Result<(), ChargerError> {
     println!("=== UEVENT DUMPER ===");
     println!("Listening for netlink broadcast (uevent) messages...");
@@ -57,7 +60,6 @@ pub fn run_uevent_dumper() -> Result<(), ChargerError> {
             let data = &buf[..res as usize];
             let s = String::from_utf8_lossy(data);
 
-            // Only print if it looks like a power supply or battery event to avoid huge noise
             if s.contains("power_supply") || s.contains("battery") {
                 let parts: Vec<&str> = s.split('\0').collect();
                 println!("--- UEVENT KERNEL BROADCAST ---");
@@ -70,4 +72,10 @@ pub fn run_uevent_dumper() -> Result<(), ChargerError> {
             }
         }
     }
+}
+
+#[cfg(not(unix))]
+pub fn run_uevent_dumper() -> Result<(), ChargerError> {
+    println!("Netlink uevent dumper is only supported on Linux/Android.");
+    Ok(())
 }
