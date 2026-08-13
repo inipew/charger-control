@@ -4,13 +4,12 @@ use std::{
     io::{Read, Write},
     path::Path,
     sync::{
-        atomic::{AtomicBool, AtomicU64, Ordering},
+        atomic::{AtomicBool, AtomicI32, AtomicU64, AtomicU8, Ordering},
         Arc, RwLock,
     },
     time::Duration,
 };
 
-use charger_core::battery::{control, reader};
 use charger_core::config::schema::Config;
 #[cfg(unix)]
 use libc::{poll, pollfd, POLLIN};
@@ -29,6 +28,10 @@ pub struct DaemonDiagnostics {
     pub is_idle: AtomicBool,
     pub poll_interval_ms: AtomicU64,
     pub error_backoff_ms: AtomicU64,
+    pub battery_level_percent: AtomicU8,
+    pub battery_temperature_dc: AtomicI32,
+    pub power_state: RwLock<String>,
+    pub hardware_state: RwLock<String>,
 }
 
 impl DaemonDiagnostics {
@@ -38,6 +41,10 @@ impl DaemonDiagnostics {
             is_idle: AtomicBool::new(false),
             poll_interval_ms: AtomicU64::new(0),
             error_backoff_ms: AtomicU64::new(0),
+            battery_level_percent: AtomicU8::new(255),
+            battery_temperature_dc: AtomicI32::new(i32::MIN),
+            power_state: RwLock::new("Unknown".to_string()),
+            hardware_state: RwLock::new("Unknown".to_string()),
         }
     }
 }
@@ -524,22 +531,33 @@ fn handle_status(
         }
     };
 
-    let hardware = control::get_actual_charging_state();
+    let hw_guard = diagnostics
+        .hardware_state
+        .read()
+        .unwrap_or_else(|p| p.into_inner());
+    let hardware = hw_guard.clone();
+    drop(hw_guard);
 
-    let battery = reader::read_capacity()
-        .ok()
-        .map(|value| format!("{value}%"))
-        .unwrap_or_else(|| "N/A".to_string());
+    let level_val = diagnostics.battery_level_percent.load(Ordering::Relaxed);
+    let battery = if level_val == 255 {
+        "N/A".to_string()
+    } else {
+        format!("{level_val}%")
+    };
 
-    let temperature = reader::read_temperature_dc()
-        .ok()
-        .map(|value| format!("{:.1} C", value as f32 / 10.0))
-        .unwrap_or_else(|| "N/A".to_string());
+    let temp_val = diagnostics.battery_temperature_dc.load(Ordering::Relaxed);
+    let temperature = if temp_val == i32::MIN {
+        "N/A".to_string()
+    } else {
+        format!("{:.1} C", temp_val as f32 / 10.0)
+    };
 
-    let power_state = reader::get_power_state()
-        .ok()
-        .map(|value| format!("{value:?}"))
-        .unwrap_or_else(|| "Unknown".to_string());
+    let ps_guard = diagnostics
+        .power_state
+        .read()
+        .unwrap_or_else(|p| p.into_inner());
+    let power_state = ps_guard.clone();
+    drop(ps_guard);
 
     let netlink_available = diagnostics.netlink_available.load(Ordering::Relaxed);
     let is_idle = diagnostics.is_idle.load(Ordering::Relaxed);
@@ -661,12 +679,26 @@ fn handle_status_json(
         }
     };
 
-    let battery = reader::read_capacity().ok();
-    let temperature = reader::read_temperature_dc().ok().map(|v| v as f32 / 10.0);
-    let power_state = reader::get_power_state()
-        .ok()
-        .map(|v| format!("{v:?}"))
-        .unwrap_or_else(|| "Unknown".to_string());
+    let level_val = diagnostics.battery_level_percent.load(Ordering::Relaxed);
+    let battery = if level_val == 255 {
+        None
+    } else {
+        Some(level_val)
+    };
+
+    let temp_val = diagnostics.battery_temperature_dc.load(Ordering::Relaxed);
+    let temperature = if temp_val == i32::MIN {
+        None
+    } else {
+        Some(temp_val as f32 / 10.0)
+    };
+
+    let ps_guard = diagnostics
+        .power_state
+        .read()
+        .unwrap_or_else(|p| p.into_inner());
+    let power_state = ps_guard.clone();
+    drop(ps_guard);
 
     let netlink_available = diagnostics.netlink_available.load(Ordering::Relaxed);
     let is_idle = diagnostics.is_idle.load(Ordering::Relaxed);

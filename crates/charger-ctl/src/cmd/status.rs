@@ -4,12 +4,84 @@ use charger_core::error::ChargerError;
 use crate::display;
 
 pub fn run(json: bool) -> Result<(), ChargerError> {
-    if json {
-        if let Some(json_str) = try_get_ipc_status_json() {
+    if let Some(json_str) = try_get_ipc_status_json() {
+        if json {
             println!("{json_str}");
             return Ok(());
         }
 
+        if let Ok(data) = serde_json::from_str::<serde_json::Value>(&json_str) {
+            display::title("Daemon & Battery Status");
+            display::key_val(
+                "Daemon Mode",
+                data["mode"].as_str().unwrap_or("Unknown").to_string(),
+            );
+            display::key_val(
+                "Daemon CPU",
+                format!("{:.2}%", data["cpu_percent"].as_f64().unwrap_or(0.0)),
+            );
+            display::key_val(
+                "Daemon Memory",
+                format!("{:.2} MB", data["memory_rss_mb"].as_f64().unwrap_or(0.0)),
+            );
+            display::key_val(
+                "Poll Interval",
+                format!("{} ms", data["poll_interval_ms"].as_u64().unwrap_or(0)),
+            );
+
+            if let Some(level) = data["battery_level_percent"].as_u64() {
+                display::key_val("Level", format!("{level}%"));
+            }
+            display::key_val(
+                "Power State",
+                data["power_state"]
+                    .as_str()
+                    .unwrap_or("Unknown")
+                    .to_string(),
+            );
+            if let Some(temp) = data["battery_temperature_c"].as_f64() {
+                display::key_val("Temperature", format!("{temp:.1} °C"));
+            }
+
+            display::key_val(
+                "Charge Limit",
+                format!("{}%", data["charge_limit"].as_u64().unwrap_or(0)),
+            );
+            display::key_val(
+                "Resume Limit",
+                format!("{}%", data["resume_limit"].as_u64().unwrap_or(0)),
+            );
+            display::key_val(
+                "Thermal Cutoff",
+                if data["thermal_cutoff"].as_bool().unwrap_or(false) {
+                    "ON".to_string()
+                } else {
+                    "OFF".to_string()
+                },
+            );
+            display::key_val(
+                "Max Temp",
+                format!("{:.1} °C", data["max_temp_c"].as_f64().unwrap_or(0.0)),
+            );
+
+            if let Ok(health_status) = health::read_health() {
+                display::key_val("Health", health_status);
+            }
+            if let Ok(technology) = reader::read_technology() {
+                display::key_val("Technology", technology);
+            }
+            if let Ok(capacity) = reader::read_charge_full_design() {
+                display::key_val("Design Capacity", format!("{} mAh", capacity));
+            }
+            if let Ok(cycles) = reader::read_cycle_count() {
+                display::key_val("Cycle Count", format!("{}", cycles));
+            }
+
+            return Ok(());
+        }
+    }
+
+    if json {
         let input_current = reader::read_input_current_ua().ok();
         let voltage_uv = reader::read_voltage_uv().ok();
         let wattage = match (input_current, voltage_uv) {
@@ -37,10 +109,9 @@ pub fn run(json: bool) -> Result<(), ChargerError> {
         return Ok(());
     }
 
-    display::title("Battery Status");
+    display::title("Battery Status (Fallback)");
 
     let level = reader::read_capacity().unwrap_or(0);
-
     display::key_val("Level", format!("{}%", level));
 
     if let Ok(power_state) = reader::get_power_state() {
@@ -55,7 +126,6 @@ pub fn run(json: bool) -> Result<(), ChargerError> {
     }
 
     let input_current = reader::read_input_current_ua().ok();
-
     if let Some(current_ua) = input_current {
         display::key_val(
             "Input Current",
@@ -64,14 +134,12 @@ pub fn run(json: bool) -> Result<(), ChargerError> {
     }
 
     let voltage_uv = reader::read_voltage_uv().ok();
-
     if let Some(voltage) = voltage_uv {
         display::key_val("Voltage", format!("{} mV", voltage / 1000));
     }
 
     if let (Some(current_ua), Some(voltage_uv)) = (input_current, voltage_uv) {
         let watts = reader::calc_wattage_from_ua_w(voltage_uv, current_ua);
-
         display::key_val("Wattage", format!("{:.2} W", watts.abs()));
     }
 

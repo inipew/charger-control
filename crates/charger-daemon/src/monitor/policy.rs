@@ -1,4 +1,4 @@
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use charger_core::config::schema::Config;
 
@@ -7,9 +7,11 @@ use super::{
     reality::{ObservedState, Sample},
 };
 
-pub const THERMAL_HYSTERESIS_DC: i32 = 20; // 0.2°C hysteresis standar
+pub const THERMAL_HYSTERESIS_DC: i32 = 20; // 2.0°C hysteresis standar
 pub const THERMAL_EMERGENCY_OFFSET_DC: i32 = 30; // 3.0°C di atas max_temp_dc
 pub const THERMAL_EMERGENCY_RELEASE_OFFSET_DC: i32 = 40; // 4.0°C di bawah max_temp_dc untuk release latch
+
+pub const CHARGE_LIMIT_SUSPEND_DELAY: Duration = Duration::from_secs(5 * 60);
 
 pub const MASK_THERMAL_EMERGENCY: u16 = 1 << 0;
 pub const MASK_SENSOR_STALE: u16 = 1 << 1;
@@ -81,17 +83,41 @@ impl PolicyResult {
     }
 }
 
+/// Temporal state terpisah dari PolicyResult (pure bitmask).
+/// Menyimpan informasi waktu yang diperlukan policy tanpa mencemari PolicyResult.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct PolicyRuntime {
+    /// Start of the current continuous interval where SOC >= charge_limit.
+    pub charge_limit_grace_started_at: Option<Instant>,
+}
+
+impl PolicyRuntime {
+    pub fn clear(&mut self) {
+        self.charge_limit_grace_started_at = None;
+    }
+
+    /// Deadline kapan charge-limit grace period berakhir.
+    /// Digunakan sebagai earliest wake-up target; actual evaluation
+    /// may occur slightly after the deadline due to polling granularity.
+    pub fn charge_limit_deadline(&self) -> Option<Instant> {
+        self.charge_limit_grace_started_at
+            .map(|t| t + CHARGE_LIMIT_SUSPEND_DELAY)
+    }
+}
+
 /// Menghitung evaluasi policy murni berdasarkan data pengamatan saat ini dan konfigurasi.
 pub fn evaluate_policy(
     observed: &ObservedState,
     config: &Config,
     current_result: &PolicyResult,
+    runtime: &mut PolicyRuntime,
     now: Instant,
 ) -> PolicyResult {
     let mut next_result = *current_result;
 
     // 1. Jika charger dicabut, bersihkan semua blokir policy
     if !observed.connection.is_connected() {
+        runtime.clear();
         return PolicyResult::clear();
     }
 
@@ -102,6 +128,10 @@ pub fn evaluate_policy(
             s
         }
         _ => {
+            // Sensor stale: timer charge-limit harus reset karena
+            // daemon kehilangan observability — tidak boleh mengklaim
+            // "SOC >= limit selama 5 menit" tanpa data segar.
+            runtime.charge_limit_grace_started_at = None;
             next_result.add(PolicyBlock::SensorStale);
             return next_result;
         }
@@ -131,12 +161,15 @@ pub fn evaluate_policy(
         next_result.remove(PolicyBlock::Thermal);
     }
 
-    // 5. Evaluasi SOC Charge Limit Policy dengan Hysteresis Nyata (resume_limit atau limit - 2.0%)
-    let is_limit_blocked = evaluate_limit_block(
+    // 5. Evaluasi SOC Charge Limit Policy dengan Grace Period + Hysteresis
+    let (is_limit_blocked, new_reached_at) = evaluate_limit_block(
         sample,
         config,
         current_result.is_blocked_by(PolicyBlock::ChargeLimit),
+        runtime.charge_limit_grace_started_at,
+        now,
     );
+    runtime.charge_limit_grace_started_at = new_reached_at;
     if is_limit_blocked {
         next_result.add(PolicyBlock::ChargeLimit);
     } else {
@@ -171,10 +204,22 @@ fn evaluate_thermal_block(sample: Sample, config: &Config, currently_blocked: bo
     }
 }
 
-fn evaluate_limit_block(sample: Sample, config: &Config, currently_blocked: bool) -> bool {
+/// Evaluasi SOC Charge Limit dengan Grace Period temporal.
+///
+/// Semantik:
+/// - Sudah blocked → pertahankan selama SOC >= resume_soc (hysteresis).
+/// - Belum blocked, SOC < limit → timer reset.
+/// - Belum blocked, SOC >= limit → catat reached_at, block hanya setelah grace period (5 menit).
+fn evaluate_limit_block(
+    sample: Sample,
+    config: &Config,
+    currently_blocked: bool,
+    reached_at: Option<Instant>,
+    now: Instant,
+) -> (bool, Option<Instant>) {
     let limit_soc = config.charge_limit as f32;
     if limit_soc <= 0.0 {
-        return false;
+        return (false, None);
     }
 
     let current_soc = sample.capacity;
@@ -185,9 +230,30 @@ fn evaluate_limit_block(sample: Sample, config: &Config, currently_blocked: bool
         (limit_soc - 2.0).max(0.0)
     };
 
+    // Sudah blocked: pertahankan selama SOC >= resume_soc (hysteresis standar)
     if currently_blocked {
-        current_soc >= resume_soc
+        if current_soc >= resume_soc {
+            return (true, reached_at);
+        }
+        // SOC turun di bawah resume → unblock dan reset timer
+        return (false, None);
+    }
+
+    // Belum blocked: SOC belum mencapai limit
+    if current_soc < limit_soc {
+        return (false, None);
+    }
+
+    // SOC >= limit: mulai/lanjutkan timer grace period
+    let first_reached = reached_at.unwrap_or(now);
+    let elapsed = now.duration_since(first_reached);
+
+    if elapsed >= CHARGE_LIMIT_SUSPEND_DELAY {
+        // Grace period selesai → aktifkan ChargeLimit block
+        (true, Some(first_reached))
     } else {
-        current_soc >= limit_soc
+        // Masih dalam grace period → belum block, timer tetap berjalan
+        (false, Some(first_reached))
     }
 }
+

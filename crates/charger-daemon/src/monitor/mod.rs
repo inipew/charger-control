@@ -8,10 +8,11 @@ pub mod scheduler;
 pub mod tests;
 
 #[cfg(unix)]
-use std::{
-    os::fd::{AsRawFd, RawFd},
-    os::unix::net::UnixDatagram,
-};
+use mio::unix::SourceFd;
+#[cfg(unix)]
+use mio::{Events, Interest, Poll, Token};
+#[cfg(unix)]
+use std::{os::fd::RawFd, os::unix::net::UnixDatagram};
 
 #[cfg(not(unix))]
 type RawFd = i32;
@@ -31,7 +32,7 @@ use decision::{BlockCause, ChargingDecision};
 use events::{handle_event, MonitorEvent, UeventKind};
 use hardware::{HardwareFault, HardwareTrack};
 use intent::OperatingIntent;
-use policy::PolicyResult;
+use policy::{PolicyResult, PolicyRuntime};
 use reality::{ObservedState, Sample};
 use scheduler::{AdaptiveScheduler, SchedulingState, Urgency};
 
@@ -100,6 +101,7 @@ pub struct MonitorContext {
     pub adaptive_scheduler: AdaptiveScheduler,
     pub diag: DiagnosticsState,
     pub has_distinct_bypass: bool,
+    pub policy_runtime: PolicyRuntime,
 }
 
 impl MonitorContext {
@@ -119,16 +121,17 @@ impl MonitorContext {
             ),
             diag: DiagnosticsState::default(),
             has_distinct_bypass,
+            policy_runtime: PolicyRuntime::default(),
         }
     }
 
     #[allow(dead_code)]
     pub fn mark_hardware_changed(&mut self) {
-        self.hardware_track.mark_changed();
+        self.hardware_track.mark_verification_needed();
     }
 
-    pub fn mark_force_evaluation(&mut self) {
-        self.sched.mark_force_evaluation();
+    pub fn mark_evaluation_requested(&mut self) {
+        self.sched.mark_evaluation_requested();
     }
 
     pub fn mark_force_hardware_verification(&mut self) {
@@ -141,11 +144,13 @@ impl MonitorContext {
 
     pub fn reset_charger_state(&mut self) {
         self.policy_result = PolicyResult::clear();
+        self.policy_runtime.clear();
         self.sched.mark_snapshot_success();
+        self.adaptive_scheduler.reset_history();
     }
 }
 
-fn has_retry_work(ctx: &MonitorContext, now: Instant) -> bool {
+fn has_pending_recovery_deadline(ctx: &MonitorContext, now: Instant) -> bool {
     [
         ctx.hardware_track.next_deadline(),
         ctx.observed.next_sensor_retry(),
@@ -153,15 +158,14 @@ fn has_retry_work(ctx: &MonitorContext, now: Instant) -> bool {
     .iter()
     .copied()
     .flatten()
-    .next()
-    .is_some()
+    .any(|deadline| deadline > now)
 }
 
 fn can_sleep_forever(ctx: &MonitorContext) -> bool {
     matches!(
         ctx.observed.connection,
         reality::ConnectionState::Disconnected
-    ) && !ctx.sched.force_evaluation
+    ) && !ctx.sched.evaluation_requested
         && ctx.intent.next_deadline().is_none()
         && ctx.hardware_track.next_deadline().is_none()
         && ctx.observed.next_sensor_retry().is_none()
@@ -185,20 +189,36 @@ pub fn run_monitor_loop(
         tracing::warn!(error = %error, "Failed setting sysfs node permissions");
     }
 
+    let mut poll = Poll::new().expect("Failed to create mio::Poll");
+    let mut events = Events::with_capacity(64);
+    const IPC: Token = Token(0);
+    const NETLINK: Token = Token(1);
+
+    let mut mio_rx = mio::net::UnixDatagram::from_std(rx);
+    poll.registry()
+        .register(&mut mio_rx, IPC, Interest::READABLE)
+        .expect("Failed to register IPC datagram to mio::Poll");
+
     let mut netlink_fd = setup_netlink_socket();
-    let netlink_available = netlink_fd.is_some();
+    if let Some(fd) = netlink_fd {
+        let mut source = SourceFd(&fd);
+        if let Err(e) = poll
+            .registry()
+            .register(&mut source, NETLINK, Interest::READABLE)
+        {
+            tracing::warn!(error = %e, "Failed to register Netlink socket");
+            unsafe { libc::close(fd) };
+            netlink_fd = None;
+        }
+    }
     diagnostics
         .netlink_available
-        .store(netlink_available, Ordering::Relaxed);
+        .store(netlink_fd.is_some(), Ordering::Relaxed);
 
-    let rx_fd = rx.as_raw_fd();
-    if let Err(e) = rx.set_nonblocking(true) {
-        tracing::warn!(error = %e, "Failed to set IPC socket to non-blocking mode");
-    }
     let mut msg_buf = [0u8; 64];
 
     tracing::info!(
-        netlink = netlink_available,
+        netlink = netlink_fd.is_some(),
         distinct_bypass = ctx.has_distinct_bypass,
         "Monitor loop starting"
     );
@@ -206,6 +226,17 @@ pub fn run_monitor_loop(
     loop {
         if netlink_fd.is_none() {
             netlink_fd = setup_netlink_socket();
+            if let Some(fd) = netlink_fd {
+                let mut source = SourceFd(&fd);
+                if let Err(e) = poll
+                    .registry()
+                    .register(&mut source, NETLINK, Interest::READABLE)
+                {
+                    tracing::warn!(error = %e, "Failed to register new Netlink socket");
+                    unsafe { libc::close(fd) };
+                    netlink_fd = None;
+                }
+            }
             diagnostics
                 .netlink_available
                 .store(netlink_fd.is_some(), Ordering::Relaxed);
@@ -217,9 +248,23 @@ pub fn run_monitor_loop(
         ctx.intent.normalize(now_eval);
 
         // 1. Evaluasi Ulang Konfigurasi
-        if ctx.sched.force_evaluation {
+        if ctx.sched.evaluation_requested {
             if let Ok(guard) = shared_config.read() {
-                ctx.config = guard.clone();
+                let new_config = guard.clone();
+
+                // Jika parameter policy berubah, reset temporal state agar
+                // grace timer dan policy lama tidak bocor ke sesi config baru.
+                // Contoh: charge_limit naik 80→90 tapi timer 80% sudah hampir habis
+                // → tanpa reset, SOC 90% akan langsung diblokir dengan timer lama.
+                if new_config.charge_limit != ctx.config.charge_limit
+                    || new_config.resume_limit != ctx.config.resume_limit
+                    || new_config.max_temp_dc != ctx.config.max_temp_dc
+                {
+                    ctx.policy_runtime.clear();
+                    ctx.policy_result = PolicyResult::clear();
+                }
+
+                ctx.config = new_config;
             }
         }
 
@@ -269,17 +314,32 @@ pub fn run_monitor_loop(
 
         ctx.observed.update(power_state, sample, now_eval);
 
+        if let Ok(mut ps) = diagnostics.power_state.write() {
+            *ps = format!("{power_state:?}");
+        }
+        if let Some(s) = &ctx.observed.sample {
+            diagnostics
+                .battery_level_percent
+                .store(s.capacity as u8, Ordering::Relaxed);
+            diagnostics
+                .battery_temperature_dc
+                .store((s.temperature_c * 10.0) as i32, Ordering::Relaxed);
+        } else {
+            diagnostics
+                .battery_level_percent
+                .store(255, Ordering::Relaxed);
+            diagnostics
+                .battery_temperature_dc
+                .store(i32::MIN, Ordering::Relaxed);
+        }
+
         // 3. Evaluasi Policy Engine
         ctx.policy_result =
-            policy::evaluate_policy(&ctx.observed, &ctx.config, &ctx.policy_result, now_eval);
+            policy::evaluate_policy(&ctx.observed, &ctx.config, &ctx.policy_result, &mut ctx.policy_runtime, now_eval);
 
         // 4. Resolve Decision & Map to Desired Hardware State
-        let decision = ChargingDecision::resolve(
-            &ctx.observed,
-            &ctx.intent,
-            &ctx.policy_result,
-            now_eval,
-        );
+        let decision =
+            ChargingDecision::resolve(&ctx.observed, &ctx.intent, &ctx.policy_result, now_eval);
         let desired_hw = decision.to_desired_hardware();
 
         // 5. Rekonsiliasi Hardware (Idempotent Sysfs Write & Event-Driven Verification)
@@ -304,13 +364,17 @@ pub fn run_monitor_loop(
             hardware::ReconcileResult::Stable(actual)
             | hardware::ReconcileResult::Changed(actual) => {
                 ctx.sched.clear_hardware_verification_request();
-                
+
                 if ctx.diag.last_decision.as_ref() != Some(&decision)
                     || ctx.diag.last_hw_mode != Some(actual)
                 {
                     tracing::info!(?decision, ?desired_hw, ?actual, "State transition updated");
                     ctx.diag.last_decision = Some(decision.clone());
                     ctx.diag.last_hw_mode = Some(actual);
+
+                    if let Ok(mut hw) = diagnostics.hardware_state.write() {
+                        *hw = format!("{actual:?}");
+                    }
                 } else if ctx
                     .diag
                     .last_heartbeat_log
@@ -320,10 +384,26 @@ pub fn run_monitor_loop(
                     ctx.diag.last_heartbeat_log = Some(now_eval);
                 }
             }
+            // Skipped = desired was NoChange, hardware not actually verified.
+            // Do NOT consume force_verification so it persists until hardware
+            // is truly read (e.g. after charger is attached).
+            hardware::ReconcileResult::Skipped(actual) => {
+                if ctx.diag.last_decision.as_ref() != Some(&decision)
+                    || ctx.diag.last_hw_mode != Some(actual)
+                {
+                    tracing::info!(?decision, ?desired_hw, ?actual, "State transition updated");
+                    ctx.diag.last_decision = Some(decision.clone());
+                    ctx.diag.last_hw_mode = Some(actual);
+
+                    if let Ok(mut hw) = diagnostics.hardware_state.write() {
+                        *hw = format!("{actual:?}");
+                    }
+                }
+            }
             hardware::ReconcileResult::Deferred => {}
             hardware::ReconcileResult::Failed(error) => {
                 ctx.sched.clear_hardware_verification_request();
-                
+
                 if let hardware::HardwareStatus::Fault { error: fault, .. } =
                     ctx.hardware_track.status
                 {
@@ -335,7 +415,6 @@ pub fn run_monitor_loop(
         }
 
         ctx.clear_evaluation_request();
-        ctx.sched.last_evaluation = now_eval;
 
         // 6. Konsolidasi Earliest Deadline
         let earliest_deadline = [
@@ -343,6 +422,7 @@ pub fn run_monitor_loop(
             ctx.observed.connection.next_transition(),
             ctx.hardware_track.next_deadline(),
             ctx.observed.next_sensor_retry(),
+            ctx.policy_runtime.charge_limit_deadline(),
             if ctx.observed.connection.is_connected() {
                 ctx.observed.sample_stale_deadline()
             } else {
@@ -355,7 +435,7 @@ pub fn run_monitor_loop(
         .min();
 
         let decision_urgency = decision.to_urgency();
-        let retry_urgency = if has_retry_work(&ctx, now_eval) {
+        let retry_urgency = if has_pending_recovery_deadline(&ctx, now_eval) {
             Urgency::Recovery
         } else {
             Urgency::Idle
@@ -398,17 +478,145 @@ pub fn run_monitor_loop(
             Ordering::Relaxed,
         );
 
-        // Sleep via poll()
-        let (ipc_ready, batch) = poll_events(rx_fd, netlink_fd, poll_timeout_ms);
+        let timeout = if poll_timeout_ms < 0 {
+            None
+        } else {
+            Some(Duration::from_millis(poll_timeout_ms as u64))
+        };
 
-        // FRESH timestamp tepat setelah bangun!
+        if let Err(e) = poll.poll(&mut events, timeout) {
+            if e.kind() != std::io::ErrorKind::Interrupted {
+                tracing::error!(error = %e, "mio::Poll failed");
+            }
+        }
+
         let wake_now = Instant::now();
 
-        if !ipc_ready && !batch.has_any() && can_sleep_forever(&ctx) {
+        if events.is_empty() {
+            handle_event(&mut ctx, MonitorEvent::ForceWake, wake_now);
             continue;
         }
 
-        // Dispatch UEVENT Batch
+        let mut batch = UeventBatch::default();
+        let mut ipc_shutdown = false;
+
+        for event in events.iter() {
+            match event.token() {
+                IPC => loop {
+                    match mio_rx.recv(&mut msg_buf) {
+                        Ok(0) => {
+                            tracing::error!("Internal IPC channel closed unexpectedly");
+                            ipc_shutdown = true;
+                            break;
+                        }
+                        Ok(_len) => {
+                            let cmd_code = msg_buf[0];
+                            match cmd_code {
+                                1 => handle_event(
+                                    &mut ctx,
+                                    MonitorEvent::IpcCommand(DaemonCommand::Reload),
+                                    wake_now,
+                                ),
+                                2 => {
+                                    tracing::info!("Shutdown signal received in monitor loop");
+                                    ipc_shutdown = true;
+                                    break;
+                                }
+                                3 => handle_event(
+                                    &mut ctx,
+                                    MonitorEvent::IpcCommand(DaemonCommand::BypassOn),
+                                    wake_now,
+                                ),
+                                4 => handle_event(
+                                    &mut ctx,
+                                    MonitorEvent::IpcCommand(DaemonCommand::BypassOff),
+                                    wake_now,
+                                ),
+                                5 => handle_event(
+                                    &mut ctx,
+                                    MonitorEvent::IpcCommand(DaemonCommand::DisableOn),
+                                    wake_now,
+                                ),
+                                6 => handle_event(
+                                    &mut ctx,
+                                    MonitorEvent::IpcCommand(DaemonCommand::DisableOff),
+                                    wake_now,
+                                ),
+                                _ => {}
+                            }
+                        }
+                        Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                            break;
+                        }
+                        Err(e) => {
+                            tracing::error!(error = %e, "IPC recv error");
+                            break;
+                        }
+                    }
+                },
+                NETLINK => {
+                    if event.is_error() || event.is_read_closed() {
+                        batch.netlink_broken = true;
+                    } else if event.is_readable() {
+                        if let Some(nl_fd) = netlink_fd {
+                            let mut buf = [0u8; 8192];
+                            loop {
+                                let res = unsafe {
+                                    libc::recv(
+                                        nl_fd,
+                                        buf.as_mut_ptr() as *mut libc::c_void,
+                                        buf.len(),
+                                        libc::MSG_DONTWAIT,
+                                    )
+                                };
+                                if res < 0 {
+                                    let err = std::io::Error::last_os_error();
+                                    match err.raw_os_error() {
+                                        // Buffer exhausted: treat as recoverable overflow.
+                                        #[cfg(target_os = "android")]
+                                        Some(libc::ENOBUFS) => {
+                                            batch.overflow = true;
+                                            break;
+                                        }
+                                        // No more data available right now.
+                                        Some(libc::EAGAIN) | Some(libc::EWOULDBLOCK) => {
+                                            break;
+                                        }
+                                        // Fatal socket error — socket must be recreated.
+                                        _ => {
+                                            tracing::warn!(
+                                                error = %err,
+                                                "Netlink recv fatal error, marking socket broken"
+                                            );
+                                            batch.netlink_broken = true;
+                                            break;
+                                        }
+                                    }
+                                }
+                                if res == 0 {
+                                    break;
+                                }
+                                let bytes_read = res as usize;
+                                match classify_uevent(&buf[..bytes_read]) {
+                                    UeventKind::Ac => batch.ac = true,
+                                    UeventKind::Usb => batch.usb = true,
+                                    UeventKind::TypeC => batch.typec = true,
+                                    UeventKind::Battery => batch.battery = true,
+                                    UeventKind::Bms => batch.bms = true,
+                                    UeventKind::Other => {}
+                                }
+                            }
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
+
+        if ipc_shutdown {
+            return;
+        }
+
         if batch.ac {
             handle_event(&mut ctx, MonitorEvent::AcChanged, wake_now);
         }
@@ -426,57 +634,20 @@ pub fn run_monitor_loop(
         }
         if batch.overflow {
             ctx.hardware_track.mark_verification_needed();
-            ctx.mark_force_evaluation();
+            ctx.mark_evaluation_requested();
         }
         if batch.netlink_broken {
+            ctx.hardware_track.mark_verification_needed();
+            ctx.mark_force_hardware_verification();
+            ctx.mark_evaluation_requested();
             if let Some(fd) = netlink_fd.take() {
+                let mut source = SourceFd(&fd);
+                let _ = poll.registry().deregister(&mut source);
                 unsafe { libc::close(fd) };
                 tracing::warn!("Netlink socket broken, will recreate on next loop");
                 diagnostics
                     .netlink_available
                     .store(false, Ordering::Relaxed);
-            }
-        }
-
-        if ipc_ready {
-            while let Ok(len) = rx.recv(&mut msg_buf) {
-                if len == 0 {
-                    tracing::error!("Internal IPC channel closed unexpectedly, shutting down monitor loop to prevent CPU spin");
-                    return;
-                }
-                let cmd_code = msg_buf[0];
-                match cmd_code {
-                    1 => handle_event(
-                        &mut ctx,
-                        MonitorEvent::IpcCommand(DaemonCommand::Reload),
-                        wake_now,
-                    ),
-                    2 => {
-                        tracing::info!("Shutdown signal received in monitor loop");
-                        return;
-                    }
-                    3 => handle_event(
-                        &mut ctx,
-                        MonitorEvent::IpcCommand(DaemonCommand::BypassOn),
-                        wake_now,
-                    ),
-                    4 => handle_event(
-                        &mut ctx,
-                        MonitorEvent::IpcCommand(DaemonCommand::BypassOff),
-                        wake_now,
-                    ),
-                    5 => handle_event(
-                        &mut ctx,
-                        MonitorEvent::IpcCommand(DaemonCommand::DisableOn),
-                        wake_now,
-                    ),
-                    6 => handle_event(
-                        &mut ctx,
-                        MonitorEvent::IpcCommand(DaemonCommand::DisableOff),
-                        wake_now,
-                    ),
-                    _ => {}
-                }
             }
         }
     }
@@ -591,79 +762,4 @@ fn classify_uevent(data: &[u8]) -> UeventKind {
     }
 
     UeventKind::Other
-}
-
-#[cfg(unix)]
-fn poll_events(rx_fd: RawFd, netlink_fd: Option<RawFd>, timeout_ms: i32) -> (bool, UeventBatch) {
-    let mut batch = UeventBatch::default();
-    let mut fds = [
-        libc::pollfd {
-            fd: rx_fd,
-            events: libc::POLLIN,
-            revents: 0,
-        },
-        libc::pollfd {
-            fd: netlink_fd.unwrap_or(-1),
-            events: libc::POLLIN,
-            revents: 0,
-        },
-    ];
-
-    let nfds = if netlink_fd.is_some() { 2 } else { 1 };
-
-    unsafe {
-        let ret = libc::poll(fds.as_mut_ptr(), nfds as libc::nfds_t, timeout_ms);
-        if ret > 0 {
-            let ipc_ready = (fds[0].revents & (libc::POLLIN | libc::POLLHUP | libc::POLLERR)) != 0;
-
-            if let Some(nl_fd) = netlink_fd {
-                if (fds[1].revents & (libc::POLLERR | libc::POLLHUP)) != 0 {
-                    batch.netlink_broken = true;
-                } else if (fds[1].revents & libc::POLLIN) != 0 {
-                    let mut buf = [0u8; 8192];
-                    loop {
-                        let res = libc::recv(
-                            nl_fd,
-                            buf.as_mut_ptr() as *mut libc::c_void,
-                            buf.len(),
-                            libc::MSG_DONTWAIT,
-                        );
-                        if res < 0 {
-                            #[cfg(target_os = "android")]
-                            {
-                                if let Some(errno) = std::io::Error::last_os_error().raw_os_error()
-                                {
-                                    if errno == libc::ENOBUFS {
-                                        batch.overflow = true;
-                                    }
-                                }
-                            }
-                            break;
-                        }
-                        if res == 0 {
-                            break;
-                        }
-                        let bytes_read = res as usize;
-                        match classify_uevent(&buf[..bytes_read]) {
-                            UeventKind::Ac => batch.ac = true,
-                            UeventKind::Usb => batch.usb = true,
-                            UeventKind::TypeC => batch.typec = true,
-                            UeventKind::Battery => batch.battery = true,
-                            UeventKind::Bms => batch.bms = true,
-                            UeventKind::Other => {}
-                        }
-                    }
-                }
-            }
-
-            (ipc_ready, batch)
-        } else {
-            (false, batch)
-        }
-    }
-}
-
-#[cfg(not(unix))]
-fn poll_events(_rx_fd: RawFd, _netlink_fd: Option<RawFd>, _timeout_ms: i32) -> (bool, UeventBatch) {
-    (false, UeventBatch::default())
 }

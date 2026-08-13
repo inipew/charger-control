@@ -73,7 +73,7 @@ impl HardwareObservation {
 /// Tracking status rekonsiliasi hardware dengan FSM eksplisit (Event-Driven Verification & Fault Recovery Policy).
 #[derive(Debug)]
 pub struct HardwareTrack {
-    pub current_obs: HardwareObservation,
+    pub last_verified_obs: HardwareObservation,
     pub status: HardwareStatus,
     pub verification_needed: bool,
 }
@@ -81,7 +81,7 @@ pub struct HardwareTrack {
 impl HardwareTrack {
     pub fn new() -> Self {
         Self {
-            current_obs: HardwareObservation::new(),
+            last_verified_obs: HardwareObservation::new(),
             status: HardwareStatus::Unknown,
             verification_needed: true,
         }
@@ -91,13 +91,8 @@ impl HardwareTrack {
         self.verification_needed = true;
     }
 
-    #[allow(dead_code)]
-    pub fn mark_changed(&mut self) {
-        self.verification_needed = true;
-    }
-
     pub fn update_observation(&mut self, mode: control::ActualHardwareMode, now: Instant) {
-        self.current_obs = HardwareObservation {
+        self.last_verified_obs = HardwareObservation {
             mode,
             verified_at: Some(now),
         };
@@ -112,6 +107,9 @@ impl HardwareTrack {
             failed_at: now,
             retry,
         };
+        if error != HardwareFault::ReadbackMismatch {
+            self.last_verified_obs = HardwareObservation::new();
+        }
         self.verification_needed = false;
     }
 
@@ -129,7 +127,7 @@ impl HardwareTrack {
 
     pub fn reset_on_disconnect(&mut self) {
         self.status = HardwareStatus::Unknown;
-        self.current_obs = HardwareObservation::new();
+        self.last_verified_obs = HardwareObservation::new();
         self.verification_needed = true;
     }
 }
@@ -137,6 +135,7 @@ impl HardwareTrack {
 /// Hasil rekonsiliasi hardware actuator.
 #[derive(Debug)]
 pub enum ReconcileResult {
+    Skipped(control::ActualHardwareMode),
     Stable(control::ActualHardwareMode),
     Changed(control::ActualHardwareMode),
     Deferred,
@@ -161,7 +160,7 @@ pub fn reconcile(
     // decision layer tidak mengatur hardware state transitions
     // saat charger terputus (disconnected) atau selama settling.
     if desired == DesiredHardwareState::NoChange {
-        return ReconcileResult::Stable(track.current_obs.mode);
+        return ReconcileResult::Skipped(track.last_verified_obs.mode);
     }
 
     let retry_due = match track.status {
@@ -188,9 +187,7 @@ pub fn reconcile(
                 }
             }
             FaultRetryPolicy::Never => {
-                if !opts.bypass_retry_delay {
-                    return ReconcileResult::Deferred;
-                }
+                return ReconcileResult::Deferred;
             }
         }
     }
@@ -202,7 +199,7 @@ pub fn reconcile(
     let current_actual = if must_verify {
         control::get_actual_charging_state()
     } else {
-        track.current_obs.mode
+        track.last_verified_obs.mode
     };
 
     // 3. Mutation Phase: Jika status hardware saat ini SUDAH SAMA, skip penulisan sysfs! (Idempotency)
@@ -218,8 +215,11 @@ pub fn reconcile(
 
     // 4. Mutation Phase: Jalankan penulisan fisik sysfs
     let write_res = match expected_actual {
-        control::ActualHardwareMode::Unknown => Ok(()), // Seharusnya unreachable jika logic di atas benar
-        control::ActualHardwareMode::Inconsistent => Ok(()),
+        control::ActualHardwareMode::Unknown | control::ActualHardwareMode::Inconsistent => {
+            Err(ChargerError::HardwareError(
+                "Cannot write Unknown or Inconsistent hardware target state",
+            ))
+        }
         control::ActualHardwareMode::ChargingEnabled => control::set_charging(true),
         control::ActualHardwareMode::ChargingDisabled => control::set_charging(false),
         control::ActualHardwareMode::Bypass => control::enter_bypass_mode(),
@@ -251,6 +251,7 @@ pub fn reconcile(
     let actual_after = control::get_actual_charging_state();
 
     if actual_after != expected_actual {
+        track.update_observation(actual_after, now);
         track.mark_fault(HardwareFault::ReadbackMismatch, now);
         tracing::error!(
             ?desired,
@@ -261,7 +262,7 @@ pub fn reconcile(
         return ReconcileResult::Failed(ChargerError::HardwareError("Hardware readback mismatch"));
     }
 
-    let is_changed = track.current_obs.mode != actual_after;
+    let is_changed = track.last_verified_obs.mode != actual_after;
     track.update_observation(actual_after, now);
 
     if is_changed {

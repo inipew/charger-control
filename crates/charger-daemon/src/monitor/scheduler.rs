@@ -40,24 +40,22 @@ impl Urgency {
 /// Penjejak status penjadwalan.
 #[derive(Debug)]
 pub struct SchedulingState {
-    pub force_evaluation: bool,
+    pub evaluation_requested: bool,
     pub force_hardware_verification: bool,
-    pub last_evaluation: Instant,
     pub snapshot_backoff: Duration,
 }
 
 impl SchedulingState {
     pub fn new() -> Self {
         Self {
-            force_evaluation: true,
+            evaluation_requested: true,
             force_hardware_verification: true,
-            last_evaluation: Instant::now() - Duration::from_secs(3600),
             snapshot_backoff: ERROR_BACKOFF_INITIAL,
         }
     }
 
-    pub fn mark_force_evaluation(&mut self) {
-        self.force_evaluation = true;
+    pub fn mark_evaluation_requested(&mut self) {
+        self.evaluation_requested = true;
     }
 
     pub fn mark_force_hardware_verification(&mut self) {
@@ -65,7 +63,7 @@ impl SchedulingState {
     }
 
     pub fn clear_evaluation_request(&mut self) {
-        self.force_evaluation = false;
+        self.evaluation_requested = false;
     }
 
     pub fn clear_hardware_verification_request(&mut self) {

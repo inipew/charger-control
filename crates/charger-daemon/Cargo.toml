@@ -8,6 +8,7 @@ charger-core.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 libc = "0.2"
+mio = { version = "1.0", features = ["os-poll", "os-ext", "net"] }
 signal-hook.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true
