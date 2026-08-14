@@ -117,6 +117,7 @@ dependencies = [
  "libc",
  "serde",
  "serde_json",
+ "signal-hook",
 ]
 
 [[package]]

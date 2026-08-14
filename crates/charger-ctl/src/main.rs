@@ -53,11 +53,43 @@ enum Commands {
     /// Grant permissions to charging nodes
     GrantPerms,
 
-    /// Debugging utilities
+    /// Debugging & observation utilities
     Debug {
-        #[arg(value_parser = ["uevent"])]
-        action: String,
+        #[command(subcommand)]
+        command: DebugCommands,
     },
+}
+
+#[derive(Subcommand)]
+enum DebugCommands {
+    /// Live device observation & dry-run simulation (Safe read-only, no sysfs actuator writes)
+    Observe {
+        /// File path to save output log (e.g. /data/adb/charger-control/observe.log)
+        #[arg(short, long)]
+        output: Option<std::path::PathBuf>,
+
+        /// Polling interval in seconds
+        #[arg(short, long, default_value = "2")]
+        interval: u64,
+
+        /// Simulated charge limit (50-100%)
+        #[arg(short, long)]
+        limit: Option<u8>,
+
+        /// Simulated resume limit
+        #[arg(short, long)]
+        resume: Option<u8>,
+    },
+
+    /// Deep probe of all /sys/class/power_supply sysfs nodes & permissions
+    Nodes {
+        /// File path to save output log
+        #[arg(short, long)]
+        output: Option<std::path::PathBuf>,
+    },
+
+    /// Raw kernel netlink uevent stream dumper
+    Uevent,
 }
 
 #[derive(Subcommand)]
@@ -134,11 +166,22 @@ fn main() -> Result<(), ChargerError> {
             println!("Charging node permissions updated.");
         }
 
-        Commands::Debug { action } => {
-            if action == "uevent" {
+        Commands::Debug { command } => match command {
+            DebugCommands::Observe {
+                output,
+                interval,
+                limit,
+                resume,
+            } => {
+                cmd::debug::run_observer(output.clone(), *interval, *limit, *resume)?;
+            }
+            DebugCommands::Nodes { output } => {
+                cmd::debug::run_node_dump(output.as_deref())?;
+            }
+            DebugCommands::Uevent => {
                 cmd::debug::run_uevent_dumper()?;
             }
-        }
+        },
     }
 
     Ok(())

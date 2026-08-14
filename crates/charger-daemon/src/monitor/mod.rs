@@ -79,6 +79,7 @@ pub struct UeventBatch {
 }
 
 impl UeventBatch {
+    #[allow(dead_code)]
     pub fn has_any(&self) -> bool {
         self.ac
             || self.usb
@@ -144,6 +145,7 @@ impl MonitorContext {
 
     /// Reset penuh: digunakan saat config berubah atau explicit Reload.
     /// Menghapus policy_runtime (ChargeLimitState kembali ke Normal).
+    #[allow(dead_code)]
     pub fn reset_charger_state(&mut self) {
         self.policy_result = PolicyResult::clear();
         self.policy_runtime.clear();
@@ -597,7 +599,7 @@ pub fn run_monitor_loop(
                                             break;
                                         }
                                         // No more data available right now.
-                                        Some(libc::EAGAIN) | Some(libc::EWOULDBLOCK) => {
+                                        Some(libc::EAGAIN) => {
                                             break;
                                         }
                                         // Fatal socket error — socket must be recreated.
@@ -722,63 +724,5 @@ fn setup_netlink_socket() -> Option<RawFd> {
     }
 }
 
-pub(crate) fn classify_uevent(data: &[u8]) -> UeventKind {
-    let mut subsystem: Option<&[u8]> = None;
-    let mut devpath: Option<&[u8]> = None;
-    let mut power_supply_name: Option<&[u8]> = None;
+pub(crate) use charger_core::battery::uevent::classify_uevent;
 
-    for part in data.split(|&b| b == 0) {
-        if part.starts_with(b"SUBSYSTEM=") {
-            subsystem = Some(&part[10..]);
-        } else if part.starts_with(b"DEVPATH=") {
-            devpath = Some(&part[8..]);
-        } else if part.starts_with(b"POWER_SUPPLY_NAME=") {
-            power_supply_name = Some(&part[18..]);
-        }
-    }
-
-    if subsystem == Some(b"typec")
-        || devpath.is_some_and(|dp| dp.windows(6).any(|w| w == b"/typec"))
-    {
-        return UeventKind::TypeC;
-    }
-
-    if subsystem == Some(b"power_supply") {
-        if let Some(name) = power_supply_name {
-            match name {
-                b"ac" => return UeventKind::Ac,
-                b"usb" | b"charger" => return UeventKind::Usb,
-                b"typec" => return UeventKind::TypeC,
-                b"battery" => return UeventKind::Battery,
-                b"bms" => return UeventKind::Bms,
-                _ => {}
-            }
-        }
-    }
-
-    if let Some(dp) = devpath {
-        if dp.windows(4).any(|w| w == b"/bms") || dp.ends_with(b"/bms") {
-            return UeventKind::Bms;
-        }
-        if dp.windows(8).any(|w| w == b"/battery") || dp.ends_with(b"/battery") {
-            return UeventKind::Battery;
-        }
-        if dp.windows(4).any(|w| w == b"/usb") || dp.ends_with(b"/usb") {
-            return UeventKind::Usb;
-        }
-        if dp.windows(3).any(|w| w == b"/ac") || dp.ends_with(b"/ac") {
-            return UeventKind::Ac;
-        }
-    }
-
-    if let Some(name) = power_supply_name {
-        if name.starts_with(b"battery") {
-            return UeventKind::Battery;
-        }
-        if name.starts_with(b"bms") {
-            return UeventKind::Bms;
-        }
-    }
-
-    UeventKind::Other
-}

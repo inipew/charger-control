@@ -4,16 +4,7 @@ use crate::ipc::DaemonCommand;
 
 use super::{intent::OperatingIntent, MonitorContext};
 
-/// Klasifikasi jenis uevent kernel yang relevan.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum UeventKind {
-    Ac,
-    Usb,
-    TypeC,
-    Battery,
-    Bms,
-    Other,
-}
+pub use charger_core::battery::uevent::UeventKind;
 
 /// Kejadian transien (Event) yang memicu pembaruan state machine monitor.
 #[derive(Debug, Clone)]
