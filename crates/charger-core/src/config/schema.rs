@@ -69,12 +69,17 @@ impl Config {
         // Clamp charge_limit antara 50% hingga 100%
         self.charge_limit = self.charge_limit.clamp(50, 100);
 
-        // Resume limit harus lebih kecil dari charge_limit jika diaktifkan (> 0)
-        if self.resume_limit > 0 && self.resume_limit >= self.charge_limit {
-            self.resume_limit = self.charge_limit.saturating_sub(2);
+        // Normalisasi resume_limit:
+        // - resume_limit = 0 (tidak dikonfigurasi) → fallback ke charge_limit - 2
+        // - resume_limit >= charge_limit (invalid) → clamp ke charge_limit - 1
+        // - resume_limit < 1 → minimum 1
+        //
+        // Invariant setelah validate(): 0 < resume_limit < charge_limit
+        if self.resume_limit == 0 || self.resume_limit >= self.charge_limit {
+            self.resume_limit = self.charge_limit.saturating_sub(2).max(1);
         }
 
-        // Maximum temperature dc (30.0°C hingga 60.0°C -> 300 hingga 600)
+        // Maximum temperature dc (30.0°C hingga 60.0°C → 300 hingga 600)
         self.max_temp_dc = self.max_temp_dc.clamp(300, 600);
 
         // Polling interval antara 1 hingga 300 detik
@@ -120,7 +125,7 @@ mod tests {
         let mut cfg = Config {
             enabled: true,
             charge_limit: 150, // invalid > 100
-            resume_limit: 98, // invalid >= charge_limit (which will be clamped to 100, so 98 is valid for 100, but if charge_limit=80, 98 > 80)
+            resume_limit: 98,
             thermal_cutoff: true,
             max_temp_dc: 800,      // invalid > 600
             poll_interval_secs: 0, // invalid < 1
@@ -129,9 +134,11 @@ mod tests {
 
         cfg.validate();
         assert_eq!(cfg.charge_limit, 100);
+        assert_eq!(cfg.resume_limit, 98); // 98 < 100 → valid, tidak diubah
         assert_eq!(cfg.max_temp_dc, 600);
         assert_eq!(cfg.poll_interval_secs, 1);
 
+        // resume_limit >= charge_limit → dinormalisasi ke charge_limit - 2
         let mut invalid_resume = Config {
             charge_limit: 80,
             resume_limit: 85, // resume_limit > charge_limit
@@ -140,5 +147,32 @@ mod tests {
         invalid_resume.validate();
         assert_eq!(invalid_resume.charge_limit, 80);
         assert_eq!(invalid_resume.resume_limit, 78);
+
+        // resume_limit = 0 (tidak dikonfigurasi) → fallback ke charge_limit - 2
+        let mut zero_resume = Config {
+            charge_limit: 80,
+            resume_limit: 0,
+            ..Config::default()
+        };
+        zero_resume.validate();
+        assert_eq!(zero_resume.resume_limit, 78);
+
+        // resume_limit == charge_limit → invalid, normalisasi ke charge_limit - 2
+        let mut equal_resume = Config {
+            charge_limit: 80,
+            resume_limit: 80,
+            ..Config::default()
+        };
+        equal_resume.validate();
+        assert_eq!(equal_resume.resume_limit, 78);
+
+        // resume_limit > charge_limit → sama seperti >=
+        let mut above_resume = Config {
+            charge_limit: 80,
+            resume_limit: 105,
+            ..Config::default()
+        };
+        above_resume.validate();
+        assert_eq!(above_resume.resume_limit, 78);
     }
 }

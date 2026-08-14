@@ -85,7 +85,8 @@ fn main() {
         Err(error) => {
             eprintln!("Failed to load config: {error}");
 
-            let default_config = Config::default();
+            let mut default_config = Config::default();
+            default_config.validate();
 
             if let Some(parent) = config_path.parent() {
                 let _ = std::fs::create_dir_all(parent);

@@ -142,9 +142,27 @@ impl MonitorContext {
         self.sched.clear_evaluation_request();
     }
 
+    /// Reset penuh: digunakan saat config berubah atau explicit Reload.
+    /// Menghapus policy_runtime (ChargeLimitState kembali ke Normal).
     pub fn reset_charger_state(&mut self) {
         self.policy_result = PolicyResult::clear();
         self.policy_runtime.clear();
+        self.sched.mark_snapshot_success();
+        self.adaptive_scheduler.reset_history();
+    }
+
+    /// Reset partial saat charger dicabut (detach).
+    ///
+    /// **Tidak** menghapus `policy_runtime` agar `ChargeLimitState::Suspended`
+    /// tetap bertahan melewati siklus detach/attach.
+    ///
+    /// Alasan: glitch koneksi fisik (bounce) atau race condition pembacaan
+    /// `get_power_state()` bisa sesaat menyebabkan transisi `Attached → Disconnected`
+    /// meskipun charger masih terpasang. Tanpa ini, state Suspended hilang dan
+    /// SOC 99% yang seharusnya tetap diblokir menjadi Allow.
+    pub fn reset_on_detach(&mut self) {
+        self.policy_result = PolicyResult::clear();
+        // policy_runtime sengaja TIDAK di-clear
         self.sched.mark_snapshot_success();
         self.adaptive_scheduler.reset_history();
     }
@@ -247,15 +265,13 @@ pub fn run_monitor_loop(
         // Normalize intent jika masa tenggang bypass telah habis
         ctx.intent.normalize(now_eval);
 
-        // 1. Evaluasi Ulang Konfigurasi
+        // 1. Evaluasi Ulang Konfigurasi & Sensor & Policy & Reconcile jika ada permintaan evaluasi
         if ctx.sched.evaluation_requested {
             if let Ok(guard) = shared_config.read() {
                 let new_config = guard.clone();
 
                 // Jika parameter policy berubah, reset temporal state agar
                 // grace timer dan policy lama tidak bocor ke sesi config baru.
-                // Contoh: charge_limit naik 80→90 tapi timer 80% sudah hampir habis
-                // → tanpa reset, SOC 90% akan langsung diblokir dengan timer lama.
                 if new_config.charge_limit != ctx.config.charge_limit
                     || new_config.resume_limit != ctx.config.resume_limit
                     || new_config.max_temp_dc != ctx.config.max_temp_dc
@@ -266,155 +282,153 @@ pub fn run_monitor_loop(
 
                 ctx.config = new_config;
             }
-        }
 
-        ctx.adaptive_scheduler.update_config(
-            Duration::from_secs(ctx.config.poll_interval_secs),
-            ctx.config.charge_limit as f32,
-            ctx.config.max_temp_dc as f32 / 10.0,
-        );
+            ctx.adaptive_scheduler.update_config(
+                Duration::from_secs(ctx.config.poll_interval_secs),
+                ctx.config.charge_limit as f32,
+                ctx.config.max_temp_dc as f32 / 10.0,
+            );
 
-        // 2. Baca Sensor Observation (Reality)
-        let power_state = reader::get_power_state().unwrap_or(reader::PowerState::Unknown);
+            // 2. Baca Sensor Observation (Reality)
+            let power_state = reader::get_power_state().unwrap_or(reader::PowerState::Unknown);
 
-        let prev_connected = ctx.observed.connection.is_connected();
-        ctx.observed.update_connection(power_state, now_eval);
-        let now_connected = ctx.observed.connection.is_connected();
+            let prev_connected = ctx.observed.connection.is_connected();
+            ctx.observed.update_connection(power_state, now_eval);
+            let now_connected = ctx.observed.connection.is_connected();
 
-        if !prev_connected && now_connected {
-            handle_event(&mut ctx, MonitorEvent::ChargerAttached, now_eval);
-        } else if prev_connected && !now_connected {
-            handle_event(&mut ctx, MonitorEvent::ChargerDetached, now_eval);
-        }
-
-        let can_retry_sample = ctx
-            .observed
-            .next_sensor_retry()
-            .is_none_or(|t| now_eval >= t);
-
-        // Optimasi: Skip pembacaan sensor snapshot sysfs jika charger tidak terhubung
-        // atau masih dalam masa backoff karena pembacaan sebelumnya gagal.
-        let sample = if power_state.is_plugged_in() && can_retry_sample {
-            match Sample::read(power_state, now_eval) {
-                Ok(s) => {
-                    ctx.sched.mark_snapshot_success();
-                    ctx.adaptive_scheduler.update_sample(&s);
-                    Some(s)
-                }
-                Err(error) => {
-                    tracing::warn!(error = %error, "Failed reading battery snapshot");
-                    let backoff = ctx.sched.mark_snapshot_failure();
-                    ctx.observed.mark_sample_failed(now_eval + backoff);
-                    None
-                }
+            if !prev_connected && now_connected {
+                handle_event(&mut ctx, MonitorEvent::ChargerAttached, now_eval);
+            } else if prev_connected && !now_connected {
+                handle_event(&mut ctx, MonitorEvent::ChargerDetached, now_eval);
             }
-        } else {
-            None
-        };
 
-        ctx.observed.update(power_state, sample, now_eval);
+            let can_retry_sample = ctx
+                .observed
+                .next_sensor_retry()
+                .is_none_or(|t| now_eval >= t);
 
-        if let Ok(mut ps) = diagnostics.power_state.write() {
-            *ps = format!("{power_state:?}");
-        }
-        if let Some(s) = &ctx.observed.sample {
-            diagnostics
-                .battery_level_percent
-                .store(s.capacity as u8, Ordering::Relaxed);
-            diagnostics
-                .battery_temperature_dc
-                .store((s.temperature_c * 10.0) as i32, Ordering::Relaxed);
-        } else {
-            diagnostics
-                .battery_level_percent
-                .store(255, Ordering::Relaxed);
-            diagnostics
-                .battery_temperature_dc
-                .store(i32::MIN, Ordering::Relaxed);
-        }
-
-        // 3. Evaluasi Policy Engine
-        ctx.policy_result =
-            policy::evaluate_policy(&ctx.observed, &ctx.config, &ctx.policy_result, &mut ctx.policy_runtime, now_eval);
-
-        // 4. Resolve Decision & Map to Desired Hardware State
-        let decision =
-            ChargingDecision::resolve(&ctx.observed, &ctx.intent, &ctx.policy_result, now_eval);
-        let desired_hw = decision.to_desired_hardware();
-
-        // 5. Rekonsiliasi Hardware (Idempotent Sysfs Write & Event-Driven Verification)
-        let is_emergency = matches!(
-            decision,
-            ChargingDecision::Block {
-                cause: BlockCause::ThermalEmergency
-            }
-        );
-        let opts = hardware::ReconcileOptions {
-            bypass_retry_delay: is_emergency,
-            force_verification: is_emergency || ctx.sched.force_hardware_verification,
-        };
-
-        match hardware::reconcile(
-            desired_hw,
-            &mut ctx.hardware_track,
-            ctx.has_distinct_bypass,
-            opts,
-            now_eval,
-        ) {
-            hardware::ReconcileResult::Stable(actual)
-            | hardware::ReconcileResult::Changed(actual) => {
-                ctx.sched.clear_hardware_verification_request();
-
-                if ctx.diag.last_decision.as_ref() != Some(&decision)
-                    || ctx.diag.last_hw_mode != Some(actual)
-                {
-                    tracing::info!(?decision, ?desired_hw, ?actual, "State transition updated");
-                    ctx.diag.last_decision = Some(decision.clone());
-                    ctx.diag.last_hw_mode = Some(actual);
-
-                    if let Ok(mut hw) = diagnostics.hardware_state.write() {
-                        *hw = format!("{actual:?}");
+            // Optimasi: Skip pembacaan sensor snapshot sysfs jika charger tidak terhubung
+            // atau masih dalam masa backoff karena pembacaan sebelumnya gagal.
+            let sample = if power_state.is_plugged_in() && can_retry_sample {
+                match Sample::read(power_state, now_eval) {
+                    Ok(s) => {
+                        ctx.sched.mark_snapshot_success();
+                        ctx.adaptive_scheduler.update_sample(&s);
+                        Some(s)
                     }
-                } else if ctx
-                    .diag
-                    .last_heartbeat_log
-                    .is_none_or(|t| now_eval.duration_since(t) >= Duration::from_secs(300))
-                {
-                    tracing::debug!(?decision, ?actual, "Heartbeat status check OK");
-                    ctx.diag.last_heartbeat_log = Some(now_eval);
-                }
-            }
-            // Skipped = desired was NoChange, hardware not actually verified.
-            // Do NOT consume force_verification so it persists until hardware
-            // is truly read (e.g. after charger is attached).
-            hardware::ReconcileResult::Skipped(actual) => {
-                if ctx.diag.last_decision.as_ref() != Some(&decision)
-                    || ctx.diag.last_hw_mode != Some(actual)
-                {
-                    tracing::info!(?decision, ?desired_hw, ?actual, "State transition updated");
-                    ctx.diag.last_decision = Some(decision.clone());
-                    ctx.diag.last_hw_mode = Some(actual);
-
-                    if let Ok(mut hw) = diagnostics.hardware_state.write() {
-                        *hw = format!("{actual:?}");
+                    Err(error) => {
+                        tracing::warn!(error = %error, "Failed reading battery snapshot");
+                        let backoff = ctx.sched.mark_snapshot_failure();
+                        ctx.observed.mark_sample_failed(now_eval + backoff);
+                        None
                     }
                 }
-            }
-            hardware::ReconcileResult::Deferred => {}
-            hardware::ReconcileResult::Failed(error) => {
-                ctx.sched.clear_hardware_verification_request();
+            } else {
+                None
+            };
 
-                if let hardware::HardwareStatus::Fault { error: fault, .. } =
-                    ctx.hardware_track.status
-                {
-                    if ctx.diag.should_log_error(fault, now_eval) {
-                        tracing::warn!(?fault, error = %error, "Hardware reconciliation failed");
+            ctx.observed.update(power_state, sample, now_eval);
+
+            if let Ok(mut ps) = diagnostics.power_state.write() {
+                *ps = format!("{power_state:?}");
+            }
+            if let Some(s) = &ctx.observed.sample {
+                diagnostics
+                    .battery_level_percent
+                    .store(s.capacity as u8, Ordering::Relaxed);
+                diagnostics
+                    .battery_temperature_dc
+                    .store((s.temperature_c * 10.0) as i32, Ordering::Relaxed);
+            } else {
+                diagnostics
+                    .battery_level_percent
+                    .store(255, Ordering::Relaxed);
+                diagnostics
+                    .battery_temperature_dc
+                    .store(i32::MIN, Ordering::Relaxed);
+            }
+
+            // 3. Evaluasi Policy Engine
+            ctx.policy_result =
+                policy::evaluate_policy(&ctx.observed, &ctx.config, &ctx.policy_result, &mut ctx.policy_runtime, now_eval);
+
+            // 4. Resolve Decision & Map to Desired Hardware State
+            let decision =
+                ChargingDecision::resolve(&ctx.observed, &ctx.intent, &ctx.policy_result, now_eval);
+            let desired_hw = decision.to_desired_hardware();
+
+            // 5. Rekonsiliasi Hardware (Idempotent Sysfs Write & Event-Driven Verification)
+            let is_emergency = matches!(
+                decision,
+                ChargingDecision::Block {
+                    cause: BlockCause::ThermalEmergency
+                }
+            );
+            let opts = hardware::ReconcileOptions {
+                bypass_retry_delay: is_emergency,
+                force_verification: is_emergency || ctx.sched.force_hardware_verification,
+            };
+
+            match hardware::reconcile(
+                desired_hw,
+                &mut ctx.hardware_track,
+                ctx.has_distinct_bypass,
+                opts,
+                now_eval,
+            ) {
+                hardware::ReconcileResult::Stable(actual)
+                | hardware::ReconcileResult::Changed(actual) => {
+                    ctx.sched.clear_hardware_verification_request();
+
+                    if ctx.diag.last_decision.as_ref() != Some(&decision)
+                        || ctx.diag.last_hw_mode != Some(actual)
+                    {
+                        tracing::info!(?decision, ?desired_hw, ?actual, "State transition updated");
+                        ctx.diag.last_decision = Some(decision.clone());
+                        ctx.diag.last_hw_mode = Some(actual);
+
+                        if let Ok(mut hw) = diagnostics.hardware_state.write() {
+                            *hw = format!("{actual:?}");
+                        }
+                    } else if ctx
+                        .diag
+                        .last_heartbeat_log
+                        .is_none_or(|t| now_eval.duration_since(t) >= Duration::from_secs(300))
+                    {
+                        tracing::debug!(?decision, ?actual, "Heartbeat status check OK");
+                        ctx.diag.last_heartbeat_log = Some(now_eval);
+                    }
+                }
+                // Skipped = desired was NoChange, hardware not actually verified.
+                hardware::ReconcileResult::Skipped(actual) => {
+                    if ctx.diag.last_decision.as_ref() != Some(&decision)
+                        || ctx.diag.last_hw_mode != Some(actual)
+                    {
+                        tracing::info!(?decision, ?desired_hw, ?actual, "State transition updated");
+                        ctx.diag.last_decision = Some(decision.clone());
+                        ctx.diag.last_hw_mode = Some(actual);
+
+                        if let Ok(mut hw) = diagnostics.hardware_state.write() {
+                            *hw = format!("{actual:?}");
+                        }
+                    }
+                }
+                hardware::ReconcileResult::Deferred => {}
+                hardware::ReconcileResult::Failed(error) => {
+                    ctx.sched.clear_hardware_verification_request();
+
+                    if let hardware::HardwareStatus::Fault { error: fault, .. } =
+                        ctx.hardware_track.status
+                    {
+                        if ctx.diag.should_log_error(fault, now_eval) {
+                            tracing::warn!(?fault, error = %error, "Hardware reconciliation failed");
+                        }
                     }
                 }
             }
-        }
 
-        ctx.clear_evaluation_request();
+            ctx.clear_evaluation_request();
+        }
 
         // 6. Konsolidasi Earliest Deadline
         let earliest_deadline = [
@@ -434,7 +448,12 @@ pub fn run_monitor_loop(
         .flatten()
         .min();
 
-        let decision_urgency = decision.to_urgency();
+        let decision_urgency = ctx
+            .diag
+            .last_decision
+            .as_ref()
+            .map(|d| d.to_urgency())
+            .unwrap_or(Urgency::Idle);
         let retry_urgency = if has_pending_recovery_deadline(&ctx, now_eval) {
             Urgency::Recovery
         } else {
@@ -493,12 +512,11 @@ pub fn run_monitor_loop(
         let wake_now = Instant::now();
 
         if events.is_empty() {
-            handle_event(&mut ctx, MonitorEvent::ForceWake, wake_now);
-            continue;
-        }
-
-        let mut batch = UeventBatch::default();
-        let mut ipc_shutdown = false;
+            // Poll timeout (deadline atau interval monitoring telah tiba)
+            ctx.mark_evaluation_requested();
+        } else {
+            let mut batch = UeventBatch::default();
+            let mut ipc_shutdown = false;
 
         for event in events.iter() {
             match event.token() {
@@ -652,6 +670,7 @@ pub fn run_monitor_loop(
         }
     }
 }
+}
 
 #[cfg(not(unix))]
 pub fn run_monitor_loop(
@@ -703,7 +722,7 @@ fn setup_netlink_socket() -> Option<RawFd> {
     }
 }
 
-fn classify_uevent(data: &[u8]) -> UeventKind {
+pub(crate) fn classify_uevent(data: &[u8]) -> UeventKind {
     let mut subsystem: Option<&[u8]> = None;
     let mut devpath: Option<&[u8]> = None;
     let mut power_supply_name: Option<&[u8]> = None;

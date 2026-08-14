@@ -83,25 +83,54 @@ impl PolicyResult {
     }
 }
 
+/// State machine eksplisit untuk charge-limit lifecycle.
+///
+/// ```text
+/// NORMAL
+///   │ SOC >= charge_limit
+///   ▼
+/// GRACE(started_at)
+///   │ SOC < limit → NORMAL (timer reset)
+///   │ elapsed >= 5m → SUSPENDED
+///   ▼
+/// SUSPENDED
+///   │ SOC <= resume_limit → NORMAL
+/// ```
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum ChargeLimitState {
+    /// SOC di bawah charge_limit; tidak ada timer aktif.
+    #[default]
+    Normal,
+
+    /// SOC >= charge_limit; menunggu grace period sebelum suspend.
+    Grace { started_at: Instant },
+
+    /// Grace period habis; charging diblokir hingga SOC <= resume_limit.
+    Suspended,
+}
+
 /// Temporal state terpisah dari PolicyResult (pure bitmask).
-/// Menyimpan informasi waktu yang diperlukan policy tanpa mencemari PolicyResult.
+/// Menyimpan state machine charge-limit tanpa mencemari PolicyResult.
 #[derive(Debug, Clone, Copy, Default)]
 pub struct PolicyRuntime {
-    /// Start of the current continuous interval where SOC >= charge_limit.
-    pub charge_limit_grace_started_at: Option<Instant>,
+    pub charge_limit_state: ChargeLimitState,
 }
 
 impl PolicyRuntime {
     pub fn clear(&mut self) {
-        self.charge_limit_grace_started_at = None;
+        self.charge_limit_state = ChargeLimitState::Normal;
     }
 
     /// Deadline kapan charge-limit grace period berakhir.
-    /// Digunakan sebagai earliest wake-up target; actual evaluation
-    /// may occur slightly after the deadline due to polling granularity.
+    /// Hanya relevan saat state = Grace. Saat Suspended, grace timer sudah tidak aktif.
+    /// Digunakan sebagai earliest wake-up target oleh scheduler.
     pub fn charge_limit_deadline(&self) -> Option<Instant> {
-        self.charge_limit_grace_started_at
-            .map(|t| t + CHARGE_LIMIT_SUSPEND_DELAY)
+        match self.charge_limit_state {
+            ChargeLimitState::Grace { started_at } => Some(started_at + CHARGE_LIMIT_SUSPEND_DELAY),
+            // Suspended: tidak ada deadline timer aktif.
+            // Normal: tidak relevan.
+            _ => None,
+        }
     }
 }
 
@@ -115,9 +144,14 @@ pub fn evaluate_policy(
 ) -> PolicyResult {
     let mut next_result = *current_result;
 
-    // 1. Jika charger dicabut, bersihkan semua blokir policy
+    // 1. Jika charger dicabut, bersihkan semua blokir policy.
+    // - Jika dalam Grace: batalkan grace timer ke Normal (karena charging terputus fisik).
+    // - Jika dalam Suspended: PERTAHANKAN state agar persist melewati siklus detach/attach
+    //   sehingga re-attach dengan SOC masih di atas resume_limit tetap diblokir.
     if !observed.connection.is_connected() {
-        runtime.clear();
+        if matches!(runtime.charge_limit_state, ChargeLimitState::Grace { .. }) {
+            runtime.charge_limit_state = ChargeLimitState::Normal;
+        }
         return PolicyResult::clear();
     }
 
@@ -128,10 +162,10 @@ pub fn evaluate_policy(
             s
         }
         _ => {
-            // Sensor stale: timer charge-limit harus reset karena
-            // daemon kehilangan observability — tidak boleh mengklaim
-            // "SOC >= limit selama 5 menit" tanpa data segar.
-            runtime.charge_limit_grace_started_at = None;
+            // Sensor stale: reset charge-limit state karena daemon kehilangan
+            // observability — tidak boleh mengklaim "SOC >= limit selama 5 menit"
+            // tanpa data segar.
+            runtime.clear();
             next_result.add(PolicyBlock::SensorStale);
             return next_result;
         }
@@ -162,14 +196,7 @@ pub fn evaluate_policy(
     }
 
     // 5. Evaluasi SOC Charge Limit Policy dengan Grace Period + Hysteresis
-    let (is_limit_blocked, new_reached_at) = evaluate_limit_block(
-        sample,
-        config,
-        current_result.is_blocked_by(PolicyBlock::ChargeLimit),
-        runtime.charge_limit_grace_started_at,
-        now,
-    );
-    runtime.charge_limit_grace_started_at = new_reached_at;
+    let is_limit_blocked = evaluate_limit_block(sample, config, runtime, now);
     if is_limit_blocked {
         next_result.add(PolicyBlock::ChargeLimit);
     } else {
@@ -204,22 +231,24 @@ fn evaluate_thermal_block(sample: Sample, config: &Config, currently_blocked: bo
     }
 }
 
-/// Evaluasi SOC Charge Limit dengan Grace Period temporal.
+/// Evaluasi SOC Charge Limit dengan state machine eksplisit.
 ///
 /// Semantik:
-/// - Sudah blocked → pertahankan selama SOC >= resume_soc (hysteresis).
-/// - Belum blocked, SOC < limit → timer reset.
-/// - Belum blocked, SOC >= limit → catat reached_at, block hanya setelah grace period (5 menit).
+/// - `Normal`:    SOC < limit → Normal. SOC >= limit → Grace(now).
+/// - `Grace`:     SOC < limit → Normal (reset). elapsed >= 5m → Suspended. Else → Grace.
+/// - `Suspended`: SOC > resume_soc → Suspended. SOC <= resume_soc → Normal.
+///
+/// Boundary resume: `SOC <= resume_soc` → unblock (inklusif di resume_limit).
 fn evaluate_limit_block(
     sample: Sample,
     config: &Config,
-    currently_blocked: bool,
-    reached_at: Option<Instant>,
+    runtime: &mut PolicyRuntime,
     now: Instant,
-) -> (bool, Option<Instant>) {
+) -> bool {
     let limit_soc = config.charge_limit as f32;
     if limit_soc <= 0.0 {
-        return (false, None);
+        runtime.charge_limit_state = ChargeLimitState::Normal;
+        return false;
     }
 
     let current_soc = sample.capacity;
@@ -230,30 +259,40 @@ fn evaluate_limit_block(
         (limit_soc - 2.0).max(0.0)
     };
 
-    // Sudah blocked: pertahankan selama SOC >= resume_soc (hysteresis standar)
-    if currently_blocked {
-        if current_soc >= resume_soc {
-            return (true, reached_at);
+    match runtime.charge_limit_state {
+        ChargeLimitState::Suspended => {
+            if current_soc > resume_soc {
+                // SOC masih di atas resume_limit → tetap Suspended
+                true
+            } else {
+                // SOC <= resume_limit: Suspended → Normal, charging kembali diizinkan
+                runtime.charge_limit_state = ChargeLimitState::Normal;
+                false
+            }
         }
-        // SOC turun di bawah resume → unblock dan reset timer
-        return (false, None);
-    }
 
-    // Belum blocked: SOC belum mencapai limit
-    if current_soc < limit_soc {
-        return (false, None);
-    }
+        ChargeLimitState::Grace { started_at } => {
+            if current_soc < limit_soc {
+                // SOC turun di bawah limit → Grace → Normal, timer reset
+                runtime.charge_limit_state = ChargeLimitState::Normal;
+                false
+            } else if now.duration_since(started_at) >= CHARGE_LIMIT_SUSPEND_DELAY {
+                // Grace period habis → Grace → Suspended
+                runtime.charge_limit_state = ChargeLimitState::Suspended;
+                true
+            } else {
+                // Masih dalam grace period → tetap Grace, belum block
+                false
+            }
+        }
 
-    // SOC >= limit: mulai/lanjutkan timer grace period
-    let first_reached = reached_at.unwrap_or(now);
-    let elapsed = now.duration_since(first_reached);
-
-    if elapsed >= CHARGE_LIMIT_SUSPEND_DELAY {
-        // Grace period selesai → aktifkan ChargeLimit block
-        (true, Some(first_reached))
-    } else {
-        // Masih dalam grace period → belum block, timer tetap berjalan
-        (false, Some(first_reached))
+        ChargeLimitState::Normal => {
+            if current_soc >= limit_soc {
+                // Baru mencapai limit → Normal → Grace
+                runtime.charge_limit_state = ChargeLimitState::Grace { started_at: now };
+            }
+            // State Normal tidak pernah menghasilkan block
+            false
+        }
     }
 }
-

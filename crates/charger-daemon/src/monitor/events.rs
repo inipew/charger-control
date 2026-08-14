@@ -1,7 +1,6 @@
 use std::time::Instant;
 
 use crate::ipc::DaemonCommand;
-use crate::monitor::PolicyResult;
 
 use super::{intent::OperatingIntent, MonitorContext};
 
@@ -27,8 +26,6 @@ pub enum MonitorEvent {
     BatteryChanged,
     BmsChanged,
     IpcCommand(DaemonCommand),
-    ConfigReload,
-    ForceWake,
 }
 
 /// Dispatcher Reducer untuk memproses event pada `MonitorContext`.
@@ -42,15 +39,13 @@ pub fn handle_event(ctx: &mut MonitorContext, event: MonitorEvent, now: Instant)
             ctx.mark_evaluation_requested();
         }
         MonitorEvent::ChargerDetached => {
-            ctx.reset_charger_state();
+            ctx.reset_on_detach();
             ctx.hardware_track.reset_on_disconnect();
             ctx.observed.clear_sample();
             ctx.mark_evaluation_requested();
         }
         MonitorEvent::BatteryChanged | MonitorEvent::BmsChanged => {
-            if ctx.observed.connection.is_connected() {
-                ctx.mark_evaluation_requested();
-            }
+            ctx.mark_evaluation_requested();
         }
         MonitorEvent::IpcCommand(cmd) => match cmd {
             DaemonCommand::BypassOn => {
@@ -74,23 +69,16 @@ pub fn handle_event(ctx: &mut MonitorContext, event: MonitorEvent, now: Instant)
                 ctx.mark_evaluation_requested();
             }
             DaemonCommand::Reload => {
-                ctx.policy_runtime.clear();
-                ctx.policy_result = PolicyResult::clear();
+                // Tidak clear policy_runtime di sini.
+                // Main loop (mod.rs) sudah mengecek diff config dan clear
+                // ChargeLimitState hanya jika charge_limit/resume_limit/max_temp_dc benar-benar berubah.
+                // Clearing tanpa cek diff akan me-reset state Suspended meski config tidak berubah,
+                // menyebabkan charging resume saat SOC masih di atas resume_limit.
                 ctx.adaptive_scheduler.reset_history();
                 ctx.mark_force_hardware_verification();
                 ctx.mark_evaluation_requested();
             }
             _ => {}
         },
-        MonitorEvent::ConfigReload => {
-            ctx.policy_runtime.clear();
-            ctx.policy_result = PolicyResult::clear();
-            ctx.adaptive_scheduler.reset_history();
-            ctx.mark_force_hardware_verification();
-            ctx.mark_evaluation_requested();
-        }
-        MonitorEvent::ForceWake => {
-            ctx.mark_evaluation_requested();
-        }
     }
 }
