@@ -393,8 +393,8 @@ pub fn get_power_state() -> Result<PowerState, ChargerError> {
         if let Ok(online) = read_sysfs(Path::new(path_str)) {
             source_available = true;
             if online == "1" {
-                let status =
-                    read_sysfs(Path::new(BATTERY_STATUS_NODE)).unwrap_or_else(|_| "Unknown".to_owned());
+                let status = read_sysfs(Path::new(BATTERY_STATUS_NODE))
+                    .unwrap_or_else(|_| "Unknown".to_owned());
 
                 return Ok(if status.eq_ignore_ascii_case("Charging") {
                     PowerState::Charging

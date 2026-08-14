@@ -17,23 +17,31 @@ use std::{os::fd::RawFd, os::unix::net::UnixDatagram};
 #[cfg(not(unix))]
 type RawFd = i32;
 
+#[cfg(unix)]
+use std::sync::atomic::Ordering;
 use std::{
-    sync::{atomic::Ordering, Arc, RwLock},
+    sync::{Arc, RwLock},
     time::{Duration, Instant},
 };
 
-use crate::ipc::{DaemonCommand, DaemonDiagnostics};
-use charger_core::{
-    battery::{control, reader},
-    config::schema::Config,
-};
+#[cfg(unix)]
+use crate::ipc::DaemonCommand;
+use crate::ipc::DaemonDiagnostics;
+#[cfg(unix)]
+use charger_core::battery::reader;
+use charger_core::{battery::control, config::schema::Config};
 
-use decision::{BlockCause, ChargingDecision};
+#[cfg(unix)]
+use decision::BlockCause;
+use decision::ChargingDecision;
+#[cfg(unix)]
 use events::{handle_event, MonitorEvent, UeventKind};
 use hardware::{HardwareFault, HardwareTrack};
 use intent::OperatingIntent;
 use policy::{PolicyResult, PolicyRuntime};
-use reality::{ObservedState, Sample};
+use reality::ObservedState;
+#[cfg(unix)]
+use reality::Sample;
 use scheduler::{AdaptiveScheduler, SchedulingState, Urgency};
 
 /// Penjejak perubahan status diagnostik untuk rate-limiting log & error fingerprinting.
@@ -277,6 +285,9 @@ pub fn run_monitor_loop(
                 if new_config.charge_limit != ctx.config.charge_limit
                     || new_config.resume_limit != ctx.config.resume_limit
                     || new_config.max_temp_dc != ctx.config.max_temp_dc
+                    || new_config.max_charge_current_ma != ctx.config.max_charge_current_ma
+                    || new_config.thermal_throttling_enabled
+                        != ctx.config.thermal_throttling_enabled
                 {
                     ctx.policy_runtime.clear();
                     ctx.policy_result = PolicyResult::clear();
@@ -343,28 +354,51 @@ pub fn run_monitor_loop(
                     .store((s.temperature_c * 10.0) as i32, Ordering::Relaxed);
             } else {
                 if let Ok(cap) = reader::read_capacity() {
-                    diagnostics.battery_level_percent.store(cap, Ordering::Relaxed);
+                    diagnostics
+                        .battery_level_percent
+                        .store(cap, Ordering::Relaxed);
                 }
                 if let Ok(temp_dc) = reader::read_temperature_dc() {
-                    diagnostics.battery_temperature_dc.store(temp_dc, Ordering::Relaxed);
+                    diagnostics
+                        .battery_temperature_dc
+                        .store(temp_dc, Ordering::Relaxed);
                 }
             }
 
-            // 3. Evaluasi Policy Engine
-            ctx.policy_result =
-                policy::evaluate_policy(&ctx.observed, &ctx.config, &ctx.policy_result, &mut ctx.policy_runtime, now_eval);
+            // 3. Evaluasi Policy Engine & Stepped Thermal Regulation
+            if let Some(s) = &ctx.observed.sample {
+                let temp_dc = (s.temperature_c * 10.0) as i32;
+                policy::evaluate_thermal_stepping(
+                    temp_dc,
+                    &ctx.config,
+                    &mut ctx.policy_runtime,
+                    now_eval,
+                );
+            }
+
+            ctx.policy_result = policy::evaluate_policy(
+                &ctx.observed,
+                &ctx.config,
+                &ctx.policy_result,
+                &mut ctx.policy_runtime,
+                now_eval,
+            );
 
             // 4. Resolve Decision & Map to Desired Hardware State
             let decision =
                 ChargingDecision::resolve(&ctx.observed, &ctx.intent, &ctx.policy_result, now_eval);
             let desired_hw = decision.to_desired_hardware();
+            let current_reg =
+                decision::resolve_current_regulation(&ctx.config, &ctx.policy_runtime, &decision);
 
             if let Ok(mut fsm) = diagnostics.fsm_state.write() {
                 *fsm = match &ctx.policy_runtime.charge_limit_state {
                     policy::ChargeLimitState::Normal => "Normal (Charging)".to_string(),
                     policy::ChargeLimitState::Grace { started_at } => {
                         let elapsed = now_eval.duration_since(*started_at);
-                        let remaining = policy::CHARGE_LIMIT_SUSPEND_DELAY.saturating_sub(elapsed).as_secs();
+                        let remaining = policy::CHARGE_LIMIT_SUSPEND_DELAY
+                            .saturating_sub(elapsed)
+                            .as_secs();
                         format!("Grace Period ({remaining}s remaining top-off)")
                     }
                     policy::ChargeLimitState::Suspended => "Suspended (Limit reached)".to_string(),
@@ -380,7 +414,31 @@ pub fn run_monitor_loop(
                 };
             }
 
-            // 5. Rekonsiliasi Hardware (Idempotent Sysfs Write & Event-Driven Verification)
+            if let Ok(mut cur) = diagnostics.current_regulation.write() {
+                *cur = match &current_reg {
+                    decision::CurrentRegulation::Unconstrained => {
+                        "Unconstrained (Full Speed)".to_string()
+                    }
+                    decision::CurrentRegulation::ConfigLimit { target_ua } => {
+                        format!("User Limit ({} mA)", target_ua / 1000)
+                    }
+                    decision::CurrentRegulation::ThermalThrottle { step, target_ua } => {
+                        format!("Thermal Step {step} ({} mA)", target_ua / 1000)
+                    }
+                    decision::CurrentRegulation::GraceCap { target_ua } => {
+                        format!("Grace Top-Off Cap ({} mA)", target_ua / 1000)
+                    }
+                    decision::CurrentRegulation::Disabled => "Disabled (0 mA)".to_string(),
+                };
+            }
+
+            // 5. Rekonsiliasi Hardware (Binary Switch + Current Limit)
+            hardware::reconcile_current(
+                current_reg,
+                &mut ctx.hardware_track,
+                ctx.sched.force_hardware_verification,
+            );
+
             let is_emergency = matches!(
                 decision,
                 ChargingDecision::Block {
@@ -541,158 +599,158 @@ pub fn run_monitor_loop(
             let mut batch = UeventBatch::default();
             let mut ipc_shutdown = false;
 
-        for event in events.iter() {
-            match event.token() {
-                IPC => loop {
-                    match mio_rx.recv(&mut msg_buf) {
-                        Ok(0) => {
-                            tracing::error!("Internal IPC channel closed unexpectedly");
-                            ipc_shutdown = true;
-                            break;
-                        }
-                        Ok(_len) => {
-                            let cmd_code = msg_buf[0];
-                            match cmd_code {
-                                1 => handle_event(
-                                    &mut ctx,
-                                    MonitorEvent::IpcCommand(DaemonCommand::Reload),
-                                    wake_now,
-                                ),
-                                2 => {
-                                    tracing::info!("Shutdown signal received in monitor loop");
-                                    ipc_shutdown = true;
-                                    break;
+            for event in events.iter() {
+                match event.token() {
+                    IPC => loop {
+                        match mio_rx.recv(&mut msg_buf) {
+                            Ok(0) => {
+                                tracing::error!("Internal IPC channel closed unexpectedly");
+                                ipc_shutdown = true;
+                                break;
+                            }
+                            Ok(_len) => {
+                                let cmd_code = msg_buf[0];
+                                match cmd_code {
+                                    1 => handle_event(
+                                        &mut ctx,
+                                        MonitorEvent::IpcCommand(DaemonCommand::Reload),
+                                        wake_now,
+                                    ),
+                                    2 => {
+                                        tracing::info!("Shutdown signal received in monitor loop");
+                                        ipc_shutdown = true;
+                                        break;
+                                    }
+                                    3 => handle_event(
+                                        &mut ctx,
+                                        MonitorEvent::IpcCommand(DaemonCommand::BypassOn),
+                                        wake_now,
+                                    ),
+                                    4 => handle_event(
+                                        &mut ctx,
+                                        MonitorEvent::IpcCommand(DaemonCommand::BypassOff),
+                                        wake_now,
+                                    ),
+                                    5 => handle_event(
+                                        &mut ctx,
+                                        MonitorEvent::IpcCommand(DaemonCommand::DisableOn),
+                                        wake_now,
+                                    ),
+                                    6 => handle_event(
+                                        &mut ctx,
+                                        MonitorEvent::IpcCommand(DaemonCommand::DisableOff),
+                                        wake_now,
+                                    ),
+                                    _ => {}
                                 }
-                                3 => handle_event(
-                                    &mut ctx,
-                                    MonitorEvent::IpcCommand(DaemonCommand::BypassOn),
-                                    wake_now,
-                                ),
-                                4 => handle_event(
-                                    &mut ctx,
-                                    MonitorEvent::IpcCommand(DaemonCommand::BypassOff),
-                                    wake_now,
-                                ),
-                                5 => handle_event(
-                                    &mut ctx,
-                                    MonitorEvent::IpcCommand(DaemonCommand::DisableOn),
-                                    wake_now,
-                                ),
-                                6 => handle_event(
-                                    &mut ctx,
-                                    MonitorEvent::IpcCommand(DaemonCommand::DisableOff),
-                                    wake_now,
-                                ),
-                                _ => {}
+                            }
+                            Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                                break;
+                            }
+                            Err(e) => {
+                                tracing::error!(error = %e, "IPC recv error");
+                                break;
                             }
                         }
-                        Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
-                            break;
-                        }
-                        Err(e) => {
-                            tracing::error!(error = %e, "IPC recv error");
-                            break;
-                        }
-                    }
-                },
-                NETLINK => {
-                    if event.is_error() || event.is_read_closed() {
-                        batch.netlink_broken = true;
-                    } else if event.is_readable() {
-                        if let Some(nl_fd) = netlink_fd {
-                            let mut buf = [0u8; 8192];
-                            loop {
-                                let res = unsafe {
-                                    libc::recv(
-                                        nl_fd,
-                                        buf.as_mut_ptr() as *mut libc::c_void,
-                                        buf.len(),
-                                        libc::MSG_DONTWAIT,
-                                    )
-                                };
-                                if res < 0 {
-                                    let err = std::io::Error::last_os_error();
-                                    match err.raw_os_error() {
-                                        // Buffer exhausted: treat as recoverable overflow.
-                                        #[cfg(target_os = "android")]
-                                        Some(libc::ENOBUFS) => {
-                                            batch.overflow = true;
-                                            break;
-                                        }
-                                        // No more data available right now.
-                                        Some(libc::EAGAIN) => {
-                                            break;
-                                        }
-                                        // Fatal socket error — socket must be recreated.
-                                        _ => {
-                                            tracing::warn!(
-                                                error = %err,
-                                                "Netlink recv fatal error, marking socket broken"
-                                            );
-                                            batch.netlink_broken = true;
-                                            break;
+                    },
+                    NETLINK => {
+                        if event.is_error() || event.is_read_closed() {
+                            batch.netlink_broken = true;
+                        } else if event.is_readable() {
+                            if let Some(nl_fd) = netlink_fd {
+                                let mut buf = [0u8; 8192];
+                                loop {
+                                    let res = unsafe {
+                                        libc::recv(
+                                            nl_fd,
+                                            buf.as_mut_ptr() as *mut libc::c_void,
+                                            buf.len(),
+                                            libc::MSG_DONTWAIT,
+                                        )
+                                    };
+                                    if res < 0 {
+                                        let err = std::io::Error::last_os_error();
+                                        match err.raw_os_error() {
+                                            // Buffer exhausted: treat as recoverable overflow.
+                                            #[cfg(target_os = "android")]
+                                            Some(libc::ENOBUFS) => {
+                                                batch.overflow = true;
+                                                break;
+                                            }
+                                            // No more data available right now.
+                                            Some(libc::EAGAIN) => {
+                                                break;
+                                            }
+                                            // Fatal socket error — socket must be recreated.
+                                            _ => {
+                                                tracing::warn!(
+                                                    error = %err,
+                                                    "Netlink recv fatal error, marking socket broken"
+                                                );
+                                                batch.netlink_broken = true;
+                                                break;
+                                            }
                                         }
                                     }
-                                }
-                                if res == 0 {
-                                    break;
-                                }
-                                let bytes_read = res as usize;
-                                match classify_uevent(&buf[..bytes_read]) {
-                                    UeventKind::Ac => batch.ac = true,
-                                    UeventKind::Usb => batch.usb = true,
-                                    UeventKind::TypeC => batch.typec = true,
-                                    UeventKind::Battery => batch.battery = true,
-                                    UeventKind::Bms => batch.bms = true,
-                                    UeventKind::Other => {}
+                                    if res == 0 {
+                                        break;
+                                    }
+                                    let bytes_read = res as usize;
+                                    match classify_uevent(&buf[..bytes_read]) {
+                                        UeventKind::Ac => batch.ac = true,
+                                        UeventKind::Usb => batch.usb = true,
+                                        UeventKind::TypeC => batch.typec = true,
+                                        UeventKind::Battery => batch.battery = true,
+                                        UeventKind::Bms => batch.bms = true,
+                                        UeventKind::Other => {}
+                                    }
                                 }
                             }
                         }
                     }
+                    _ => {}
                 }
-                _ => {}
             }
-        }
 
-        if ipc_shutdown {
-            return;
-        }
+            if ipc_shutdown {
+                return;
+            }
 
-        if batch.ac {
-            handle_event(&mut ctx, MonitorEvent::AcChanged, wake_now);
-        }
-        if batch.usb {
-            handle_event(&mut ctx, MonitorEvent::UsbChanged, wake_now);
-        }
-        if batch.typec {
-            handle_event(&mut ctx, MonitorEvent::TypeCChanged, wake_now);
-        }
-        if batch.battery {
-            handle_event(&mut ctx, MonitorEvent::BatteryChanged, wake_now);
-        }
-        if batch.bms {
-            handle_event(&mut ctx, MonitorEvent::BmsChanged, wake_now);
-        }
-        if batch.overflow {
-            ctx.hardware_track.mark_verification_needed();
-            ctx.mark_evaluation_requested();
-        }
-        if batch.netlink_broken {
-            ctx.hardware_track.mark_verification_needed();
-            ctx.mark_force_hardware_verification();
-            ctx.mark_evaluation_requested();
-            if let Some(fd) = netlink_fd.take() {
-                let mut source = SourceFd(&fd);
-                let _ = poll.registry().deregister(&mut source);
-                unsafe { libc::close(fd) };
-                tracing::warn!("Netlink socket broken, will recreate on next loop");
-                diagnostics
-                    .netlink_available
-                    .store(false, Ordering::Relaxed);
+            if batch.ac {
+                handle_event(&mut ctx, MonitorEvent::AcChanged, wake_now);
+            }
+            if batch.usb {
+                handle_event(&mut ctx, MonitorEvent::UsbChanged, wake_now);
+            }
+            if batch.typec {
+                handle_event(&mut ctx, MonitorEvent::TypeCChanged, wake_now);
+            }
+            if batch.battery {
+                handle_event(&mut ctx, MonitorEvent::BatteryChanged, wake_now);
+            }
+            if batch.bms {
+                handle_event(&mut ctx, MonitorEvent::BmsChanged, wake_now);
+            }
+            if batch.overflow {
+                ctx.hardware_track.mark_verification_needed();
+                ctx.mark_evaluation_requested();
+            }
+            if batch.netlink_broken {
+                ctx.hardware_track.mark_verification_needed();
+                ctx.mark_force_hardware_verification();
+                ctx.mark_evaluation_requested();
+                if let Some(fd) = netlink_fd.take() {
+                    let mut source = SourceFd(&fd);
+                    let _ = poll.registry().deregister(&mut source);
+                    unsafe { libc::close(fd) };
+                    tracing::warn!("Netlink socket broken, will recreate on next loop");
+                    diagnostics
+                        .netlink_available
+                        .store(false, Ordering::Relaxed);
+                }
             }
         }
     }
-}
 }
 
 #[cfg(not(unix))]
@@ -745,5 +803,5 @@ fn setup_netlink_socket() -> Option<RawFd> {
     }
 }
 
+#[cfg(test)]
 pub(crate) use charger_core::battery::uevent::classify_uevent;
-

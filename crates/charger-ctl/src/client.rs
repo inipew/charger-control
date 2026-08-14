@@ -1,5 +1,6 @@
 use std::time::Duration;
 
+#[cfg(unix)]
 use charger_core::config::schema::DEFAULT_SOCKET_PATH;
 
 #[cfg(unix)]

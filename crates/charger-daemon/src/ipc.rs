@@ -1,10 +1,13 @@
 #[cfg(unix)]
+use std::io::{Read, Write};
+#[cfg(unix)]
 use std::os::unix::net::{UnixDatagram, UnixListener, UnixStream};
+#[cfg(unix)]
+use std::sync::atomic::Ordering;
 use std::{
-    io::{Read, Write},
     path::Path,
     sync::{
-        atomic::{AtomicBool, AtomicI32, AtomicU64, AtomicU8, Ordering},
+        atomic::{AtomicBool, AtomicI32, AtomicU64, AtomicU8},
         Arc, RwLock,
     },
     time::Duration,
@@ -34,6 +37,7 @@ pub struct DaemonDiagnostics {
     pub hardware_state: RwLock<String>,
     pub fsm_state: RwLock<String>,
     pub target_decision: RwLock<String>,
+    pub current_regulation: RwLock<String>,
 }
 
 impl DaemonDiagnostics {
@@ -49,6 +53,7 @@ impl DaemonDiagnostics {
             hardware_state: RwLock::new("Unknown".to_string()),
             fsm_state: RwLock::new("Normal".to_string()),
             target_decision: RwLock::new("Allow".to_string()),
+            current_regulation: RwLock::new("Unconstrained".to_string()),
         }
     }
 }
@@ -575,7 +580,12 @@ fn handle_status(
         .read()
         .unwrap_or_else(|p| p.into_inner());
     let power_state = ps_guard.clone();
-    drop(ps_guard);
+    let cur_guard = diagnostics
+        .current_regulation
+        .read()
+        .unwrap_or_else(|p| p.into_inner());
+    let current_regulation = cur_guard.clone();
+    drop(cur_guard);
 
     let netlink_available = diagnostics.netlink_available.load(Ordering::Relaxed);
     let is_idle = diagnostics.is_idle.load(Ordering::Relaxed);
@@ -606,6 +616,12 @@ fn handle_status(
 
     let backoff_str = format!("{:.1}s", backoff_ms as f32 / 1000.0);
 
+    let max_current_str = if config_guard.max_charge_current_ma == 0 {
+        "Unconstrained (Full Speed)".to_string()
+    } else {
+        format!("{} mA", config_guard.max_charge_current_ma)
+    };
+
     let message = format!(
         "OK:\n\
          [ DAEMON STATUS ]\n\
@@ -618,6 +634,7 @@ fn handle_status(
          • FSM State    : {}\n\
          • Target Action: {}\n\
          • Hardware     : {}\n\
+         • Current Reg  : {}\n\
          \n\
          [ MONITOR DIAGNOSTICS ]\n\
          • Mode         : {}\n\
@@ -634,6 +651,8 @@ fn handle_status(
          • Enabled      : {}\n\
          • Charge Limit : {}%\n\
          • Resume Limit : {}%\n\
+         • Max Current  : {}\n\
+         • Thermal Reg  : {}\n\
          • Thermal Cut  : {}\n\
          • Max Temp     : {:.1} C",
         if config_guard.enabled {
@@ -647,6 +666,7 @@ fn handle_status(
         fsm_state,
         target_decision,
         hardware,
+        current_regulation,
         mode_str,
         netlink_str,
         interval_str,
@@ -657,6 +677,12 @@ fn handle_status(
         config_guard.enabled,
         config_guard.charge_limit,
         config_guard.resume_limit,
+        max_current_str,
+        if config_guard.thermal_throttling_enabled {
+            "ON (Stepped)"
+        } else {
+            "OFF"
+        },
         if config_guard.thermal_cutoff {
             "ON"
         } else {
@@ -677,6 +703,7 @@ pub struct DaemonStatusResponse {
     pub mode: String,
     pub fsm_state: String,
     pub target_decision: String,
+    pub current_regulation: String,
     pub hardware_state: String,
     pub netlink_available: bool,
     pub poll_interval_ms: u64,
@@ -686,6 +713,8 @@ pub struct DaemonStatusResponse {
     pub power_state: String,
     pub charge_limit: u8,
     pub resume_limit: u8,
+    pub max_charge_current_ma: u32,
+    pub thermal_throttling_enabled: bool,
     pub thermal_cutoff: bool,
     pub max_temp_c: f32,
 }
@@ -719,6 +748,13 @@ fn handle_status_json(
         .unwrap_or_else(|p| p.into_inner());
     let target_decision = dec_guard.clone();
     drop(dec_guard);
+
+    let cur_guard = diagnostics
+        .current_regulation
+        .read()
+        .unwrap_or_else(|p| p.into_inner());
+    let current_regulation = cur_guard.clone();
+    drop(cur_guard);
 
     let hw_guard = diagnostics
         .hardware_state
@@ -769,6 +805,7 @@ fn handle_status_json(
         mode: mode_str.to_string(),
         fsm_state,
         target_decision,
+        current_regulation,
         hardware_state,
         netlink_available,
         poll_interval_ms: interval_ms,
@@ -778,6 +815,8 @@ fn handle_status_json(
         power_state,
         charge_limit: config_guard.charge_limit,
         resume_limit: config_guard.resume_limit,
+        max_charge_current_ma: config_guard.max_charge_current_ma,
+        thermal_throttling_enabled: config_guard.thermal_throttling_enabled,
         thermal_cutoff: config_guard.thermal_cutoff,
         max_temp_c: config_guard.max_temp_dc as f32 / 10.0,
     };

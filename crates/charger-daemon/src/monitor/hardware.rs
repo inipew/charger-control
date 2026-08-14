@@ -76,6 +76,7 @@ pub struct HardwareTrack {
     pub last_verified_obs: HardwareObservation,
     pub status: HardwareStatus,
     pub verification_needed: bool,
+    pub applied_current_limit_ua: Option<u32>,
 }
 
 impl HardwareTrack {
@@ -84,6 +85,7 @@ impl HardwareTrack {
             last_verified_obs: HardwareObservation::new(),
             status: HardwareStatus::Unknown,
             verification_needed: true,
+            applied_current_limit_ua: None,
         }
     }
 
@@ -129,6 +131,7 @@ impl HardwareTrack {
         self.status = HardwareStatus::Unknown;
         self.last_verified_obs = HardwareObservation::new();
         self.verification_needed = true;
+        self.applied_current_limit_ua = None;
     }
 }
 
@@ -269,5 +272,30 @@ pub fn reconcile(
         ReconcileResult::Changed(actual_after)
     } else {
         ReconcileResult::Stable(actual_after)
+    }
+}
+
+/// Rekonsiliasi batas arus pengisian daya ke sysfs secara idempotent.
+pub fn reconcile_current(
+    target: super::decision::CurrentRegulation,
+    track: &mut HardwareTrack,
+    force: bool,
+) {
+    let desired_ua = target.target_ua();
+
+    if !force && track.applied_current_limit_ua == desired_ua {
+        return;
+    }
+
+    if let Some(ua) = desired_ua {
+        if let Err(e) = control::set_fast_charge_current(ua) {
+            tracing::warn!(error = %e, target_ua = ua, "Failed setting fast charge current limit");
+        } else {
+            track.applied_current_limit_ua = Some(ua);
+        }
+    } else if track.applied_current_limit_ua.is_some() {
+        // Reset to default hardware maximum
+        let _ = control::reset_fast_charge_current();
+        track.applied_current_limit_ua = None;
     }
 }

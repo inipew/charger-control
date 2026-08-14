@@ -22,6 +22,9 @@ pub fn run(json: bool) -> Result<(), ChargerError> {
             if let Some(target) = data["target_decision"].as_str() {
                 display::key_val("Target Action", target);
             }
+            if let Some(cur_reg) = data["current_regulation"].as_str() {
+                display::key_val("Current Regulation", cur_reg);
+            }
             if let Some(hw) = data["hardware_state"].as_str() {
                 display::key_val("Hardware State", hw);
             }
@@ -60,7 +63,11 @@ pub fn run(json: bool) -> Result<(), ChargerError> {
 
             if let Ok(metrics) = reader::get_battery_metrics() {
                 let sign_str = if metrics.is_charging_flow { "+" } else { "-" };
-                let state_str = if metrics.is_charging_flow { "Charging" } else { "Discharging" };
+                let state_str = if metrics.is_charging_flow {
+                    "Charging"
+                } else {
+                    "Discharging"
+                };
                 display::key_val(
                     "Battery Current",
                     format!("{}{:.1} mA ({})", sign_str, metrics.current_ma, state_str),
@@ -84,6 +91,23 @@ pub fn run(json: bool) -> Result<(), ChargerError> {
                 "Resume Limit",
                 format!("{}%", data["resume_limit"].as_u64().unwrap_or(0)),
             );
+
+            let max_curr = data["max_charge_current_ma"].as_u64().unwrap_or(0);
+            if max_curr > 0 {
+                display::key_val("Max Charge Current", format!("{max_curr} mA"));
+            } else {
+                display::key_val("Max Charge Current", "Unconstrained (Full Speed)");
+            }
+
+            display::key_val(
+                "Thermal Throttling",
+                if data["thermal_throttling_enabled"].as_bool().unwrap_or(true) {
+                    "ON (Stepped)".to_string()
+                } else {
+                    "OFF".to_string()
+                },
+            );
+
             display::key_val(
                 "Thermal Cutoff",
                 if data["thermal_cutoff"].as_bool().unwrap_or(false) {
@@ -158,7 +182,11 @@ pub fn run(json: bool) -> Result<(), ChargerError> {
 
     if let Ok(metrics) = reader::get_battery_metrics() {
         let sign_str = if metrics.is_charging_flow { "+" } else { "-" };
-        let state_str = if metrics.is_charging_flow { "Charging" } else { "Discharging" };
+        let state_str = if metrics.is_charging_flow {
+            "Charging"
+        } else {
+            "Discharging"
+        };
         display::key_val(
             "Battery Current",
             format!("{}{:.1} mA ({})", sign_str, metrics.current_ma, state_str),

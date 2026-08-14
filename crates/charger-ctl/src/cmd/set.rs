@@ -153,3 +153,38 @@ pub fn max_temp(value: i32) -> Result<(), ChargerError> {
 
     Ok(())
 }
+
+pub fn max_current(value: u32) -> Result<(), ChargerError> {
+    if value != 0 && !(500..=10000).contains(&value) {
+        let msg = "Max charge current must be 0 (unconstrained) or between 500 and 10000 mA";
+        display::error(msg);
+        return Err(ChargerError::InvalidInput(msg.to_string()));
+    }
+
+    let mut cfg = load_config()?;
+    cfg.max_charge_current_ma = value;
+    save_config(&cfg)?;
+
+    if value == 0 {
+        display::success("Max charge current set to Unconstrained (Full Speed)");
+    } else {
+        display::success(&format!("Max charge current set to {value} mA"));
+    }
+
+    notify_daemon();
+    Ok(())
+}
+
+pub fn thermal_throttle(enabled: bool) -> Result<(), ChargerError> {
+    let mut cfg = load_config()?;
+    cfg.thermal_throttling_enabled = enabled;
+    save_config(&cfg)?;
+
+    display::success(&format!(
+        "Stepped thermal throttling {}",
+        if enabled { "enabled" } else { "disabled" }
+    ));
+
+    notify_daemon();
+    Ok(())
+}

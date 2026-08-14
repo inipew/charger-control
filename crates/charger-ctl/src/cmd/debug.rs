@@ -1,3 +1,8 @@
+use std::{
+    fs::{self, File, OpenOptions},
+    io::Write,
+    path::{Path, PathBuf},
+};
 #[cfg(unix)]
 use std::{
     sync::{
@@ -5,11 +10,6 @@ use std::{
         Arc,
     },
     time::{Duration, Instant},
-};
-use std::{
-    fs::{self, File, OpenOptions},
-    io::Write,
-    path::{Path, PathBuf},
 };
 
 use charger_core::{
@@ -118,8 +118,14 @@ pub fn run_node_dump(output_file: Option<&Path>) -> Result<(), ChargerError> {
     for entry in entries.flatten() {
         let path = entry.path();
         if path.is_dir() {
-            let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("unknown");
-            logger.log_raw(&format!("\n📂 POWER SUPPLY DEVICE: [{name}] ({})", path.display()));
+            let name = path
+                .file_name()
+                .and_then(|n| n.to_str())
+                .unwrap_or("unknown");
+            logger.log_raw(&format!(
+                "\n📂 POWER SUPPLY DEVICE: [{name}] ({})",
+                path.display()
+            ));
 
             if let Ok(files) = fs::read_dir(&path) {
                 let mut sorted_files: Vec<_> = files.flatten().collect();
@@ -128,7 +134,10 @@ pub fn run_node_dump(output_file: Option<&Path>) -> Result<(), ChargerError> {
                 for file in sorted_files {
                     let file_path = file.path();
                     if file_path.is_file() {
-                        let fname = file_path.file_name().and_then(|n| n.to_str()).unwrap_or("?");
+                        let fname = file_path
+                            .file_name()
+                            .and_then(|n| n.to_str())
+                            .unwrap_or("?");
                         let val_str = fs::read_to_string(&file_path)
                             .map(|s| s.trim().to_string())
                             .unwrap_or_else(|_| "<unreadable>".to_string());
@@ -184,7 +193,10 @@ pub fn run_node_dump(output_file: Option<&Path>) -> Result<(), ChargerError> {
     let detected_suspend = detect_node(SUSPEND_NODES);
     let actual_mode = control::get_actual_charging_state();
 
-    logger.log_raw(&format!("\n• Active Charging Node : {:?}", detected_charging));
+    logger.log_raw(&format!(
+        "\n• Active Charging Node : {:?}",
+        detected_charging
+    ));
     logger.log_raw(&format!("• Active Suspend Node  : {:?}", detected_suspend));
     logger.log_raw(&format!("• Actual Hardware State: {:?}", actual_mode));
     logger.log_raw("===============================================================\n");
@@ -264,7 +276,8 @@ pub fn run_observer(
         r.store(false, Ordering::SeqCst);
     });
 
-    logger.log("[*] Live monitoring started! Silakan colok / cabut charger, atau biarkan charging.");
+    logger
+        .log("[*] Live monitoring started! Silakan colok / cabut charger, atau biarkan charging.");
     logger.log("[*] Tekan Ctrl+C untuk berhenti dan menyimpan log.\n");
 
     // Simulasi State Machine
@@ -329,8 +342,9 @@ pub fn run_observer(
             let volt_res = reader::read_voltage_uv();
             let curr_res = reader::read_battery_current_ua();
             let input_curr_res = reader::read_input_current_ua();
-            let batt_status = reader::read_sysfs(Path::new(charger_core::battery::nodes::BATTERY_STATUS_NODE))
-                .unwrap_or_else(|_| "Unknown".into());
+            let batt_status =
+                reader::read_sysfs(Path::new(charger_core::battery::nodes::BATTERY_STATUS_NODE))
+                    .unwrap_or_else(|_| "Unknown".into());
             let actual_hw = control::get_actual_charging_state();
 
             let soc = capacity_res.unwrap_or(0.0);

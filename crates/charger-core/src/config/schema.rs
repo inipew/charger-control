@@ -41,6 +41,13 @@ pub struct Config {
     /// Polling interval monitor loop (detik)
     pub poll_interval_secs: u64,
 
+    /// Batas arus maksimum pengisian daya (dalam mA).
+    /// 0 = Tidak dibatasi (kecepatan bawaan charger/hardware).
+    pub max_charge_current_ma: u32,
+
+    /// Aktifkan regulasi termal bertingkat adaptif (Stepped Thermal Throttling)
+    pub thermal_throttling_enabled: bool,
+
     /// Path log file
     pub log_path: PathBuf,
 }
@@ -57,6 +64,8 @@ impl Default for Config {
             thermal_cutoff: false,
             max_temp_dc: 420,
             poll_interval_secs: 10,
+            max_charge_current_ma: 0,
+            thermal_throttling_enabled: true,
 
             log_path: PathBuf::from("/data/adb/charger-control/charger-control.log"),
         }
@@ -84,6 +93,11 @@ impl Config {
 
         // Polling interval antara 1 hingga 300 detik
         self.poll_interval_secs = self.poll_interval_secs.clamp(1, 300);
+
+        // Batas arus: 0 = unconstrained, jika > 0 maka di-clamp antara 500 mA s/d 10000 mA (10A)
+        if self.max_charge_current_ma > 0 {
+            self.max_charge_current_ma = self.max_charge_current_ma.clamp(500, 10000);
+        }
     }
 
     pub fn load(path: &PathBuf) -> Result<Self, crate::error::ChargerError> {
@@ -130,6 +144,7 @@ mod tests {
             max_temp_dc: 800,      // invalid > 600
             poll_interval_secs: 0, // invalid < 1
             log_path: PathBuf::from("/tmp/test.log"),
+            ..Config::default()
         };
 
         cfg.validate();
@@ -174,5 +189,27 @@ mod tests {
         };
         above_resume.validate();
         assert_eq!(above_resume.resume_limit, 78);
+
+        // max_charge_current_ma: 0 remains 0, < 500 clamped to 500, > 10000 clamped to 10000
+        let mut current_cfg = Config {
+            max_charge_current_ma: 200, // < 500
+            ..Config::default()
+        };
+        current_cfg.validate();
+        assert_eq!(current_cfg.max_charge_current_ma, 500);
+
+        let mut current_high = Config {
+            max_charge_current_ma: 25000, // > 10000
+            ..Config::default()
+        };
+        current_high.validate();
+        assert_eq!(current_high.max_charge_current_ma, 10000);
+
+        let mut current_zero = Config {
+            max_charge_current_ma: 0,
+            ..Config::default()
+        };
+        current_zero.validate();
+        assert_eq!(current_zero.max_charge_current_ma, 0);
     }
 }

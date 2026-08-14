@@ -1,7 +1,6 @@
-use std::{
-    process::{Command, Stdio},
-    time::{Duration, Instant},
-};
+#[cfg(unix)]
+use std::process::{Command, Stdio};
+use std::time::{Duration, Instant};
 
 use charger_core::error::ChargerError;
 

@@ -6,11 +6,17 @@ mod tests {
 
     use crate::monitor::{
         classify_uevent,
-        decision::{ChargingDecision, DesiredHardwareState, WaitReason},
+        decision::{
+            resolve_current_regulation, BlockCause, ChargingDecision, CurrentRegulation,
+            DesiredHardwareState, WaitReason,
+        },
         events::UeventKind,
-        hardware::{HardwareFault, HardwareStatus, HardwareTrack},
+        hardware::{HardwareFault, HardwareTrack},
         intent::OperatingIntent,
-        policy::{evaluate_policy, ChargeLimitState, PolicyBlock, PolicyResult, PolicyRuntime, CHARGE_LIMIT_SUSPEND_DELAY},
+        policy::{
+            evaluate_policy, evaluate_thermal_stepping, ChargeLimitState, PolicyBlock,
+            PolicyResult, PolicyRuntime, ThermalStep, CHARGE_LIMIT_SUSPEND_DELAY,
+        },
         reality::{ConnectionState, ObservedState, Sample},
         scheduler::Urgency,
     };
@@ -37,7 +43,13 @@ mod tests {
             }),
             now,
         );
-        let _p0 = evaluate_policy(&observed, &config, &PolicyResult::clear(), &mut runtime, now);
+        let _p0 = evaluate_policy(
+            &observed,
+            &config,
+            &PolicyResult::clear(),
+            &mut runtime,
+            now,
+        );
 
         // t=5m: grace period selesai → ChargeLimit blocked
         let after_grace = now + CHARGE_LIMIT_SUSPEND_DELAY;
@@ -106,7 +118,13 @@ mod tests {
         );
         observed.connection = ConnectionState::Attached;
 
-        let policy1 = evaluate_policy(&observed, &config, &PolicyResult::clear(), &mut runtime, now);
+        let policy1 = evaluate_policy(
+            &observed,
+            &config,
+            &PolicyResult::clear(),
+            &mut runtime,
+            now,
+        );
         assert!(policy1.is_blocked_by(PolicyBlock::ThermalEmergency));
 
         now += Duration::from_secs(10);
@@ -366,7 +384,7 @@ mod tests {
         // It relies on the stale threshold.
         let mut observed = ObservedState::new();
         let now = Instant::now();
-        
+
         observed.update(
             charger_core::battery::reader::PowerState::Connected,
             Some(Sample {
@@ -377,14 +395,14 @@ mod tests {
             }),
             now,
         );
-        
+
         // Mark that a subsequent read failed
         let failure_time = now + Duration::from_secs(10);
         observed.mark_sample_failed(failure_time + Duration::from_secs(2));
-        
+
         // Policy should STILL consider it fresh because 10s < 60s
         assert!(observed.has_fresh_sample(failure_time));
-        
+
         // But after 60s from the original sample time, it becomes stale
         let stale_time = now + crate::monitor::reality::SAMPLE_STALE_THRESHOLD;
         assert!(!observed.has_fresh_sample(stale_time));
@@ -412,9 +430,18 @@ mod tests {
         observed.connection = ConnectionState::Attached;
 
         // t=0: SOC >= limit, tapi grace period belum habis → belum block
-        let p1 = evaluate_policy(&observed, &config, &PolicyResult::clear(), &mut runtime, now);
+        let p1 = evaluate_policy(
+            &observed,
+            &config,
+            &PolicyResult::clear(),
+            &mut runtime,
+            now,
+        );
         assert!(!p1.is_blocked_by(PolicyBlock::ChargeLimit));
-        assert!(matches!(runtime.charge_limit_state, ChargeLimitState::Grace { .. }));
+        assert!(matches!(
+            runtime.charge_limit_state,
+            ChargeLimitState::Grace { .. }
+        ));
 
         // t=2m: masih dalam grace → belum block
         let t2 = now + Duration::from_secs(120);
@@ -469,9 +496,18 @@ mod tests {
             }),
             now,
         );
-        let p1 = evaluate_policy(&observed, &config, &PolicyResult::clear(), &mut runtime, now);
+        let p1 = evaluate_policy(
+            &observed,
+            &config,
+            &PolicyResult::clear(),
+            &mut runtime,
+            now,
+        );
         assert!(!p1.is_blocked_by(PolicyBlock::ChargeLimit));
-        assert!(matches!(runtime.charge_limit_state, ChargeLimitState::Grace { .. }));
+        assert!(matches!(
+            runtime.charge_limit_state,
+            ChargeLimitState::Grace { .. }
+        ));
 
         // t=3m: SOC turun ke 99% (< limit) → timer RESET
         let t3 = now + Duration::from_secs(180);
@@ -502,7 +538,10 @@ mod tests {
         );
         let p3 = evaluate_policy(&observed, &config, &p2, &mut runtime, t3);
         assert!(!p3.is_blocked_by(PolicyBlock::ChargeLimit));
-        assert_eq!(runtime.charge_limit_state, ChargeLimitState::Grace { started_at: t3 }); // Timer baru!
+        assert_eq!(
+            runtime.charge_limit_state,
+            ChargeLimitState::Grace { started_at: t3 }
+        ); // Timer baru!
 
         // t=5m dari timer awal (t=0+5m) → seharusnya BELUM block karena timer reset di t=3m
         let t5_from_start = now + CHARGE_LIMIT_SUSPEND_DELAY;
@@ -557,8 +596,17 @@ mod tests {
             }),
             now,
         );
-        let p1 = evaluate_policy(&observed, &config, &PolicyResult::clear(), &mut runtime, now);
-        assert!(matches!(runtime.charge_limit_state, ChargeLimitState::Grace { .. }));
+        let p1 = evaluate_policy(
+            &observed,
+            &config,
+            &PolicyResult::clear(),
+            &mut runtime,
+            now,
+        );
+        assert!(matches!(
+            runtime.charge_limit_state,
+            ChargeLimitState::Grace { .. }
+        ));
 
         // t=61s: sample sekarang stale → timer HARUS reset
         let t_stale = now + crate::monitor::reality::SAMPLE_STALE_THRESHOLD;
@@ -581,18 +629,37 @@ mod tests {
         // 1. t=0: SOC 80% (reach limit)
         observed.update(
             charger_core::battery::reader::PowerState::Connected,
-            Some(Sample { capacity: 80.0, temperature_c: 30.0, power_state: charger_core::battery::reader::PowerState::Connected, timestamp: now }),
+            Some(Sample {
+                capacity: 80.0,
+                temperature_c: 30.0,
+                power_state: charger_core::battery::reader::PowerState::Connected,
+                timestamp: now,
+            }),
             now,
         );
-        let mut p = evaluate_policy(&observed, &config, &PolicyResult::clear(), &mut runtime, now);
+        let mut p = evaluate_policy(
+            &observed,
+            &config,
+            &PolicyResult::clear(),
+            &mut runtime,
+            now,
+        );
         assert!(!p.is_blocked_by(PolicyBlock::ChargeLimit));
-        assert_eq!(runtime.charge_limit_state, ChargeLimitState::Grace { started_at: now });
+        assert_eq!(
+            runtime.charge_limit_state,
+            ChargeLimitState::Grace { started_at: now }
+        );
 
         // 2. t=299s: SOC 80% (almost 5 mins) -> still allowed
         now += Duration::from_secs(299);
         observed.update(
             charger_core::battery::reader::PowerState::Connected,
-            Some(Sample { capacity: 80.0, temperature_c: 30.0, power_state: charger_core::battery::reader::PowerState::Connected, timestamp: now }),
+            Some(Sample {
+                capacity: 80.0,
+                temperature_c: 30.0,
+                power_state: charger_core::battery::reader::PowerState::Connected,
+                timestamp: now,
+            }),
             now,
         );
         p = evaluate_policy(&observed, &config, &p, &mut runtime, now);
@@ -602,7 +669,12 @@ mod tests {
         now += Duration::from_secs(1);
         observed.update(
             charger_core::battery::reader::PowerState::Connected,
-            Some(Sample { capacity: 80.0, temperature_c: 30.0, power_state: charger_core::battery::reader::PowerState::Connected, timestamp: now }),
+            Some(Sample {
+                capacity: 80.0,
+                temperature_c: 30.0,
+                power_state: charger_core::battery::reader::PowerState::Connected,
+                timestamp: now,
+            }),
             now,
         );
         p = evaluate_policy(&observed, &config, &p, &mut runtime, now);
@@ -612,7 +684,12 @@ mod tests {
         now += Duration::from_secs(10);
         observed.update(
             charger_core::battery::reader::PowerState::Connected,
-            Some(Sample { capacity: 77.0, temperature_c: 30.0, power_state: charger_core::battery::reader::PowerState::Connected, timestamp: now }),
+            Some(Sample {
+                capacity: 77.0,
+                temperature_c: 30.0,
+                power_state: charger_core::battery::reader::PowerState::Connected,
+                timestamp: now,
+            }),
             now,
         );
         p = evaluate_policy(&observed, &config, &p, &mut runtime, now);
@@ -623,13 +700,23 @@ mod tests {
         now += Duration::from_secs(10);
         observed.update(
             charger_core::battery::reader::PowerState::Connected,
-            Some(Sample { capacity: 80.0, temperature_c: 30.0, power_state: charger_core::battery::reader::PowerState::Connected, timestamp: now }),
+            Some(Sample {
+                capacity: 80.0,
+                temperature_c: 30.0,
+                power_state: charger_core::battery::reader::PowerState::Connected,
+                timestamp: now,
+            }),
             now,
         );
         let start_time_2 = now;
         p = evaluate_policy(&observed, &config, &p, &mut runtime, now);
         assert!(!p.is_blocked_by(PolicyBlock::ChargeLimit));
-        assert_eq!(runtime.charge_limit_state, ChargeLimitState::Grace { started_at: start_time_2 });
+        assert_eq!(
+            runtime.charge_limit_state,
+            ChargeLimitState::Grace {
+                started_at: start_time_2
+            }
+        );
 
         // 6. t=330s: Disconnect happens! -> everything clears
         now += Duration::from_secs(10);
@@ -643,12 +730,20 @@ mod tests {
         observed.connection = ConnectionState::Attached;
         observed.update(
             charger_core::battery::reader::PowerState::Connected,
-            Some(Sample { capacity: 80.0, temperature_c: 30.0, power_state: charger_core::battery::reader::PowerState::Connected, timestamp: now }),
+            Some(Sample {
+                capacity: 80.0,
+                temperature_c: 30.0,
+                power_state: charger_core::battery::reader::PowerState::Connected,
+                timestamp: now,
+            }),
             now,
         );
         p = evaluate_policy(&observed, &config, &p, &mut runtime, now);
         assert!(!p.is_blocked_by(PolicyBlock::ChargeLimit));
-        assert_eq!(runtime.charge_limit_state, ChargeLimitState::Grace { started_at: now });
+        assert_eq!(
+            runtime.charge_limit_state,
+            ChargeLimitState::Grace { started_at: now }
+        );
     }
 
     #[test]
@@ -676,9 +771,18 @@ mod tests {
         );
 
         // t=0: SOC 80% → timer mulai
-        let p1 = evaluate_policy(&observed, &config, &PolicyResult::clear(), &mut runtime, now);
+        let p1 = evaluate_policy(
+            &observed,
+            &config,
+            &PolicyResult::clear(),
+            &mut runtime,
+            now,
+        );
         assert!(!p1.is_blocked_by(PolicyBlock::ChargeLimit));
-        assert_eq!(runtime.charge_limit_state, ChargeLimitState::Grace { started_at: now });
+        assert_eq!(
+            runtime.charge_limit_state,
+            ChargeLimitState::Grace { started_at: now }
+        );
 
         // Simulasi ConfigReload: charge_limit naik ke 90
         // Runtime di-reset oleh ConfigReload handler (seperti di events.rs)
@@ -705,7 +809,12 @@ mod tests {
 
         // Harus BELUM blocked — timer baru saja dimulai dari `changed`
         assert!(!p2.is_blocked_by(PolicyBlock::ChargeLimit));
-        assert_eq!(runtime.charge_limit_state, ChargeLimitState::Grace { started_at: changed });
+        assert_eq!(
+            runtime.charge_limit_state,
+            ChargeLimitState::Grace {
+                started_at: changed
+            }
+        );
     }
 
     #[test]
@@ -726,16 +835,32 @@ mod tests {
         // Bawa ke Suspended: SOC 80% selama 5 menit
         observed.update(
             charger_core::battery::reader::PowerState::Connected,
-            Some(Sample { capacity: 80.0, temperature_c: 30.0, power_state: charger_core::battery::reader::PowerState::Connected, timestamp: now }),
+            Some(Sample {
+                capacity: 80.0,
+                temperature_c: 30.0,
+                power_state: charger_core::battery::reader::PowerState::Connected,
+                timestamp: now,
+            }),
             now,
         );
-        let p0 = evaluate_policy(&observed, &config, &PolicyResult::clear(), &mut runtime, now);
+        let p0 = evaluate_policy(
+            &observed,
+            &config,
+            &PolicyResult::clear(),
+            &mut runtime,
+            now,
+        );
         assert!(!p0.is_blocked_by(PolicyBlock::ChargeLimit));
 
         let t5 = now + CHARGE_LIMIT_SUSPEND_DELAY;
         observed.update(
             charger_core::battery::reader::PowerState::Connected,
-            Some(Sample { capacity: 80.0, temperature_c: 30.0, power_state: charger_core::battery::reader::PowerState::Connected, timestamp: t5 }),
+            Some(Sample {
+                capacity: 80.0,
+                temperature_c: 30.0,
+                power_state: charger_core::battery::reader::PowerState::Connected,
+                timestamp: t5,
+            }),
             t5,
         );
         let p_suspended = evaluate_policy(&observed, &config, &p0, &mut runtime, t5);
@@ -745,31 +870,55 @@ mod tests {
         // SOC 78.1 (> resume_limit 78) → tetap Block
         observed.update(
             charger_core::battery::reader::PowerState::Connected,
-            Some(Sample { capacity: 78.1, temperature_c: 30.0, power_state: charger_core::battery::reader::PowerState::Connected, timestamp: t5 }),
+            Some(Sample {
+                capacity: 78.1,
+                temperature_c: 30.0,
+                power_state: charger_core::battery::reader::PowerState::Connected,
+                timestamp: t5,
+            }),
             t5,
         );
         let p_above = evaluate_policy(&observed, &config, &p_suspended, &mut runtime, t5);
-        assert!(p_above.is_blocked_by(PolicyBlock::ChargeLimit), "78.1 > resume 78 harus tetap Block");
+        assert!(
+            p_above.is_blocked_by(PolicyBlock::ChargeLimit),
+            "78.1 > resume 78 harus tetap Block"
+        );
         assert_eq!(runtime.charge_limit_state, ChargeLimitState::Suspended);
 
         // SOC 78.0 (== resume_limit) → Allow (boundary inklusif: <= resume_limit)
         observed.update(
             charger_core::battery::reader::PowerState::Connected,
-            Some(Sample { capacity: 78.0, temperature_c: 30.0, power_state: charger_core::battery::reader::PowerState::Connected, timestamp: t5 }),
+            Some(Sample {
+                capacity: 78.0,
+                temperature_c: 30.0,
+                power_state: charger_core::battery::reader::PowerState::Connected,
+                timestamp: t5,
+            }),
             t5,
         );
         let p_at = evaluate_policy(&observed, &config, &p_above, &mut runtime, t5);
-        assert!(!p_at.is_blocked_by(PolicyBlock::ChargeLimit), "78.0 == resume 78 harus Allow");
+        assert!(
+            !p_at.is_blocked_by(PolicyBlock::ChargeLimit),
+            "78.0 == resume 78 harus Allow"
+        );
         assert_eq!(runtime.charge_limit_state, ChargeLimitState::Normal);
 
         // SOC 77.9 (< resume_limit) → Allow juga (state sudah Normal)
         observed.update(
             charger_core::battery::reader::PowerState::Connected,
-            Some(Sample { capacity: 77.9, temperature_c: 30.0, power_state: charger_core::battery::reader::PowerState::Connected, timestamp: t5 }),
+            Some(Sample {
+                capacity: 77.9,
+                temperature_c: 30.0,
+                power_state: charger_core::battery::reader::PowerState::Connected,
+                timestamp: t5,
+            }),
             t5,
         );
         let p_below = evaluate_policy(&observed, &config, &p_at, &mut runtime, t5);
-        assert!(!p_below.is_blocked_by(PolicyBlock::ChargeLimit), "77.9 < resume 78 harus Allow");
+        assert!(
+            !p_below.is_blocked_by(PolicyBlock::ChargeLimit),
+            "77.9 < resume 78 harus Allow"
+        );
     }
 
     #[test]
@@ -788,15 +937,31 @@ mod tests {
         // 1. Bawa ke Suspended
         observed.update(
             charger_core::battery::reader::PowerState::Connected,
-            Some(Sample { capacity: 80.0, temperature_c: 30.0, power_state: charger_core::battery::reader::PowerState::Connected, timestamp: now }),
+            Some(Sample {
+                capacity: 80.0,
+                temperature_c: 30.0,
+                power_state: charger_core::battery::reader::PowerState::Connected,
+                timestamp: now,
+            }),
             now,
         );
-        let p0 = evaluate_policy(&observed, &config, &PolicyResult::clear(), &mut runtime, now);
+        let p0 = evaluate_policy(
+            &observed,
+            &config,
+            &PolicyResult::clear(),
+            &mut runtime,
+            now,
+        );
 
         let t5 = now + CHARGE_LIMIT_SUSPEND_DELAY;
         observed.update(
             charger_core::battery::reader::PowerState::Connected,
-            Some(Sample { capacity: 80.0, temperature_c: 30.0, power_state: charger_core::battery::reader::PowerState::Connected, timestamp: t5 }),
+            Some(Sample {
+                capacity: 80.0,
+                temperature_c: 30.0,
+                power_state: charger_core::battery::reader::PowerState::Connected,
+                timestamp: t5,
+            }),
             t5,
         );
         let p_suspended = evaluate_policy(&observed, &config, &p0, &mut runtime, t5);
@@ -807,7 +972,12 @@ mod tests {
         let t_resume = t5 + Duration::from_secs(60);
         observed.update(
             charger_core::battery::reader::PowerState::Connected,
-            Some(Sample { capacity: 78.0, temperature_c: 30.0, power_state: charger_core::battery::reader::PowerState::Connected, timestamp: t_resume }),
+            Some(Sample {
+                capacity: 78.0,
+                temperature_c: 30.0,
+                power_state: charger_core::battery::reader::PowerState::Connected,
+                timestamp: t_resume,
+            }),
             t_resume,
         );
         let p_normal = evaluate_policy(&observed, &config, &p_suspended, &mut runtime, t_resume);
@@ -818,21 +988,38 @@ mod tests {
         let t_back = t_resume + Duration::from_secs(5);
         observed.update(
             charger_core::battery::reader::PowerState::Connected,
-            Some(Sample { capacity: 80.0, temperature_c: 30.0, power_state: charger_core::battery::reader::PowerState::Connected, timestamp: t_back }),
+            Some(Sample {
+                capacity: 80.0,
+                temperature_c: 30.0,
+                power_state: charger_core::battery::reader::PowerState::Connected,
+                timestamp: t_back,
+            }),
             t_back,
         );
         let p_grace = evaluate_policy(&observed, &config, &p_normal, &mut runtime, t_back);
-        assert!(!p_grace.is_blocked_by(PolicyBlock::ChargeLimit), "Baru naik ke limit lagi harus dalam Grace, belum Block");
-        assert_eq!(runtime.charge_limit_state, ChargeLimitState::Grace { started_at: t_back });
+        assert!(
+            !p_grace.is_blocked_by(PolicyBlock::ChargeLimit),
+            "Baru naik ke limit lagi harus dalam Grace, belum Block"
+        );
+        assert_eq!(
+            runtime.charge_limit_state,
+            ChargeLimitState::Grace { started_at: t_back }
+        );
 
         // 4. Setelah 5 menit baru Suspended kembali
         let t_next_suspend = t_back + CHARGE_LIMIT_SUSPEND_DELAY;
         observed.update(
             charger_core::battery::reader::PowerState::Connected,
-            Some(Sample { capacity: 80.0, temperature_c: 30.0, power_state: charger_core::battery::reader::PowerState::Connected, timestamp: t_next_suspend }),
+            Some(Sample {
+                capacity: 80.0,
+                temperature_c: 30.0,
+                power_state: charger_core::battery::reader::PowerState::Connected,
+                timestamp: t_next_suspend,
+            }),
             t_next_suspend,
         );
-        let p_next_suspend = evaluate_policy(&observed, &config, &p_grace, &mut runtime, t_next_suspend);
+        let p_next_suspend =
+            evaluate_policy(&observed, &config, &p_grace, &mut runtime, t_next_suspend);
         assert!(p_next_suspend.is_blocked_by(PolicyBlock::ChargeLimit));
         assert_eq!(runtime.charge_limit_state, ChargeLimitState::Suspended);
     }
@@ -847,16 +1034,26 @@ mod tests {
         let mut runtime = PolicyRuntime::default();
 
         // Normal → None
-        assert!(runtime.charge_limit_deadline().is_none(), "Normal: deadline harus None");
+        assert!(
+            runtime.charge_limit_deadline().is_none(),
+            "Normal: deadline harus None"
+        );
 
         // Grace → Some(started_at + 5min)
         runtime.charge_limit_state = ChargeLimitState::Grace { started_at: now };
         let deadline = runtime.charge_limit_deadline();
-        assert_eq!(deadline, Some(now + CHARGE_LIMIT_SUSPEND_DELAY), "Grace: deadline harus Some(t + 5min)");
+        assert_eq!(
+            deadline,
+            Some(now + CHARGE_LIMIT_SUSPEND_DELAY),
+            "Grace: deadline harus Some(t + 5min)"
+        );
 
         // Suspended → None (grace timer tidak lagi aktif)
         runtime.charge_limit_state = ChargeLimitState::Suspended;
-        assert!(runtime.charge_limit_deadline().is_none(), "Suspended: deadline harus None");
+        assert!(
+            runtime.charge_limit_deadline().is_none(),
+            "Suspended: deadline harus None"
+        );
     }
 
     #[test]
@@ -883,49 +1080,111 @@ mod tests {
         };
 
         // t=0: SOC 100 → Grace dimulai
-        observed.update(charger_core::battery::reader::PowerState::Connected, Some(make_sample(100.0, now)), now);
-        let p = evaluate_policy(&observed, &config, &PolicyResult::clear(), &mut runtime, now);
+        observed.update(
+            charger_core::battery::reader::PowerState::Connected,
+            Some(make_sample(100.0, now)),
+            now,
+        );
+        let p = evaluate_policy(
+            &observed,
+            &config,
+            &PolicyResult::clear(),
+            &mut runtime,
+            now,
+        );
         assert!(!p.is_blocked_by(PolicyBlock::ChargeLimit));
-        assert!(matches!(runtime.charge_limit_state, ChargeLimitState::Grace { .. }));
+        assert!(matches!(
+            runtime.charge_limit_state,
+            ChargeLimitState::Grace { .. }
+        ));
 
         // t=5m: Grace habis → Suspended
         let t5 = now + CHARGE_LIMIT_SUSPEND_DELAY;
-        observed.update(charger_core::battery::reader::PowerState::Connected, Some(make_sample(100.0, t5)), t5);
+        observed.update(
+            charger_core::battery::reader::PowerState::Connected,
+            Some(make_sample(100.0, t5)),
+            t5,
+        );
         let p = evaluate_policy(&observed, &config, &p, &mut runtime, t5);
-        assert!(p.is_blocked_by(PolicyBlock::ChargeLimit), "SOC 100 setelah 5m harus Block");
+        assert!(
+            p.is_blocked_by(PolicyBlock::ChargeLimit),
+            "SOC 100 setelah 5m harus Block"
+        );
         assert_eq!(runtime.charge_limit_state, ChargeLimitState::Suspended);
 
         // SOC 99 → harus tetap Block (bukan langsung Allow!)
-        observed.update(charger_core::battery::reader::PowerState::Connected, Some(make_sample(99.0, t5)), t5);
+        observed.update(
+            charger_core::battery::reader::PowerState::Connected,
+            Some(make_sample(99.0, t5)),
+            t5,
+        );
         let p = evaluate_policy(&observed, &config, &p, &mut runtime, t5);
-        assert!(p.is_blocked_by(PolicyBlock::ChargeLimit), "SOC 99 > resume 95 harus tetap Block");
+        assert!(
+            p.is_blocked_by(PolicyBlock::ChargeLimit),
+            "SOC 99 > resume 95 harus tetap Block"
+        );
         assert_eq!(runtime.charge_limit_state, ChargeLimitState::Suspended);
 
         // SOC 98 → tetap Block
-        observed.update(charger_core::battery::reader::PowerState::Connected, Some(make_sample(98.0, t5)), t5);
+        observed.update(
+            charger_core::battery::reader::PowerState::Connected,
+            Some(make_sample(98.0, t5)),
+            t5,
+        );
         let p = evaluate_policy(&observed, &config, &p, &mut runtime, t5);
-        assert!(p.is_blocked_by(PolicyBlock::ChargeLimit), "SOC 98 > resume 95 harus tetap Block");
+        assert!(
+            p.is_blocked_by(PolicyBlock::ChargeLimit),
+            "SOC 98 > resume 95 harus tetap Block"
+        );
 
         // SOC 97 → tetap Block
-        observed.update(charger_core::battery::reader::PowerState::Connected, Some(make_sample(97.0, t5)), t5);
+        observed.update(
+            charger_core::battery::reader::PowerState::Connected,
+            Some(make_sample(97.0, t5)),
+            t5,
+        );
         let p = evaluate_policy(&observed, &config, &p, &mut runtime, t5);
-        assert!(p.is_blocked_by(PolicyBlock::ChargeLimit), "SOC 97 > resume 95 harus tetap Block");
+        assert!(
+            p.is_blocked_by(PolicyBlock::ChargeLimit),
+            "SOC 97 > resume 95 harus tetap Block"
+        );
 
         // SOC 96 → tetap Block
-        observed.update(charger_core::battery::reader::PowerState::Connected, Some(make_sample(96.0, t5)), t5);
+        observed.update(
+            charger_core::battery::reader::PowerState::Connected,
+            Some(make_sample(96.0, t5)),
+            t5,
+        );
         let p = evaluate_policy(&observed, &config, &p, &mut runtime, t5);
-        assert!(p.is_blocked_by(PolicyBlock::ChargeLimit), "SOC 96 > resume 95 harus tetap Block");
+        assert!(
+            p.is_blocked_by(PolicyBlock::ChargeLimit),
+            "SOC 96 > resume 95 harus tetap Block"
+        );
 
         // SOC 95 → Allow (boundary inklusif: 95 <= 95)
-        observed.update(charger_core::battery::reader::PowerState::Connected, Some(make_sample(95.0, t5)), t5);
+        observed.update(
+            charger_core::battery::reader::PowerState::Connected,
+            Some(make_sample(95.0, t5)),
+            t5,
+        );
         let p = evaluate_policy(&observed, &config, &p, &mut runtime, t5);
-        assert!(!p.is_blocked_by(PolicyBlock::ChargeLimit), "SOC 95 == resume 95 harus Allow");
+        assert!(
+            !p.is_blocked_by(PolicyBlock::ChargeLimit),
+            "SOC 95 == resume 95 harus Allow"
+        );
         assert_eq!(runtime.charge_limit_state, ChargeLimitState::Normal);
 
         // SOC 94 → Allow
-        observed.update(charger_core::battery::reader::PowerState::Connected, Some(make_sample(94.0, t5)), t5);
+        observed.update(
+            charger_core::battery::reader::PowerState::Connected,
+            Some(make_sample(94.0, t5)),
+            t5,
+        );
         let p = evaluate_policy(&observed, &config, &p, &mut runtime, t5);
-        assert!(!p.is_blocked_by(PolicyBlock::ChargeLimit), "SOC 94 < resume 95 harus Allow");
+        assert!(
+            !p.is_blocked_by(PolicyBlock::ChargeLimit),
+            "SOC 94 < resume 95 harus Allow"
+        );
     }
 
     #[test]
@@ -948,15 +1207,31 @@ mod tests {
         // 1. Bawa ke state Suspended
         observed.update(
             charger_core::battery::reader::PowerState::Connected,
-            Some(Sample { capacity: 100.0, temperature_c: 30.0, power_state: charger_core::battery::reader::PowerState::Connected, timestamp: now }),
+            Some(Sample {
+                capacity: 100.0,
+                temperature_c: 30.0,
+                power_state: charger_core::battery::reader::PowerState::Connected,
+                timestamp: now,
+            }),
             now,
         );
-        let p = evaluate_policy(&observed, &config, &PolicyResult::clear(), &mut runtime, now);
+        let p = evaluate_policy(
+            &observed,
+            &config,
+            &PolicyResult::clear(),
+            &mut runtime,
+            now,
+        );
 
         let t5 = now + CHARGE_LIMIT_SUSPEND_DELAY;
         observed.update(
             charger_core::battery::reader::PowerState::Connected,
-            Some(Sample { capacity: 100.0, temperature_c: 30.0, power_state: charger_core::battery::reader::PowerState::Connected, timestamp: t5 }),
+            Some(Sample {
+                capacity: 100.0,
+                temperature_c: 30.0,
+                power_state: charger_core::battery::reader::PowerState::Connected,
+                timestamp: t5,
+            }),
             t5,
         );
         let p = evaluate_policy(&observed, &config, &p, &mut runtime, t5);
@@ -971,24 +1246,44 @@ mod tests {
         let p_disconnected = evaluate_policy(&observed, &config, &p, &mut runtime, t_detach);
 
         // Bitmask policy result harus clear saat disconnected
-        assert_eq!(p_disconnected, PolicyResult::clear(), "Saat disconnected, policy result harus clear");
+        assert_eq!(
+            p_disconnected,
+            PolicyResult::clear(),
+            "Saat disconnected, policy result harus clear"
+        );
         // TETAPI policy_runtime (Suspended) HARUS tetap ada!
-        assert_eq!(runtime.charge_limit_state, ChargeLimitState::Suspended,
-            "State Suspended harus tetap bertahan saat disconnected");
+        assert_eq!(
+            runtime.charge_limit_state,
+            ChargeLimitState::Suspended,
+            "State Suspended harus tetap bertahan saat disconnected"
+        );
 
         // 3. Setelah re-attach (5 detik kemudian), evaluate_policy dipanggil lagi
         observed.connection = ConnectionState::Attached;
         let t_reattach = t_detach + Duration::from_secs(5);
         observed.update(
             charger_core::battery::reader::PowerState::Connected,
-            Some(Sample { capacity: 99.0, temperature_c: 30.0, power_state: charger_core::battery::reader::PowerState::Connected, timestamp: t_reattach }),
+            Some(Sample {
+                capacity: 99.0,
+                temperature_c: 30.0,
+                power_state: charger_core::battery::reader::PowerState::Connected,
+                timestamp: t_reattach,
+            }),
             t_reattach,
         );
-        let p_after = evaluate_policy(&observed, &config, &p_disconnected, &mut runtime, t_reattach);
+        let p_after = evaluate_policy(
+            &observed,
+            &config,
+            &p_disconnected,
+            &mut runtime,
+            t_reattach,
+        );
 
         // SOC 99 > resume 95 → harus tetap Block karena runtime masih Suspended
-        assert!(p_after.is_blocked_by(PolicyBlock::ChargeLimit),
-            "SOC 99 setelah re-attach harus tetap Block — runtime Suspended harus survive detach");
+        assert!(
+            p_after.is_blocked_by(PolicyBlock::ChargeLimit),
+            "SOC 99 setelah re-attach harus tetap Block — runtime Suspended harus survive detach"
+        );
         assert_eq!(runtime.charge_limit_state, ChargeLimitState::Suspended);
     }
 
@@ -1029,7 +1324,8 @@ mod tests {
         assert_eq!(classify_uevent(uevent_bms_devpath), UeventKind::Bms);
 
         // Unrelated uevent
-        let uevent_other = b"ACTION=change\0SUBSYSTEM=input\0DEVPATH=/devices/virtual/input/input0\0";
+        let uevent_other =
+            b"ACTION=change\0SUBSYSTEM=input\0DEVPATH=/devices/virtual/input/input0\0";
         assert_eq!(classify_uevent(uevent_other), UeventKind::Other);
     }
 
@@ -1054,7 +1350,12 @@ mod tests {
         let intent = OperatingIntent::normal();
         let policy_res = PolicyResult::clear();
         let dec = ChargingDecision::resolve(&observed, &intent, &policy_res, now);
-        assert_eq!(dec, ChargingDecision::Wait { reason: WaitReason::AttachingSettleWindow });
+        assert_eq!(
+            dec,
+            ChargingDecision::Wait {
+                reason: WaitReason::AttachingSettleWindow
+            }
+        );
 
         // After 4s (< 5s settle window) -> still Attaching
         let t4 = now + Duration::from_secs(4);
@@ -1065,5 +1366,106 @@ mod tests {
         let t5 = now + Duration::from_secs(5);
         conn.tick(t5);
         assert_eq!(conn, ConnectionState::Attached);
+    }
+
+    #[test]
+    fn test_stepped_thermal_regulation_curve() {
+        let mut now = Instant::now();
+        let mut runtime = PolicyRuntime::default();
+        let mut config = Config::default();
+        config.thermal_throttling_enabled = true;
+
+        // 1. T = 35.0°C (< 38.0°C) -> Normal
+        let step0 = evaluate_thermal_stepping(350, &config, &mut runtime, now);
+        assert_eq!(step0, ThermalStep::Normal);
+        assert_eq!(step0.target_ua(), None);
+
+        // 2. T = 39.0°C (>= 38.0°C) -> Step 1 (2500 mA)
+        now += Duration::from_secs(2);
+        let step1 = evaluate_thermal_stepping(390, &config, &mut runtime, now);
+        assert_eq!(step1, ThermalStep::Step1);
+        assert_eq!(step1.target_ua(), Some(2_500_000));
+
+        // 3. T = 41.5°C (>= 41.0°C) -> Step 2 (1500 mA)
+        now += Duration::from_secs(2);
+        let step2 = evaluate_thermal_stepping(415, &config, &mut runtime, now);
+        assert_eq!(step2, ThermalStep::Step2);
+        assert_eq!(step2.target_ua(), Some(1_500_000));
+
+        // 4. T = 43.5°C (>= 43.0°C) -> Step 3 (800 mA)
+        now += Duration::from_secs(2);
+        let step3 = evaluate_thermal_stepping(435, &config, &mut runtime, now);
+        assert_eq!(step3, ThermalStep::Step3);
+        assert_eq!(step3.target_ua(), Some(800_000));
+    }
+
+    #[test]
+    fn test_thermal_step_hold_hysteresis() {
+        let mut now = Instant::now();
+        let mut runtime = PolicyRuntime::default();
+        let config = Config::default();
+
+        // 1. Naik ke Step 2 (41.5°C) -> langsung berubah
+        let step = evaluate_thermal_stepping(415, &config, &mut runtime, now);
+        assert_eq!(step, ThermalStep::Step2);
+
+        // 2. 3 detik kemudian, suhu turun ke 39.0°C (harusnya Step 1),
+        // tapi karena hold window (10s) belum lewat, step tetap di Step 2!
+        now += Duration::from_secs(3);
+        let step_hold = evaluate_thermal_stepping(390, &config, &mut runtime, now);
+        assert_eq!(step_hold, ThermalStep::Step2);
+
+        // 3. 11 detik kemudian, hold window kadaluwarsa -> step turun ke Step 1
+        now += Duration::from_secs(8);
+        let step_down = evaluate_thermal_stepping(390, &config, &mut runtime, now);
+        assert_eq!(step_down, ThermalStep::Step1);
+    }
+
+    #[test]
+    fn test_current_arbitration_hierarchy() {
+        let mut config = Config::default();
+        config.max_charge_current_ma = 2000; // User limit 2000 mA
+        config.thermal_throttling_enabled = true;
+        let mut runtime = PolicyRuntime::default();
+
+        // Case A: Normal Charging + User Limit (2000 mA)
+        let dec_allow = ChargingDecision::Allow;
+        let reg_a = resolve_current_regulation(&config, &runtime, &dec_allow);
+        assert_eq!(
+            reg_a,
+            CurrentRegulation::ConfigLimit {
+                target_ua: 2_000_000
+            }
+        );
+
+        // Case B: Stepped Thermal Throttle Step 3 (800 mA) < User Limit (2000 mA) -> Thermal wins!
+        runtime.thermal_step = ThermalStep::Step3;
+        let reg_b = resolve_current_regulation(&config, &runtime, &dec_allow);
+        assert_eq!(
+            reg_b,
+            CurrentRegulation::ThermalThrottle {
+                step: 3,
+                target_ua: 800_000
+            }
+        );
+
+        // Case C: User Limit (500 mA) < Thermal Step 1 (2500 mA) -> User Limit wins (more strict)!
+        config.max_charge_current_ma = 500;
+        runtime.thermal_step = ThermalStep::Step1;
+        let reg_c = resolve_current_regulation(&config, &runtime, &dec_allow);
+        assert_eq!(
+            reg_c,
+            CurrentRegulation::ThermalThrottle {
+                step: 1,
+                target_ua: 500_000
+            }
+        );
+
+        // Case D: Decision is Block/Wait -> Disabled (0 mA)
+        let dec_block = ChargingDecision::Block {
+            cause: BlockCause::ThermalEmergency,
+        };
+        let reg_d = resolve_current_regulation(&config, &runtime, &dec_block);
+        assert_eq!(reg_d, CurrentRegulation::Disabled);
     }
 }

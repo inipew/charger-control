@@ -4,6 +4,7 @@ mod monitor;
 
 #[cfg(unix)]
 use std::os::unix::io::AsRawFd;
+#[cfg(unix)]
 use std::{
     path::Path,
     sync::{
@@ -12,6 +13,7 @@ use std::{
     },
 };
 
+#[cfg(unix)]
 use charger_core::config::schema::{Config, DEFAULT_CONFIG_PATH};
 
 #[cfg(unix)]

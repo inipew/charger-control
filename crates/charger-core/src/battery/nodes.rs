@@ -10,6 +10,12 @@ pub const CHARGING_NODES: &[&str] = &["/sys/class/power_supply/battery/charging_
 /// The order is intentional and must be preserved by callers.
 pub const SUSPEND_NODES: &[&str] = &["/sys/class/power_supply/battery/input_suspend"];
 
+pub const FAST_CHARGE_CURRENT_NODES: &[&str] =
+    &["/sys/class/power_supply/battery/fast_charge_current"];
+
+pub const THERMAL_INPUT_CURRENT_NODES: &[&str] =
+    &["/sys/class/power_supply/battery/thermal_input_current"];
+
 pub const BATTERY_CURRENT_NODES: &[&str] = &[
     "/sys/class/power_supply/battery/current_now",
     "/sys/class/power_supply/bms/current_now",

@@ -83,6 +83,48 @@ impl PolicyResult {
     }
 }
 
+pub const THERMAL_STEP1_TEMP_DC: i32 = 380; // 38.0°C
+pub const THERMAL_STEP1_CURRENT_UA: u32 = 2_500_000; // 2.5A
+
+pub const THERMAL_STEP2_TEMP_DC: i32 = 410; // 41.0°C
+pub const THERMAL_STEP2_CURRENT_UA: u32 = 1_500_000; // 1.5A
+
+pub const THERMAL_STEP3_TEMP_DC: i32 = 430; // 43.0°C
+pub const THERMAL_STEP3_CURRENT_UA: u32 = 800_000; // 800mA
+
+pub const THERMAL_STEP_HOLD_WINDOW: Duration = Duration::from_secs(10);
+pub const GRACE_CURRENT_CAP_UA: u32 = 1_000_000; // 1.0A
+
+/// Step regulasi termal bertingkat (Stepped Thermal Throttling).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum ThermalStep {
+    #[default]
+    Normal,
+    Step1,
+    Step2,
+    Step3,
+}
+
+impl ThermalStep {
+    pub const fn target_ua(self) -> Option<u32> {
+        match self {
+            Self::Normal => None,
+            Self::Step1 => Some(THERMAL_STEP1_CURRENT_UA),
+            Self::Step2 => Some(THERMAL_STEP2_CURRENT_UA),
+            Self::Step3 => Some(THERMAL_STEP3_CURRENT_UA),
+        }
+    }
+
+    pub const fn level(self) -> u8 {
+        match self {
+            Self::Normal => 0,
+            Self::Step1 => 1,
+            Self::Step2 => 2,
+            Self::Step3 => 3,
+        }
+    }
+}
+
 /// State machine eksplisit untuk charge-limit lifecycle.
 ///
 /// ```text
@@ -110,15 +152,19 @@ pub enum ChargeLimitState {
 }
 
 /// Temporal state terpisah dari PolicyResult (pure bitmask).
-/// Menyimpan state machine charge-limit tanpa mencemari PolicyResult.
+/// Menyimpan state machine charge-limit dan thermal stepping tanpa mencemari PolicyResult.
 #[derive(Debug, Clone, Copy, Default)]
 pub struct PolicyRuntime {
     pub charge_limit_state: ChargeLimitState,
+    pub thermal_step: ThermalStep,
+    pub thermal_step_updated_at: Option<Instant>,
 }
 
 impl PolicyRuntime {
     pub fn clear(&mut self) {
         self.charge_limit_state = ChargeLimitState::Normal;
+        self.thermal_step = ThermalStep::Normal;
+        self.thermal_step_updated_at = None;
     }
 
     /// Deadline kapan charge-limit grace period berakhir.
@@ -132,6 +178,45 @@ impl PolicyRuntime {
             _ => None,
         }
     }
+}
+
+/// Evaluasi Stepped Thermal Throttling dengan Hold Hysteresis (10 detik).
+pub fn evaluate_thermal_stepping(
+    temp_dc: i32,
+    config: &Config,
+    runtime: &mut PolicyRuntime,
+    now: Instant,
+) -> ThermalStep {
+    if !config.thermal_throttling_enabled {
+        runtime.thermal_step = ThermalStep::Normal;
+        return ThermalStep::Normal;
+    }
+
+    let desired_step = if temp_dc >= THERMAL_STEP3_TEMP_DC {
+        ThermalStep::Step3
+    } else if temp_dc >= THERMAL_STEP2_TEMP_DC {
+        ThermalStep::Step2
+    } else if temp_dc >= THERMAL_STEP1_TEMP_DC {
+        ThermalStep::Step1
+    } else {
+        ThermalStep::Normal
+    };
+
+    if desired_step != runtime.thermal_step {
+        // Step up (more severe throttling) occurs immediately for safety.
+        // Step down (recovering to higher current) requires step hold window to avoid oscillating.
+        let is_step_up = desired_step.level() > runtime.thermal_step.level();
+        let hold_expired = runtime
+            .thermal_step_updated_at
+            .is_none_or(|t| now.duration_since(t) >= THERMAL_STEP_HOLD_WINDOW);
+
+        if is_step_up || hold_expired {
+            runtime.thermal_step = desired_step;
+            runtime.thermal_step_updated_at = Some(now);
+        }
+    }
+
+    runtime.thermal_step
 }
 
 /// Menghitung evaluasi policy murni berdasarkan data pengamatan saat ini dan konfigurasi.

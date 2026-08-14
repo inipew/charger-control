@@ -5,7 +5,9 @@ use std::{
 };
 
 use crate::{
-    battery::nodes::{CHARGING_NODES, SUSPEND_NODES},
+    battery::nodes::{
+        CHARGING_NODES, FAST_CHARGE_CURRENT_NODES, SUSPEND_NODES, THERMAL_INPUT_CURRENT_NODES,
+    },
     error::ChargerError,
 };
 
@@ -215,6 +217,9 @@ fn detect_node_cached(
     None
 }
 
+static FAST_CHARGE_NODE_IDX: AtomicUsize = AtomicUsize::new(usize::MAX);
+static THERMAL_INPUT_NODE_IDX: AtomicUsize = AtomicUsize::new(usize::MAX);
+
 fn charging_node() -> Option<&'static str> {
     detect_node_cached("charging_control", CHARGING_NODES, &CHARGING_NODE_IDX)
 }
@@ -224,6 +229,24 @@ fn suspend_node() -> Option<&'static str> {
     detect_node_cached("input_suspend", SUSPEND_NODES, &SUSPEND_NODE_IDX)
 }
 
+/// Return the primary fast-charge current control node.
+fn fast_charge_node() -> Option<&'static str> {
+    detect_node_cached(
+        "fast_charge_current",
+        FAST_CHARGE_CURRENT_NODES,
+        &FAST_CHARGE_NODE_IDX,
+    )
+}
+
+/// Return the primary thermal input current control node.
+fn thermal_input_node() -> Option<&'static str> {
+    detect_node_cached(
+        "thermal_input_current",
+        THERMAL_INPUT_CURRENT_NODES,
+        &THERMAL_INPUT_NODE_IDX,
+    )
+}
+
 /// Invalidate the cached node indices for both charging and suspend nodes.
 ///
 /// Call this when a write operation returns `NoChargingNodeFound` so that
@@ -231,6 +254,62 @@ fn suspend_node() -> Option<&'static str> {
 pub fn reset_node_caches() {
     CHARGING_NODE_IDX.store(usize::MAX, Ordering::Relaxed);
     SUSPEND_NODE_IDX.store(usize::MAX, Ordering::Relaxed);
+    FAST_CHARGE_NODE_IDX.store(usize::MAX, Ordering::Relaxed);
+    THERMAL_INPUT_NODE_IDX.store(usize::MAX, Ordering::Relaxed);
+}
+
+/// Set fast charge current limit in microamperes (µA).
+///
+/// Ensures a hardware safety floor of at least 500,000 µA (500 mA).
+pub fn set_fast_charge_current(current_ua: u32) -> Result<(), ChargerError> {
+    let safe_ua = current_ua.max(500_000);
+    let val_str = safe_ua.to_string();
+    let mut any_succeeded = false;
+
+    if let Some(node) = fast_charge_node() {
+        if write_optional_node(node, &val_str).unwrap_or(false) {
+            tracing::info!(
+                path = node,
+                current_ua = safe_ua,
+                "fast charge current limit written"
+            );
+            any_succeeded = true;
+        }
+    }
+
+    if let Some(node) = thermal_input_node() {
+        if write_optional_node(node, &val_str).unwrap_or(false) {
+            tracing::info!(
+                path = node,
+                current_ua = safe_ua,
+                "thermal input current limit written"
+            );
+            any_succeeded = true;
+        }
+    }
+
+    if any_succeeded {
+        Ok(())
+    } else {
+        Err(ChargerError::NoChargingNodeFound)
+    }
+}
+
+/// Read the currently configured fast charge current in µA from sysfs.
+pub fn read_fast_charge_current() -> Option<u32> {
+    if let Some(node) = fast_charge_node() {
+        if let Ok(raw) = fs::read_to_string(node) {
+            if let Ok(ua) = raw.trim().parse::<u32>() {
+                return Some(ua);
+            }
+        }
+    }
+    None
+}
+
+/// Reset fast charge current to default maximum (5.85 A).
+pub fn reset_fast_charge_current() -> Result<(), ChargerError> {
+    set_fast_charge_current(5_850_000)
 }
 
 /// Enable normal charging.

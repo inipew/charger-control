@@ -110,6 +110,17 @@ enum SetTarget {
     MaxTemp {
         value: i32,
     },
+
+    /// Set maximum charge current in mA (0 for unconstrained, or 500..=10000 mA)
+    MaxCurrent {
+        value: u32,
+    },
+
+    /// Enable or disable stepped adaptive thermal throttling
+    ThermalThrottle {
+        #[arg(value_parser = ["on", "off"])]
+        state: String,
+    },
 }
 
 fn main() -> Result<(), ChargerError> {
@@ -135,6 +146,14 @@ fn main() -> Result<(), ChargerError> {
 
             SetTarget::MaxTemp { value } => {
                 cmd::set::max_temp(*value)?;
+            }
+
+            SetTarget::MaxCurrent { value } => {
+                cmd::set::max_current(*value)?;
+            }
+
+            SetTarget::ThermalThrottle { state } => {
+                cmd::set::thermal_throttle(state == "on")?;
             }
         },
 
