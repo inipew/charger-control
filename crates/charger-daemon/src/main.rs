@@ -212,6 +212,15 @@ fn main() {
         tracing::info!("Charging restored successfully");
     }
 
+    if let Err(error) = charger_core::battery::control::reset_fast_charge_current() {
+        tracing::warn!(
+            error = %error,
+            "Failed to reset fast charge current limit"
+        );
+    } else {
+        tracing::info!("Fast charge current limit reset successfully");
+    }
+
     ipc_shutdown.store(true, Ordering::Release);
     let _ = std::os::unix::net::UnixStream::connect(ipc::SOCKET_PATH);
 

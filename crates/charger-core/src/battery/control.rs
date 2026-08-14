@@ -491,7 +491,12 @@ pub fn has_distinct_bypass_node() -> bool {
 pub fn grant_node_permissions() -> Result<(), ChargerError> {
     use std::os::unix::fs::PermissionsExt;
 
-    let nodes = CHARGING_NODES.iter().chain(SUSPEND_NODES.iter()).copied();
+    let nodes = CHARGING_NODES
+        .iter()
+        .chain(SUSPEND_NODES.iter())
+        .chain(FAST_CHARGE_CURRENT_NODES.iter())
+        .chain(THERMAL_INPUT_CURRENT_NODES.iter())
+        .copied();
 
     let mut found = false;
     let mut permission_failures = 0usize;

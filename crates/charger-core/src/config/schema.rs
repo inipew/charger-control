@@ -212,4 +212,84 @@ mod tests {
         current_zero.validate();
         assert_eq!(current_zero.max_charge_current_ma, 0);
     }
+
+    #[test]
+    fn test_config_toml_roundtrip() {
+        let original = Config {
+            enabled: true,
+            charge_limit: 85,
+            resume_limit: 80,
+            thermal_cutoff: true,
+            max_temp_dc: 450,
+            poll_interval_secs: 5,
+            max_charge_current_ma: 1800,
+            thermal_throttling_enabled: true,
+            log_path: PathBuf::from("/data/adb/test.log"),
+        };
+
+        let toml_str = toml::to_string(&original).expect("Serialization failed");
+        let mut parsed: Config = toml::from_str(&toml_str).expect("Deserialization failed");
+        parsed.validate();
+
+        assert_eq!(parsed.charge_limit, 85);
+        assert_eq!(parsed.resume_limit, 80);
+        assert_eq!(parsed.max_charge_current_ma, 1800);
+        assert!(parsed.thermal_throttling_enabled);
+        assert!(parsed.thermal_cutoff);
+    }
+
+    #[test]
+    fn test_config_backwards_compatibility_missing_fields() {
+        let legacy_toml = r#"
+            enabled = true
+            charge_limit = 90
+            resume_limit = 85
+            thermal_cutoff = false
+            max_temp_dc = 400
+            poll_interval_secs = 10
+            log_path = "/data/adb/test.log"
+        "#;
+
+        let mut parsed: Config = toml::from_str(legacy_toml).expect("Legacy TOML parsing failed");
+        parsed.validate();
+
+        assert_eq!(parsed.charge_limit, 90);
+        assert_eq!(parsed.resume_limit, 85);
+        // Default values for new fields must be used
+        assert_eq!(parsed.max_charge_current_ma, 0); // Unconstrained
+        assert!(parsed.thermal_throttling_enabled); // Default true
+    }
+
+    #[test]
+    fn test_config_extreme_boundary_clamping() {
+        let mut lower_boundary = Config {
+            charge_limit: 10,         // < 50 -> clamp to 50
+            resume_limit: 5,          // < 50 -> clamp to 50 - 2 = 48
+            max_temp_dc: 100,         // < 300 -> clamp to 300 (30.0 C)
+            poll_interval_secs: 0,    // < 1 -> clamp to 1
+            max_charge_current_ma: 1, // 1 < 500 -> clamp to 500
+            ..Config::default()
+        };
+        lower_boundary.validate();
+        assert_eq!(lower_boundary.charge_limit, 50);
+        assert_eq!(lower_boundary.resume_limit, 5); // 5 < 50 is valid!
+        assert_eq!(lower_boundary.max_temp_dc, 300);
+        assert_eq!(lower_boundary.poll_interval_secs, 1);
+        assert_eq!(lower_boundary.max_charge_current_ma, 500);
+
+        let mut upper_boundary = Config {
+            charge_limit: 250,             // > 100 -> clamp to 100
+            resume_limit: 240,             // > 100 -> clamp to 100 - 2 = 98
+            max_temp_dc: 9999,             // > 600 -> clamp to 600 (60.0 C)
+            poll_interval_secs: 999,       // > 300 -> clamp to 300
+            max_charge_current_ma: 999999, // > 10000 -> clamp to 10000
+            ..Config::default()
+        };
+        upper_boundary.validate();
+        assert_eq!(upper_boundary.charge_limit, 100);
+        assert_eq!(upper_boundary.resume_limit, 98);
+        assert_eq!(upper_boundary.max_temp_dc, 600);
+        assert_eq!(upper_boundary.poll_interval_secs, 300);
+        assert_eq!(upper_boundary.max_charge_current_ma, 10000);
+    }
 }

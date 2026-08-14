@@ -803,5 +803,5 @@ fn setup_netlink_socket() -> Option<RawFd> {
     }
 }
 
-#[cfg(test)]
+#[cfg(any(unix, test))]
 pub(crate) use charger_core::battery::uevent::classify_uevent;

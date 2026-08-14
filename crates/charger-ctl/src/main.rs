@@ -79,6 +79,14 @@ enum DebugCommands {
         /// Simulated resume limit
         #[arg(short, long)]
         resume: Option<u8>,
+
+        /// Simulated max charge current in mA (e.g. 1500 for Gentle Mode, 0 for unconstrained)
+        #[arg(long)]
+        max_current: Option<u32>,
+
+        /// Simulated thermal throttle toggle (true/false)
+        #[arg(long)]
+        thermal_throttle: Option<bool>,
     },
 
     /// Deep probe of all /sys/class/power_supply sysfs nodes & permissions
@@ -88,7 +96,7 @@ enum DebugCommands {
         output: Option<std::path::PathBuf>,
     },
 
-    /// Raw kernel netlink uevent stream dumper
+    /// Live raw kernel netlink uevent stream dumper
     Uevent,
 }
 
@@ -191,8 +199,17 @@ fn main() -> Result<(), ChargerError> {
                 interval,
                 limit,
                 resume,
+                max_current,
+                thermal_throttle,
             } => {
-                cmd::debug::run_observer(output.clone(), *interval, *limit, *resume)?;
+                cmd::debug::run_observer(
+                    output.clone(),
+                    *interval,
+                    *limit,
+                    *resume,
+                    *max_current,
+                    *thermal_throttle,
+                )?;
             }
             DebugCommands::Nodes { output } => {
                 cmd::debug::run_node_dump(output.as_deref())?;

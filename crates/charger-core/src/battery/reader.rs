@@ -445,4 +445,36 @@ mod tests {
         assert_eq!(parse_percentage("150"), None);
         assert_eq!(parse_percentage("abc"), None);
     }
+
+    #[test]
+    fn test_power_state_plugged_in() {
+        assert!(PowerState::Connected.is_plugged_in());
+        assert!(PowerState::Charging.is_plugged_in());
+        assert!(PowerState::Attached.is_plugged_in());
+        assert!(!PowerState::Disconnected.is_plugged_in());
+        assert!(!PowerState::Unknown.is_plugged_in());
+    }
+
+    #[test]
+    fn test_current_metrics_struct() {
+        // Negative current = Charging flow (into battery)
+        let charging = CurrentMetrics {
+            current_ma: 785.5,
+            signed_ma: 785.5,
+            is_charging_flow: true,
+            wattage_w: calc_wattage_w(4_400_000, 785.5),
+        };
+        assert!(charging.is_charging_flow);
+        assert!((charging.wattage_w - 3.4562).abs() < 0.01);
+
+        // Positive current = Discharging flow (out of battery)
+        let discharging = CurrentMetrics {
+            current_ma: 350.0,
+            signed_ma: -350.0,
+            is_charging_flow: false,
+            wattage_w: calc_wattage_w(4_100_000, 350.0),
+        };
+        assert!(!discharging.is_charging_flow);
+        assert_eq!(discharging.signed_ma, -350.0);
+    }
 }

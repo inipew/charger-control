@@ -1468,4 +1468,207 @@ mod tests {
         let reg_d = resolve_current_regulation(&config, &runtime, &dec_block);
         assert_eq!(reg_d, CurrentRegulation::Disabled);
     }
+
+    #[test]
+    fn test_grace_period_current_cap() {
+        let mut config = Config::default();
+        config.max_charge_current_ma = 2500; // User set 2.5A
+        let mut runtime = PolicyRuntime::default();
+        let now = Instant::now();
+
+        // When in Grace period, current MUST be capped to 1000 mA (top-off saturation protection)
+        runtime.charge_limit_state = ChargeLimitState::Grace { started_at: now };
+        let reg = resolve_current_regulation(&config, &runtime, &ChargingDecision::Allow);
+        assert_eq!(
+            reg,
+            CurrentRegulation::GraceCap {
+                target_ua: 1_000_000
+            }
+        );
+
+        // If user set even lower (e.g. 500 mA), user lower limit wins!
+        config.max_charge_current_ma = 500;
+        let reg_low = resolve_current_regulation(&config, &runtime, &ChargingDecision::Allow);
+        assert_eq!(reg_low, CurrentRegulation::GraceCap { target_ua: 500_000 });
+    }
+
+    #[test]
+    fn test_unconstrained_charging_flow() {
+        let config = Config::default(); // max_charge_current_ma = 0
+        let runtime = PolicyRuntime::default(); // Normal state, Normal thermal
+        let reg = resolve_current_regulation(&config, &runtime, &ChargingDecision::Allow);
+        assert_eq!(reg, CurrentRegulation::Unconstrained);
+        assert_eq!(reg.target_ua(), None);
+    }
+
+    #[test]
+    fn test_fractional_soc_resume_precision() {
+        let now = Instant::now();
+        let mut observed = ObservedState::new();
+        let mut config = Config::default();
+        config.charge_limit = 80;
+        config.resume_limit = 78;
+        let mut runtime = PolicyRuntime::default();
+
+        observed.connection = ConnectionState::Attached;
+        runtime.charge_limit_state = ChargeLimitState::Suspended;
+
+        // 1. SOC = 78.05% (still > 78.0%) -> remains Suspended (Block)
+        observed.update(
+            charger_core::battery::reader::PowerState::Connected,
+            Some(Sample {
+                capacity: 78.05,
+                temperature_c: 30.0,
+                power_state: charger_core::battery::reader::PowerState::Connected,
+                timestamp: now,
+            }),
+            now,
+        );
+        let p1 = evaluate_policy(
+            &observed,
+            &config,
+            &PolicyResult::clear(),
+            &mut runtime,
+            now,
+        );
+        assert!(p1.is_blocked_by(PolicyBlock::ChargeLimit));
+        assert_eq!(runtime.charge_limit_state, ChargeLimitState::Suspended);
+
+        // 2. SOC = 78.00% (<= 78.0%) -> transitions to Normal (Allow!)
+        observed.update(
+            charger_core::battery::reader::PowerState::Connected,
+            Some(Sample {
+                capacity: 78.00,
+                temperature_c: 30.0,
+                power_state: charger_core::battery::reader::PowerState::Connected,
+                timestamp: now,
+            }),
+            now,
+        );
+        let p2 = evaluate_policy(&observed, &config, &p1, &mut runtime, now);
+        assert!(!p2.is_blocked_by(PolicyBlock::ChargeLimit));
+        assert_eq!(runtime.charge_limit_state, ChargeLimitState::Normal);
+    }
+
+    #[test]
+    fn test_thermal_emergency_full_recovery_cycle() {
+        let now = Instant::now();
+        let mut observed = ObservedState::new();
+        let mut config = Config::default();
+        config.max_temp_dc = 420; // 42.0 C
+                                  // Emergency offset is +3.0 C = 45.0 C (450 dc)
+                                  // Recovery offset is -4.0 C = 38.0 C (380 dc)
+
+        observed.connection = ConnectionState::Attached;
+        let mut runtime = PolicyRuntime::default();
+        let mut p = PolicyResult::clear();
+
+        // 1. T = 44.5 C (< 45.0 C emergency) -> Standard thermal block, but NOT emergency latch
+        observed.update(
+            charger_core::battery::reader::PowerState::Connected,
+            Some(Sample {
+                capacity: 50.0,
+                temperature_c: 44.5,
+                power_state: charger_core::battery::reader::PowerState::Connected,
+                timestamp: now,
+            }),
+            now,
+        );
+        p = evaluate_policy(&observed, &config, &p, &mut runtime, now);
+        assert!(p.is_blocked_by(PolicyBlock::Thermal));
+        assert!(!p.is_blocked_by(PolicyBlock::ThermalEmergency));
+
+        // 2. T = 45.5 C (>= 45.0 C emergency) -> Emergency latch ACTIVATED!
+        observed.update(
+            charger_core::battery::reader::PowerState::Connected,
+            Some(Sample {
+                capacity: 50.0,
+                temperature_c: 45.5,
+                power_state: charger_core::battery::reader::PowerState::Connected,
+                timestamp: now,
+            }),
+            now,
+        );
+        p = evaluate_policy(&observed, &config, &p, &mut runtime, now);
+        assert!(p.is_blocked_by(PolicyBlock::ThermalEmergency));
+
+        // 3. T drops to 40.0 C (> 38.0 C release threshold) -> MUST REMAIN LATCHED
+        observed.update(
+            charger_core::battery::reader::PowerState::Connected,
+            Some(Sample {
+                capacity: 50.0,
+                temperature_c: 40.0,
+                power_state: charger_core::battery::reader::PowerState::Connected,
+                timestamp: now,
+            }),
+            now,
+        );
+        p = evaluate_policy(&observed, &config, &p, &mut runtime, now);
+        assert!(
+            p.is_blocked_by(PolicyBlock::ThermalEmergency),
+            "Latch must hold at 40C"
+        );
+
+        // 4. T drops to 37.5 C (<= 38.0 C release threshold) -> Latch UNLATCHED!
+        observed.update(
+            charger_core::battery::reader::PowerState::Connected,
+            Some(Sample {
+                capacity: 50.0,
+                temperature_c: 37.5,
+                power_state: charger_core::battery::reader::PowerState::Connected,
+                timestamp: now,
+            }),
+            now,
+        );
+        p = evaluate_policy(&observed, &config, &p, &mut runtime, now);
+        assert!(
+            !p.is_blocked_by(PolicyBlock::ThermalEmergency),
+            "Latch must release at 37.5C"
+        );
+        assert!(!p.is_blocked_by(PolicyBlock::Thermal));
+    }
+
+    #[test]
+    fn test_intent_disabled_and_bypass_decisions() {
+        let now = Instant::now();
+        let observed = ObservedState {
+            connection: ConnectionState::Attached,
+            power_state: charger_core::battery::reader::PowerState::Connected,
+            sample: Some(Sample {
+                capacity: 50.0,
+                temperature_c: 30.0,
+                power_state: charger_core::battery::reader::PowerState::Connected,
+                timestamp: now,
+            }),
+            timestamp: now,
+            sample_retry_at: None,
+        };
+        let policy_res = PolicyResult::clear();
+
+        // 1. Intent Disabled -> Block(UserDisabled)
+        let intent_disabled = OperatingIntent {
+            mode: crate::monitor::intent::IntentMode::Disabled,
+            expires_at: None,
+        };
+        let dec_disabled = ChargingDecision::resolve(&observed, &intent_disabled, &policy_res, now);
+        assert_eq!(
+            dec_disabled,
+            ChargingDecision::Block {
+                cause: BlockCause::UserDisabled
+            }
+        );
+
+        // 2. Intent Bypass -> Bypass
+        let intent_bypass = OperatingIntent {
+            mode: crate::monitor::intent::IntentMode::Bypass,
+            expires_at: None,
+        };
+        let dec_bypass = ChargingDecision::resolve(&observed, &intent_bypass, &policy_res, now);
+        assert_eq!(dec_bypass, ChargingDecision::Bypass);
+
+        // 3. Intent Normal -> Allow
+        let intent_normal = OperatingIntent::normal();
+        let dec_normal = ChargingDecision::resolve(&observed, &intent_normal, &policy_res, now);
+        assert_eq!(dec_normal, ChargingDecision::Allow);
+    }
 }
