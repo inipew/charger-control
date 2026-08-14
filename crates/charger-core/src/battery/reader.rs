@@ -6,15 +6,17 @@ use std::{
 
 use crate::{
     battery::nodes::{
-        AC_ONLINE_NODE, BATTERY_CAPACITY_NODES, BATTERY_CAPACITY_RAW_NODES, BATTERY_CURRENT_NODES,
-        BATTERY_REAL_SOC_NODES, BATTERY_STATUS_NODE, BATTERY_TEMP_NODES, BATTERY_VOLTAGE_NODES,
-        INPUT_CURRENT_NODES, USB_ONLINE_NODE, USB_TYPEC_MODE_NODE,
+        BATTERY_CAPACITY_NODES, BATTERY_CAPACITY_RAW_NODES, BATTERY_CURRENT_NODES,
+        BATTERY_REAL_SOC_NODES, BATTERY_SOC_DECIMAL_NODES, BATTERY_STATUS_NODE, BATTERY_TEMP_NODES,
+        BATTERY_VOLTAGE_NODES, CHARGE_FULL_DESIGN_NODES, CYCLE_COUNT_NODES, INPUT_CURRENT_NODES,
+        ONLINE_NODES, TECHNOLOGY_NODES, TYPEC_MODE_NODES,
     },
     error::ChargerError,
 };
 
 static CAPACITY_CACHED_IDX: AtomicUsize = AtomicUsize::new(usize::MAX);
 static CAPACITY_RAW_CACHED_IDX: AtomicUsize = AtomicUsize::new(usize::MAX);
+static SOC_DECIMAL_CACHED_IDX: AtomicUsize = AtomicUsize::new(usize::MAX);
 static REAL_SOC_CACHED_IDX: AtomicUsize = AtomicUsize::new(usize::MAX);
 static INPUT_CURRENT_CACHED_IDX: AtomicUsize = AtomicUsize::new(usize::MAX);
 static BATTERY_CURRENT_CACHED_IDX: AtomicUsize = AtomicUsize::new(usize::MAX);
@@ -84,11 +86,28 @@ pub fn read_capacity() -> Result<u8, ChargerError> {
     Ok(read_capacity_raw()?.round().clamp(0.0, 100.0) as u8)
 }
 
+pub fn read_soc_decimal() -> Option<f32> {
+    read_first_cached(
+        BATTERY_SOC_DECIMAL_NODES,
+        &SOC_DECIMAL_CACHED_IDX,
+        |raw| {
+            let value = raw.parse::<f32>().ok()?;
+            if value.is_finite() && (0.0..100.0).contains(&value) {
+                Some(value / 100.0)
+            } else {
+                None
+            }
+        },
+        "soc_decimal",
+    )
+    .ok()
+}
+
 /// Read battery SOC with fractional precision.
 ///
 /// Supported representations:
 ///
-/// - battery/capacity: 0..100
+/// - battery/capacity: 0..100 (+ optional bms/soc_decimal fractional part)
 /// - bms/capacity_raw: either 0..100 or 0..10000
 /// - battery/real_soc: 0..100
 pub fn read_capacity_raw() -> Result<f32, ChargerError> {
@@ -98,6 +117,11 @@ pub fn read_capacity_raw() -> Result<f32, ChargerError> {
         parse_percentage,
         "capacity",
     ) {
+        if value < 100.0 {
+            if let Some(dec) = read_soc_decimal() {
+                return Ok((value + dec).min(100.0));
+            }
+        }
         return Ok(value);
     }
 
@@ -222,14 +246,8 @@ pub fn read_temperature_c() -> Result<f32, ChargerError> {
 }
 
 pub fn read_charge_full_design() -> Result<u32, ChargerError> {
-    const NODES: &[&str] = &[
-        "/sys/class/power_supply/battery/charge_full_design",
-        "/sys/class/power_supply/bms/charge_full_design",
-        "/sys/class/power_supply/battery/capacity_design_uah",
-    ];
-
     read_first_cached(
-        NODES,
+        CHARGE_FULL_DESIGN_NODES,
         &CHARGE_FULL_CACHED_IDX,
         |raw| {
             let value = raw.parse::<u32>().ok()?;
@@ -247,14 +265,8 @@ pub fn read_charge_full_design() -> Result<u32, ChargerError> {
 }
 
 pub fn read_cycle_count() -> Result<u32, ChargerError> {
-    const NODES: &[&str] = &[
-        "/sys/class/power_supply/battery/cycle_count",
-        "/sys/class/power_supply/bms/cycle_count",
-        "/sys/class/power_supply/main/cycle_count",
-    ];
-
     read_first_cached(
-        NODES,
+        CYCLE_COUNT_NODES,
         &CYCLE_COUNT_CACHED_IDX,
         |raw| raw.parse::<u32>().ok(),
         "cycle_count",
@@ -262,17 +274,10 @@ pub fn read_cycle_count() -> Result<u32, ChargerError> {
 }
 
 pub fn read_technology() -> Result<String, ChargerError> {
-    const NODES: &[&str] = &[
-        "/sys/class/power_supply/battery/technology",
-        // battery/type = "Battery" is the power supply type, not chemistry — skip.
-        // bms/battery_type may be a numeric ID on some platforms — validated below.
-        "/sys/class/power_supply/bms/battery_type",
-    ];
-
     // Values that describe the power supply category, not battery chemistry.
     const NON_TECH_VALUES: &[&str] = &["Battery", "Mains", "USB", "BMS", "UPS", "Unknown"];
 
-    for path in NODES {
+    for path in TECHNOLOGY_NODES {
         if let Ok(value) = read_sysfs(Path::new(path)) {
             if value.is_empty() {
                 continue;
@@ -304,6 +309,53 @@ pub fn calc_wattage_from_ua_w(voltage_uv: u32, current_ua: i64) -> f32 {
     (voltage_uv as f64 / 1_000_000.0 * current_ua as f64 / 1_000_000.0) as f32
 }
 
+/// Normalized metrics of battery current and power flow.
+#[derive(Debug, Clone, Copy, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct CurrentMetrics {
+    /// Absolute current in mA.
+    pub current_ma: f32,
+    /// Signed current in mA (+ for charging, - for discharging).
+    pub signed_ma: f32,
+    /// Whether current is flowing into battery (charging).
+    pub is_charging_flow: bool,
+    /// Absolute power in Watts.
+    pub wattage_w: f32,
+}
+
+/// Read normalized battery current, direction, and power draw.
+pub fn get_battery_metrics() -> Result<CurrentMetrics, ChargerError> {
+    let current_ua = read_battery_current_ua()?;
+    let voltage_uv = read_voltage_uv().unwrap_or(3_800_000);
+    let power_state = get_power_state().unwrap_or(PowerState::Unknown);
+
+    let raw_ma = current_ua as f32 / 1000.0;
+
+    // Standard Linux power supply class convention:
+    // negative current_now = charging into battery (sink),
+    // positive current_now = discharging from battery (source).
+    let is_charging_flow = if raw_ma < 0.0 {
+        true
+    } else if raw_ma > 0.0 && power_state.is_plugged_in() {
+        // Fallback for drivers that invert convention
+        true
+    } else if raw_ma > 0.0 {
+        false
+    } else {
+        power_state.is_plugged_in()
+    };
+
+    let abs_ma = raw_ma.abs();
+    let signed_ma = if is_charging_flow { abs_ma } else { -abs_ma };
+    let wattage_w = calc_wattage_from_ua_w(voltage_uv, current_ua.abs());
+
+    Ok(CurrentMetrics {
+        current_ma: abs_ma,
+        signed_ma,
+        is_charging_flow,
+        wattage_w,
+    })
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PowerState {
     Disconnected,
@@ -331,44 +383,34 @@ impl PowerState {
 ///
 /// Priority:
 ///
-/// 1. AC online
-/// 2. USB Type-C attached hint
+/// 1. AC / Charger / USB / Mains online
+/// 2. USB Type-C attached hint (Source attached or Sink attached)
 /// 3. disconnected
 pub fn get_power_state() -> Result<PowerState, ChargerError> {
     let mut source_available = false;
 
-    if let Ok(ac_online) = read_sysfs(Path::new(AC_ONLINE_NODE)) {
-        source_available = true;
-        if ac_online == "1" {
-            let status =
-                read_sysfs(Path::new(BATTERY_STATUS_NODE)).unwrap_or_else(|_| "Unknown".to_owned());
+    for path_str in ONLINE_NODES {
+        if let Ok(online) = read_sysfs(Path::new(path_str)) {
+            source_available = true;
+            if online == "1" {
+                let status =
+                    read_sysfs(Path::new(BATTERY_STATUS_NODE)).unwrap_or_else(|_| "Unknown".to_owned());
 
-            return Ok(if status.eq_ignore_ascii_case("Charging") {
-                PowerState::Charging
-            } else {
-                PowerState::Connected
-            });
+                return Ok(if status.eq_ignore_ascii_case("Charging") {
+                    PowerState::Charging
+                } else {
+                    PowerState::Connected
+                });
+            }
         }
     }
 
-    if let Ok(usb_online) = read_sysfs(Path::new(USB_ONLINE_NODE)) {
-        source_available = true;
-        if usb_online == "1" {
-            let status =
-                read_sysfs(Path::new(BATTERY_STATUS_NODE)).unwrap_or_else(|_| "Unknown".to_owned());
-
-            return Ok(if status.eq_ignore_ascii_case("Charging") {
-                PowerState::Charging
-            } else {
-                PowerState::Connected
-            });
-        }
-    }
-
-    if let Ok(typec) = read_sysfs(Path::new(USB_TYPEC_MODE_NODE)) {
-        source_available = true;
-        if typec.contains("Source attached") {
-            return Ok(PowerState::Attached);
+    for path_str in TYPEC_MODE_NODES {
+        if let Ok(typec) = read_sysfs(Path::new(path_str)) {
+            source_available = true;
+            if typec.contains("Source attached") || typec.contains("Sink attached") {
+                return Ok(PowerState::Attached);
+            }
         }
     }
 
@@ -376,5 +418,31 @@ pub fn get_power_state() -> Result<PowerState, ChargerError> {
         Ok(PowerState::Disconnected)
     } else {
         Ok(PowerState::Unknown)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_wattage_calculation() {
+        // 4.40V * 500mA = 2.2W
+        let w = calc_wattage_w(4_400_000, 500.0);
+        assert!((w - 2.2).abs() < 0.001);
+
+        // 4.35V * 1000000uA (1A) = 4.35W
+        let w2 = calc_wattage_from_ua_w(4_350_000, 1_000_000);
+        assert!((w2 - 4.35).abs() < 0.001);
+    }
+
+    #[test]
+    fn test_parse_percentage() {
+        assert_eq!(parse_percentage("98"), Some(98.0));
+        assert_eq!(parse_percentage("100"), Some(100.0));
+        assert_eq!(parse_percentage("0"), Some(0.0));
+        assert_eq!(parse_percentage("-5"), None);
+        assert_eq!(parse_percentage("150"), None);
+        assert_eq!(parse_percentage("abc"), None);
     }
 }

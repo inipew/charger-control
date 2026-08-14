@@ -342,12 +342,12 @@ pub fn run_monitor_loop(
                     .battery_temperature_dc
                     .store((s.temperature_c * 10.0) as i32, Ordering::Relaxed);
             } else {
-                diagnostics
-                    .battery_level_percent
-                    .store(255, Ordering::Relaxed);
-                diagnostics
-                    .battery_temperature_dc
-                    .store(i32::MIN, Ordering::Relaxed);
+                if let Ok(cap) = reader::read_capacity() {
+                    diagnostics.battery_level_percent.store(cap, Ordering::Relaxed);
+                }
+                if let Ok(temp_dc) = reader::read_temperature_dc() {
+                    diagnostics.battery_temperature_dc.store(temp_dc, Ordering::Relaxed);
+                }
             }
 
             // 3. Evaluasi Policy Engine
@@ -358,6 +358,27 @@ pub fn run_monitor_loop(
             let decision =
                 ChargingDecision::resolve(&ctx.observed, &ctx.intent, &ctx.policy_result, now_eval);
             let desired_hw = decision.to_desired_hardware();
+
+            if let Ok(mut fsm) = diagnostics.fsm_state.write() {
+                *fsm = match &ctx.policy_runtime.charge_limit_state {
+                    policy::ChargeLimitState::Normal => "Normal (Charging)".to_string(),
+                    policy::ChargeLimitState::Grace { started_at } => {
+                        let elapsed = now_eval.duration_since(*started_at);
+                        let remaining = policy::CHARGE_LIMIT_SUSPEND_DELAY.saturating_sub(elapsed).as_secs();
+                        format!("Grace Period ({remaining}s remaining top-off)")
+                    }
+                    policy::ChargeLimitState::Suspended => "Suspended (Limit reached)".to_string(),
+                };
+            }
+
+            if let Ok(mut dec) = diagnostics.target_decision.write() {
+                *dec = match &decision {
+                    ChargingDecision::Allow => "Allow".to_string(),
+                    ChargingDecision::Block { cause } => format!("Block ({cause:?})"),
+                    ChargingDecision::Bypass => "Bypass".to_string(),
+                    ChargingDecision::Wait { reason } => format!("Wait ({reason:?})"),
+                };
+            }
 
             // 5. Rekonsiliasi Hardware (Idempotent Sysfs Write & Event-Driven Verification)
             let is_emergency = matches!(

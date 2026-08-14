@@ -34,7 +34,7 @@ pub fn classify_uevent(data: &[u8]) -> UeventKind {
     if subsystem == Some(b"power_supply") {
         if let Some(name) = power_supply_name {
             match name {
-                b"ac" => return UeventKind::Ac,
+                b"ac" | b"main" | b"mains" | b"wireless" => return UeventKind::Ac,
                 b"usb" | b"charger" => return UeventKind::Usb,
                 b"typec" => return UeventKind::TypeC,
                 b"battery" => return UeventKind::Battery,
@@ -51,8 +51,14 @@ pub fn classify_uevent(data: &[u8]) -> UeventKind {
         if dp.windows(8).any(|w| w == b"/battery") || dp.ends_with(b"/battery") {
             return UeventKind::Battery;
         }
+        if dp.windows(8).any(|w| w == b"/charger") || dp.ends_with(b"/charger") {
+            return UeventKind::Usb;
+        }
         if dp.windows(4).any(|w| w == b"/usb") || dp.ends_with(b"/usb") {
             return UeventKind::Usb;
+        }
+        if dp.windows(5).any(|w| w == b"/main") || dp.ends_with(b"/main") {
+            return UeventKind::Ac;
         }
         if dp.windows(3).any(|w| w == b"/ac") || dp.ends_with(b"/ac") {
             return UeventKind::Ac;

@@ -32,6 +32,8 @@ pub struct DaemonDiagnostics {
     pub battery_temperature_dc: AtomicI32,
     pub power_state: RwLock<String>,
     pub hardware_state: RwLock<String>,
+    pub fsm_state: RwLock<String>,
+    pub target_decision: RwLock<String>,
 }
 
 impl DaemonDiagnostics {
@@ -45,6 +47,8 @@ impl DaemonDiagnostics {
             battery_temperature_dc: AtomicI32::new(i32::MIN),
             power_state: RwLock::new("Unknown".to_string()),
             hardware_state: RwLock::new("Unknown".to_string()),
+            fsm_state: RwLock::new("Normal".to_string()),
+            target_decision: RwLock::new("Allow".to_string()),
         }
     }
 }
@@ -531,6 +535,20 @@ fn handle_status(
         }
     };
 
+    let fsm_guard = diagnostics
+        .fsm_state
+        .read()
+        .unwrap_or_else(|p| p.into_inner());
+    let fsm_state = fsm_guard.clone();
+    drop(fsm_guard);
+
+    let dec_guard = diagnostics
+        .target_decision
+        .read()
+        .unwrap_or_else(|p| p.into_inner());
+    let target_decision = dec_guard.clone();
+    drop(dec_guard);
+
     let hw_guard = diagnostics
         .hardware_state
         .read()
@@ -595,7 +613,11 @@ fn handle_status(
          • PID          : {}\n\
          • Memory (RSS) : {:.2} MB\n\
          • CPU Average  : {:.3}%\n\
-         • Hardware     : {:?}\n\
+         \n\
+         [ STATE MACHINE ]\n\
+         • FSM State    : {}\n\
+         • Target Action: {}\n\
+         • Hardware     : {}\n\
          \n\
          [ MONITOR DIAGNOSTICS ]\n\
          • Mode         : {}\n\
@@ -622,6 +644,8 @@ fn handle_status(
         pid,
         rss,
         cpu,
+        fsm_state,
+        target_decision,
         hardware,
         mode_str,
         netlink_str,
@@ -651,6 +675,9 @@ pub struct DaemonStatusResponse {
     pub cpu_percent: f32,
     pub enabled: bool,
     pub mode: String,
+    pub fsm_state: String,
+    pub target_decision: String,
+    pub hardware_state: String,
     pub netlink_available: bool,
     pub poll_interval_ms: u64,
     pub error_backoff_ms: u64,
@@ -678,6 +705,27 @@ fn handle_status_json(
             return;
         }
     };
+
+    let fsm_guard = diagnostics
+        .fsm_state
+        .read()
+        .unwrap_or_else(|p| p.into_inner());
+    let fsm_state = fsm_guard.clone();
+    drop(fsm_guard);
+
+    let dec_guard = diagnostics
+        .target_decision
+        .read()
+        .unwrap_or_else(|p| p.into_inner());
+    let target_decision = dec_guard.clone();
+    drop(dec_guard);
+
+    let hw_guard = diagnostics
+        .hardware_state
+        .read()
+        .unwrap_or_else(|p| p.into_inner());
+    let hardware_state = hw_guard.clone();
+    drop(hw_guard);
 
     let level_val = diagnostics.battery_level_percent.load(Ordering::Relaxed);
     let battery = if level_val == 255 {
@@ -719,6 +767,9 @@ fn handle_status_json(
         cpu_percent: cpu,
         enabled: config_guard.enabled,
         mode: mode_str.to_string(),
+        fsm_state,
+        target_decision,
+        hardware_state,
         netlink_available,
         poll_interval_ms: interval_ms,
         error_backoff_ms: backoff_ms,

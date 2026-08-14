@@ -277,8 +277,6 @@ pub fn run_observer(
 
     let mut sim_state = SimState::Normal;
     let mut last_sample_time = Instant::now() - Duration::from_secs(10);
-    let mut last_soc: Option<f32> = None;
-    let mut last_power_state = reader::PowerState::Unknown;
     let mut uevent_buf = [0u8; 8192];
 
     let poll_timeout_ms = 1000; // 1s sub-poll for responsive event loop
@@ -342,7 +340,6 @@ pub fn run_observer(
             let input_curr_ma = input_curr_res.map(|ua| (ua / 1000) as i32).unwrap_or(0);
 
             // Transisi State Machine Simulasi
-            let prev_sim_state = sim_state;
             let is_plugged = power_state.is_plugged_in();
 
             if !is_plugged {
@@ -388,16 +385,13 @@ pub fn run_observer(
             }
 
             // Target Decision Simulation
-            let (target_decision, target_hw) = if !is_plugged {
-                ("NoChange (Disconnected)", ActualHardwareMode::Unknown)
+            let target_decision = if !is_plugged {
+                "NoChange (Disconnected)"
             } else {
                 match sim_state {
-                    SimState::Normal => ("Allow (Normal Charging)", ActualHardwareMode::ChargingEnabled),
-                    SimState::Grace { started_at } => {
-                        let elapsed_secs = now.duration_since(started_at).as_secs();
-                        ("Allow (Grace Top-Off)", ActualHardwareMode::ChargingEnabled)
-                    }
-                    SimState::Suspended => ("Block (Charge Limit Hysteresis)", ActualHardwareMode::ChargingDisabled),
+                    SimState::Normal => "Allow (Normal Charging)",
+                    SimState::Grace { .. } => "Allow (Grace Top-Off)",
+                    SimState::Suspended => "Block (Charge Limit Hysteresis)",
                 }
             };
 
@@ -413,9 +407,6 @@ pub fn run_observer(
             logger.log(&format!(
                 "📊 SOC: {soc:>5.1}% | Temp: {temp_c:>4.1}°C | Volt: {volt_v:>4.2}V | Curr: {curr_ma:>5}mA | InCurr: {input_curr_ma:>4}mA | Power: {power_state:?} | Status: {batt_status:<10} | FSM: {fsm_str:<18} | Target: {target_decision:<25} | ActualHW: {actual_hw:?}"
             ));
-
-            last_soc = Some(soc);
-            last_power_state = power_state;
         }
     }
 

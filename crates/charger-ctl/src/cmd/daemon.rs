@@ -300,10 +300,10 @@ fn stop_daemon() {
 
     if daemon_ipc_ready() {
         send_cmd(b"shutdown");
-    } else if let Some(p) = target_pid {
+    } else if let Some(_p) = target_pid {
         #[cfg(unix)]
         unsafe {
-            let _ = libc::kill(p as libc::pid_t, libc::SIGTERM);
+            let _ = libc::kill(_p as libc::pid_t, libc::SIGTERM);
         }
     }
 
@@ -323,15 +323,15 @@ fn stop_daemon() {
         std::thread::sleep(POLL_INTERVAL);
     }
 
-    if let Some(p) = target_pid {
+    if let Some(_p) = target_pid {
         #[cfg(unix)]
         {
             display::warn(&format!(
-                "Daemon (PID {p}) did not exit within timeout. Sending SIGTERM..."
+                "Daemon (PID {_p}) did not exit within timeout. Sending SIGTERM..."
             ));
 
             unsafe {
-                let _ = libc::kill(p as libc::pid_t, libc::SIGTERM);
+                let _ = libc::kill(_p as libc::pid_t, libc::SIGTERM);
             }
         }
     }
@@ -352,15 +352,15 @@ fn stop_daemon() {
         std::thread::sleep(POLL_INTERVAL);
     }
 
-    if let Some(p) = target_pid {
+    if let Some(_p) = target_pid {
         #[cfg(unix)]
         {
             display::error(&format!(
-                "Daemon (PID {p}) is stubborn. Force killing (SIGKILL)..."
+                "Daemon (PID {_p}) is stubborn. Force killing (SIGKILL)..."
             ));
 
             unsafe {
-                let _ = libc::kill(p as libc::pid_t, libc::SIGKILL);
+                let _ = libc::kill(_p as libc::pid_t, libc::SIGKILL);
             }
         }
     }
