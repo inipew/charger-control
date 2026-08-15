@@ -18,14 +18,20 @@ pub enum HardwareFault {
     PermissionDenied,
     WriteFailed,
     ReadbackMismatch,
+    CurrentLimitNodeMissing,
+    CurrentLimitWriteFailed,
 }
 
 impl HardwareFault {
     pub fn retry_policy(&self) -> FaultRetryPolicy {
         match self {
             Self::PermissionDenied => FaultRetryPolicy::Never,
-            Self::NodeMissing => FaultRetryPolicy::After(Duration::from_secs(30)),
-            Self::WriteFailed => FaultRetryPolicy::After(Duration::from_secs(5)),
+            Self::NodeMissing | Self::CurrentLimitNodeMissing => {
+                FaultRetryPolicy::After(Duration::from_secs(30))
+            }
+            Self::WriteFailed | Self::CurrentLimitWriteFailed => {
+                FaultRetryPolicy::After(Duration::from_secs(5))
+            }
             Self::ReadbackMismatch => FaultRetryPolicy::After(Duration::from_secs(10)),
         }
     }
@@ -34,6 +40,15 @@ impl HardwareFault {
     pub fn is_retryable(&self) -> bool {
         !matches!(self.retry_policy(), FaultRetryPolicy::Never)
     }
+}
+
+/// Status konvergensi antara desired state dan physical hardware truth.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ConvergenceState {
+    Converged,
+    Reconciling,
+    Deferred,
+    Fault,
 }
 
 /// Status transisi eksplisit dari hardware actuator.
@@ -77,6 +92,8 @@ pub struct HardwareTrack {
     pub status: HardwareStatus,
     pub verification_needed: bool,
     pub applied_current_limit_ua: Option<u32>,
+    pub current_verification_needed: bool,
+    pub convergence: ConvergenceState,
 }
 
 impl HardwareTrack {
@@ -86,11 +103,14 @@ impl HardwareTrack {
             status: HardwareStatus::Unknown,
             verification_needed: true,
             applied_current_limit_ua: None,
+            current_verification_needed: true,
+            convergence: ConvergenceState::Converged,
         }
     }
 
     pub fn mark_verification_needed(&mut self) {
         self.verification_needed = true;
+        self.current_verification_needed = true;
     }
 
     pub fn update_observation(&mut self, mode: control::ActualHardwareMode, now: Instant) {
@@ -100,6 +120,7 @@ impl HardwareTrack {
         };
         self.status = HardwareStatus::Stable { mode };
         self.verification_needed = false;
+        self.convergence = ConvergenceState::Converged;
     }
 
     pub fn mark_fault(&mut self, error: HardwareFault, now: Instant) {
@@ -113,6 +134,7 @@ impl HardwareTrack {
             self.last_verified_obs = HardwareObservation::new();
         }
         self.verification_needed = false;
+        self.convergence = ConvergenceState::Fault;
     }
 
     pub fn next_deadline(&self) -> Option<Instant> {
@@ -131,7 +153,13 @@ impl HardwareTrack {
         self.status = HardwareStatus::Unknown;
         self.last_verified_obs = HardwareObservation::new();
         self.verification_needed = true;
+        // P0-2 FIX: Reset hardware current limit immediately if we know one was applied,
+        // and set current_verification_needed = true so that upon next attach,
+        // we explicitly verify and reset hardware rather than skipping.
+        let _ = control::reset_fast_charge_current();
         self.applied_current_limit_ua = None;
+        self.current_verification_needed = true;
+        self.convergence = ConvergenceState::Converged;
     }
 }
 
@@ -163,6 +191,7 @@ pub fn reconcile(
     // decision layer tidak mengatur hardware state transitions
     // saat charger terputus (disconnected) atau selama settling.
     if desired == DesiredHardwareState::NoChange {
+        track.convergence = ConvergenceState::Converged;
         return ReconcileResult::Skipped(track.last_verified_obs.mode);
     }
 
@@ -186,10 +215,12 @@ pub fn reconcile(
         match retry {
             FaultRetryPolicy::After(delay) => {
                 if now < *failed_at + *delay && !opts.bypass_retry_delay {
+                    track.convergence = ConvergenceState::Deferred;
                     return ReconcileResult::Deferred;
                 }
             }
             FaultRetryPolicy::Never => {
+                track.convergence = ConvergenceState::Deferred;
                 return ReconcileResult::Deferred;
             }
         }
@@ -208,6 +239,7 @@ pub fn reconcile(
     // 3. Mutation Phase: Jika status hardware saat ini SUDAH SAMA, skip penulisan sysfs! (Idempotency)
     if current_actual == expected_actual {
         track.update_observation(current_actual, now);
+        track.convergence = ConvergenceState::Converged;
         return ReconcileResult::Stable(current_actual);
     }
 
@@ -215,6 +247,7 @@ pub fn reconcile(
         target: desired,
         started_at: now,
     };
+    track.convergence = ConvergenceState::Reconciling;
 
     // 4. Mutation Phase: Jalankan penulisan fisik sysfs
     let write_res = match expected_actual {
@@ -275,27 +308,59 @@ pub fn reconcile(
     }
 }
 
-/// Rekonsiliasi batas arus pengisian daya ke sysfs secara idempotent.
+/// Rekonsiliasi batas arus pengisian daya ke sysfs secara idempotent dan closed-loop.
 pub fn reconcile_current(
     target: super::decision::CurrentRegulation,
     track: &mut HardwareTrack,
     force: bool,
-) {
+    now: Instant,
+) -> Result<(), ChargerError> {
     let desired_ua = target.target_ua();
 
-    if !force && track.applied_current_limit_ua == desired_ua {
-        return;
+    if !force && !track.current_verification_needed && track.applied_current_limit_ua == desired_ua {
+        return Ok(());
     }
 
     if let Some(ua) = desired_ua {
-        if let Err(e) = control::set_fast_charge_current(ua) {
-            tracing::warn!(error = %e, target_ua = ua, "Failed setting fast charge current limit");
-        } else {
-            track.applied_current_limit_ua = Some(ua);
+        match control::set_fast_charge_current(ua) {
+            Ok(()) => {
+                track.applied_current_limit_ua = Some(ua);
+                track.current_verification_needed = false;
+                Ok(())
+            }
+            Err(ChargerError::NoChargingNodeFound) => {
+                control::reset_node_caches();
+                track.mark_fault(HardwareFault::CurrentLimitNodeMissing, now);
+                Err(ChargerError::NoChargingNodeFound)
+            }
+            Err(e) => {
+                tracing::warn!(error = %e, target_ua = ua, "Failed setting fast charge current limit");
+                track.mark_fault(HardwareFault::CurrentLimitWriteFailed, now);
+                Err(e)
+            }
         }
-    } else if track.applied_current_limit_ua.is_some() {
-        // Reset to default hardware maximum
-        let _ = control::reset_fast_charge_current();
-        track.applied_current_limit_ua = None;
+    } else {
+        // Desired is Unconstrained (None / Max Hardware)
+        if track.applied_current_limit_ua.is_some() || track.current_verification_needed || force {
+            match control::reset_fast_charge_current() {
+                Ok(()) => {
+                    track.applied_current_limit_ua = None;
+                    track.current_verification_needed = false;
+                    Ok(())
+                }
+                Err(ChargerError::NoChargingNodeFound) => {
+                    control::reset_node_caches();
+                    track.mark_fault(HardwareFault::CurrentLimitNodeMissing, now);
+                    Err(ChargerError::NoChargingNodeFound)
+                }
+                Err(e) => {
+                    tracing::warn!(error = %e, "Failed resetting fast charge current limit");
+                    track.mark_fault(HardwareFault::CurrentLimitWriteFailed, now);
+                    Err(e)
+                }
+            }
+        } else {
+            Ok(())
+        }
     }
 }

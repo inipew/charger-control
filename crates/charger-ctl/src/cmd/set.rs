@@ -188,3 +188,17 @@ pub fn thermal_throttle(enabled: bool) -> Result<(), ChargerError> {
     notify_daemon();
     Ok(())
 }
+
+pub fn enable(enabled: bool) -> Result<(), ChargerError> {
+    let mut cfg = load_config()?;
+    cfg.enabled = enabled;
+    save_config(&cfg)?;
+
+    display::success(&format!(
+        "Charging control {}",
+        if enabled { "enabled" } else { "disabled" }
+    ));
+
+    notify_daemon();
+    Ok(())
+}

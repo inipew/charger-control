@@ -12,10 +12,13 @@ use mio::unix::SourceFd;
 #[cfg(unix)]
 use mio::{Events, Interest, Poll, Token};
 #[cfg(unix)]
-use std::{os::fd::RawFd, os::unix::net::UnixDatagram};
+use std::{
+    os::fd::{AsRawFd, FromRawFd, OwnedFd},
+    os::unix::net::UnixDatagram,
+};
 
 #[cfg(not(unix))]
-type RawFd = i32;
+pub struct OwnedFd;
 
 #[cfg(unix)]
 use std::sync::atomic::Ordering;
@@ -48,6 +51,7 @@ use scheduler::{AdaptiveScheduler, SchedulingState, Urgency};
 #[derive(Debug, Default)]
 pub struct DiagnosticsState {
     pub last_decision: Option<ChargingDecision>,
+    pub last_computed_decision: Option<ChargingDecision>,
     pub last_hw_mode: Option<control::ActualHardwareMode>,
     pub last_heartbeat_log: Option<Instant>,
     pub last_error: Option<HardwareFault>,
@@ -116,10 +120,15 @@ pub struct MonitorContext {
 impl MonitorContext {
     pub fn new(config: &Config) -> Self {
         let has_distinct_bypass = control::has_distinct_bypass_node();
+        let intent = if config.enabled {
+            OperatingIntent::normal()
+        } else {
+            OperatingIntent::disabled()
+        };
         Self {
             config: config.clone(),
             observed: ObservedState::new(),
-            intent: OperatingIntent::normal(),
+            intent,
             policy_result: PolicyResult::clear(),
             hardware_track: HardwareTrack::new(),
             sched: SchedulingState::new(),
@@ -227,15 +236,15 @@ pub fn run_monitor_loop(
         .register(&mut mio_rx, IPC, Interest::READABLE)
         .expect("Failed to register IPC datagram to mio::Poll");
 
-    let mut netlink_fd = setup_netlink_socket();
-    if let Some(fd) = netlink_fd {
-        let mut source = SourceFd(&fd);
+    let mut netlink_fd: Option<OwnedFd> = setup_netlink_socket();
+    if let Some(ref fd) = netlink_fd {
+        let raw_fd = fd.as_raw_fd();
+        let mut source = SourceFd(&raw_fd);
         if let Err(e) = poll
             .registry()
             .register(&mut source, NETLINK, Interest::READABLE)
         {
             tracing::warn!(error = %e, "Failed to register Netlink socket");
-            unsafe { libc::close(fd) };
             netlink_fd = None;
         }
     }
@@ -254,14 +263,14 @@ pub fn run_monitor_loop(
     loop {
         if netlink_fd.is_none() {
             netlink_fd = setup_netlink_socket();
-            if let Some(fd) = netlink_fd {
-                let mut source = SourceFd(&fd);
+            if let Some(ref fd) = netlink_fd {
+                let raw_fd = fd.as_raw_fd();
+                let mut source = SourceFd(&raw_fd);
                 if let Err(e) = poll
                     .registry()
                     .register(&mut source, NETLINK, Interest::READABLE)
                 {
                     tracing::warn!(error = %e, "Failed to register new Netlink socket");
-                    unsafe { libc::close(fd) };
                     netlink_fd = None;
                 }
             }
@@ -288,9 +297,19 @@ pub fn run_monitor_loop(
                     || new_config.max_charge_current_ma != ctx.config.max_charge_current_ma
                     || new_config.thermal_throttling_enabled
                         != ctx.config.thermal_throttling_enabled
+                    || new_config.thermal_cutoff != ctx.config.thermal_cutoff
+                    || new_config.enabled != ctx.config.enabled
                 {
+                    if new_config.enabled != ctx.config.enabled {
+                        ctx.intent = if new_config.enabled {
+                            OperatingIntent::normal()
+                        } else {
+                            OperatingIntent::disabled()
+                        };
+                    }
                     ctx.policy_runtime.clear();
                     ctx.policy_result = PolicyResult::clear();
+                    ctx.mark_force_hardware_verification();
                 }
 
                 ctx.config = new_config;
@@ -379,7 +398,6 @@ pub fn run_monitor_loop(
             ctx.policy_result = policy::evaluate_policy(
                 &ctx.observed,
                 &ctx.config,
-                &ctx.policy_result,
                 &mut ctx.policy_runtime,
                 now_eval,
             );
@@ -387,6 +405,7 @@ pub fn run_monitor_loop(
             // 4. Resolve Decision & Map to Desired Hardware State
             let decision =
                 ChargingDecision::resolve(&ctx.observed, &ctx.intent, &ctx.policy_result, now_eval);
+            ctx.diag.last_computed_decision = Some(decision.clone());
             let desired_hw = decision.to_desired_hardware();
             let current_reg =
                 decision::resolve_current_regulation(&ctx.config, &ctx.policy_runtime, &decision);
@@ -433,10 +452,11 @@ pub fn run_monitor_loop(
             }
 
             // 5. Rekonsiliasi Hardware (Binary Switch + Current Limit)
-            hardware::reconcile_current(
+            let _ = hardware::reconcile_current(
                 current_reg,
                 &mut ctx.hardware_track,
                 ctx.sched.force_hardware_verification,
+                now_eval,
             );
 
             let is_emergency = matches!(
@@ -508,6 +528,10 @@ pub fn run_monitor_loop(
                 }
             }
 
+            if let Ok(mut conv) = diagnostics.convergence_state.write() {
+                *conv = format!("{:?}", ctx.hardware_track.convergence);
+            }
+
             ctx.clear_evaluation_request();
         }
 
@@ -518,6 +542,7 @@ pub fn run_monitor_loop(
             ctx.hardware_track.next_deadline(),
             ctx.observed.next_sensor_retry(),
             ctx.policy_runtime.charge_limit_deadline(),
+            ctx.policy_runtime.thermal_step_deadline(),
             if ctx.observed.connection.is_connected() {
                 ctx.observed.sample_stale_deadline()
             } else {
@@ -531,7 +556,7 @@ pub fn run_monitor_loop(
 
         let decision_urgency = ctx
             .diag
-            .last_decision
+            .last_computed_decision
             .as_ref()
             .map(|d| d.to_urgency())
             .unwrap_or(Urgency::Idle);
@@ -657,12 +682,13 @@ pub fn run_monitor_loop(
                         if event.is_error() || event.is_read_closed() {
                             batch.netlink_broken = true;
                         } else if event.is_readable() {
-                            if let Some(nl_fd) = netlink_fd {
+                            if let Some(ref nl_fd) = netlink_fd {
+                                let raw_fd = nl_fd.as_raw_fd();
                                 let mut buf = [0u8; 8192];
                                 loop {
                                     let res = unsafe {
                                         libc::recv(
-                                            nl_fd,
+                                            raw_fd,
                                             buf.as_mut_ptr() as *mut libc::c_void,
                                             buf.len(),
                                             libc::MSG_DONTWAIT,
@@ -739,10 +765,11 @@ pub fn run_monitor_loop(
                 ctx.hardware_track.mark_verification_needed();
                 ctx.mark_force_hardware_verification();
                 ctx.mark_evaluation_requested();
-                if let Some(fd) = netlink_fd.take() {
-                    let mut source = SourceFd(&fd);
+                if let Some(owned_fd) = netlink_fd.take() {
+                    let raw_fd = owned_fd.as_raw_fd();
+                    let mut source = SourceFd(&raw_fd);
                     let _ = poll.registry().deregister(&mut source);
-                    unsafe { libc::close(fd) };
+                    // owned_fd is automatically closed via RAII on drop without manual unsafe libc::close
                     tracing::warn!("Netlink socket broken, will recreate on next loop");
                     diagnostics
                         .netlink_available
@@ -761,7 +788,8 @@ pub fn run_monitor_loop(
 ) {
 }
 
-fn setup_netlink_socket() -> Option<RawFd> {
+#[cfg(unix)]
+fn setup_netlink_socket() -> Option<OwnedFd> {
     #[cfg(target_os = "android")]
     {
         unsafe {
@@ -794,13 +822,18 @@ fn setup_netlink_socket() -> Option<RawFd> {
                 libc::close(fd);
                 return None;
             }
-            Some(fd)
+            Some(OwnedFd::from_raw_fd(fd))
         }
     }
     #[cfg(not(target_os = "android"))]
     {
         None
     }
+}
+
+#[cfg(not(unix))]
+fn setup_netlink_socket() -> Option<OwnedFd> {
+    None
 }
 
 #[cfg(any(unix, test))]

@@ -129,6 +129,12 @@ enum SetTarget {
         #[arg(value_parser = ["on", "off"])]
         state: String,
     },
+
+    /// Enable or disable overall charging control daemon management
+    Enable {
+        #[arg(value_parser = ["on", "off"])]
+        state: String,
+    },
 }
 
 fn main() -> Result<(), ChargerError> {
@@ -162,6 +168,10 @@ fn main() -> Result<(), ChargerError> {
 
             SetTarget::ThermalThrottle { state } => {
                 cmd::set::thermal_throttle(state == "on")?;
+            }
+
+            SetTarget::Enable { state } => {
+                cmd::set::enable(state == "on")?;
             }
         },
 

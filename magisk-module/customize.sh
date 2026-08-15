@@ -22,10 +22,12 @@ if [ ! -f "$DATA_DIR/config.toml" ]; then
 cat > "$DATA_DIR/config.toml" <<EOF
 enabled = true
 charge_limit = 100
+resume_limit = 0
 thermal_cutoff = false
-max_temp_dc = 400
-cpu_power_save = false
+max_temp_dc = 420
 poll_interval_secs = 10
+max_charge_current_ma = 0
+thermal_throttling_enabled = true
 log_path = "$DATA_DIR/charger-control.log"
 EOF
 fi

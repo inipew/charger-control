@@ -46,7 +46,7 @@ impl ObserverLogger {
             }
             let f = OpenOptions::new()
                 .create(true)
-                .write(true)
+                
                 .append(true)
                 .open(path)
                 .map_err(|e| ChargerError::ConfigWrite {
@@ -493,12 +493,7 @@ pub fn run_observer(
             };
 
             if config.thermal_throttling_enabled && desired_thermal_step != sim_thermal_step {
-                let is_step_up = match (desired_thermal_step, sim_thermal_step) {
-                    (SimThermalStep::Step3, _) => true,
-                    (SimThermalStep::Step2, SimThermalStep::Step1 | SimThermalStep::Normal) => true,
-                    (SimThermalStep::Step1, SimThermalStep::Normal) => true,
-                    _ => false,
-                };
+                let is_step_up = matches!((desired_thermal_step, sim_thermal_step), (SimThermalStep::Step3, _) | (SimThermalStep::Step2, SimThermalStep::Step1 | SimThermalStep::Normal) | (SimThermalStep::Step1, SimThermalStep::Normal));
                 let hold_expired = sim_thermal_step_updated_at
                     .is_none_or(|t| now.duration_since(t) >= Duration::from_secs(10));
 

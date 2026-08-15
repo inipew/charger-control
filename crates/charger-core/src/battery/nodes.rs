@@ -70,11 +70,16 @@ pub const ONLINE_NODES: &[&str] = &[
     "/sys/class/power_supply/ac/online",
     "/sys/class/power_supply/charger/online",
     "/sys/class/power_supply/usb/online",
+    "/sys/class/power_supply/main/online",
+    "/sys/class/power_supply/mains/online",
+    "/sys/class/power_supply/wireless/online",
 ];
 
 pub const TYPEC_MODE_NODES: &[&str] = &[
     "/sys/class/power_supply/usb/typec_mode",
     "/sys/class/power_supply/battery/typec_mode",
+    "/sys/class/power_supply/usb/typec_power_role",
+    "/sys/class/typec/port0/power_role",
 ];
 
 pub const BATTERY_STATUS_NODE: &str = "/sys/class/power_supply/battery/status";

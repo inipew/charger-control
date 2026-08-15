@@ -32,10 +32,11 @@ impl CurrentRegulation {
 
 /// Menghitung batas arus pengisian daya berdasarkan hierarki otoritas murni:
 /// 1. Binary Block / Disabled / Disconnected -> Disabled (None)
-/// 2. Stepped Thermal Throttling -> Min(Thermal Step, User Limit)
-/// 3. User Config Limit -> config.max_charge_current_ma * 1000 uA
-/// 4. Grace Top-Off Cap -> Min(1000 mA, User Limit)
-/// 5. Unconstrained -> Kecepatan penuh hardware bawaan
+/// 2. Arbitrasi Multi-Constraint: Batas arus efektif adalah nilai MINIMUM dari seluruh constraint aktif:
+///    - Stepped Thermal Throttling (Step 1: 2.5A, Step 2: 1.5A, Step 3: 0.8A)
+///    - Grace Top-Off Cap (1.0A)
+///    - User Config Limit (config.max_charge_current_ma)
+/// 3. Jika tidak ada constraint yang aktif -> Unconstrained
 pub fn resolve_current_regulation(
     config: &Config,
     policy_runtime: &PolicyRuntime,
@@ -52,40 +53,62 @@ pub fn resolve_current_regulation(
         None
     };
 
-    // 2. Evaluasi Stepped Thermal Throttling
-    if config.thermal_throttling_enabled && policy_runtime.thermal_step != ThermalStep::Normal {
-        let thermal_ua = policy_runtime.thermal_step.target_ua().unwrap_or(u32::MAX);
-        let effective_ua = match user_limit_ua {
-            Some(u) => thermal_ua.min(u),
-            None => thermal_ua,
-        };
-        return CurrentRegulation::ThermalThrottle {
-            step: policy_runtime.thermal_step.level(),
-            target_ua: effective_ua,
-        };
-    }
+    let thermal_limit_ua = if config.thermal_throttling_enabled
+        && policy_runtime.thermal_step != ThermalStep::Normal
+    {
+        policy_runtime.thermal_step.target_ua()
+    } else {
+        None
+    };
 
-    // 3. Evaluasi Grace Period Cap (Top-off saturation cap: 1000 mA)
-    if matches!(
+    let is_grace = matches!(
         policy_runtime.charge_limit_state,
         ChargeLimitState::Grace { .. }
-    ) {
-        let effective_ua = match user_limit_ua {
-            Some(u) => GRACE_CURRENT_CAP_UA.min(u),
-            None => GRACE_CURRENT_CAP_UA,
-        };
-        return CurrentRegulation::GraceCap {
-            target_ua: effective_ua,
+    );
+    let grace_limit_ua = if is_grace {
+        Some(GRACE_CURRENT_CAP_UA)
+    } else {
+        None
+    };
+
+    // Evaluasi seluruh constraint aktif untuk mencari batas arus paling ketat (minimum)
+    let mut effective_limit_ua: Option<u32> = None;
+    for &limit in &[user_limit_ua, thermal_limit_ua, grace_limit_ua] {
+        if let Some(val) = limit {
+            effective_limit_ua = Some(effective_limit_ua.map_or(val, |cur| cur.min(val)));
+        }
+    }
+
+    let Some(target_ua) = effective_limit_ua else {
+        return CurrentRegulation::Unconstrained;
+    };
+
+    // Klasifikasikan domain keputusan berdasarkan constraint utama yang membatasi:
+    // A. Jika Thermal Throttling aktif dan membatasi lebih ketat atau sama dengan Grace & User
+    if let Some(thermal_ua) = thermal_limit_ua {
+        if thermal_ua <= target_ua || (grace_limit_ua.is_none() && user_limit_ua.is_none()) {
+            return CurrentRegulation::ThermalThrottle {
+                step: policy_runtime.thermal_step.level(),
+                target_ua,
+            };
+        }
+    }
+
+    // B. Jika Grace Top-Off Cap aktif dan membatasi lebih ketat dari Thermal
+    if is_grace {
+        return CurrentRegulation::GraceCap { target_ua };
+    }
+
+    // C. Jika Thermal Throttling aktif (misal dengan User Limit lebih rendah dari Thermal Step)
+    if policy_runtime.thermal_step != ThermalStep::Normal && config.thermal_throttling_enabled {
+        return CurrentRegulation::ThermalThrottle {
+            step: policy_runtime.thermal_step.level(),
+            target_ua,
         };
     }
 
-    // 4. Evaluasi User Config Limit
-    if let Some(target_ua) = user_limit_ua {
-        return CurrentRegulation::ConfigLimit { target_ua };
-    }
-
-    // 5. Default: Unconstrained (Bebas)
-    CurrentRegulation::Unconstrained
+    // D. User Config Limit
+    CurrentRegulation::ConfigLimit { target_ua }
 }
 
 /// Status hardware yang diinginkan oleh Decision Resolver.
@@ -119,12 +142,11 @@ pub enum BlockCause {
     UserDisabled,
 }
 
-/// Alasan penundaan pengisian daya berdomain terstruktur.
+/// Alasan penundaan pengisian daya berdomain terstruktur (hanya transisi koneksi fisik).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum WaitReason {
     Disconnected,
     AttachingSettleWindow,
-    SensorUnavailable,
 }
 
 /// Decision Resolver terstruktur tanpa alokasi heap.
@@ -140,7 +162,7 @@ impl ChargingDecision {
     /// Menyelesaikan keputusan pengisian daya berdasarkan hirarki otoritas murni:
     /// 1. Connection check (Disconnect -> Wait(Disconnected))
     /// 2. Attaching window check (Attaching -> Wait(AttachingSettleWindow))
-    /// 3. System Safety Policy Check (via strongest_block())
+    /// 3. System Safety Policy Check (via strongest_block()) -> Block(Cause)
     /// 4. User/Operating Intent check (Disabled / Bypass / Normal)
     ///
     /// Hardware fault/recovery sengaja tidak termasuk dalam decision domain.
@@ -161,11 +183,6 @@ impl ChargingDecision {
             ConnectionState::Attached => {
                 // 1. Safety SELALU menang di atas Hardware Fault dan User Intent
                 if let Some(cause) = policy.strongest_block() {
-                    if cause == BlockCause::SensorStale {
-                        return Self::Wait {
-                            reason: WaitReason::SensorUnavailable,
-                        };
-                    }
                     return Self::Block { cause };
                 }
 
@@ -185,14 +202,11 @@ impl ChargingDecision {
     pub fn to_desired_hardware(&self) -> DesiredHardwareState {
         match self {
             Self::Wait {
-                reason: WaitReason::Disconnected,
-            }
-            | Self::Wait {
-                reason: WaitReason::AttachingSettleWindow,
+                reason: WaitReason::Disconnected | WaitReason::AttachingSettleWindow,
             } => DesiredHardwareState::NoChange,
             Self::Allow => DesiredHardwareState::ChargingEnabled,
             Self::Bypass => DesiredHardwareState::Bypass,
-            Self::Block { .. } | Self::Wait { .. } => DesiredHardwareState::ChargingDisabled,
+            Self::Block { .. } => DesiredHardwareState::ChargingDisabled,
         }
     }
 
@@ -205,18 +219,15 @@ impl ChargingDecision {
             Self::Block {
                 cause: BlockCause::ChargeLimit,
             } => Urgency::Monitoring,
+            Self::Block {
+                cause: BlockCause::SensorStale,
+            } => Urgency::Recovery,
             Self::Wait {
                 reason: WaitReason::Disconnected,
             } => Urgency::Idle,
             Self::Wait {
                 reason: WaitReason::AttachingSettleWindow,
             } => Urgency::Normal,
-            Self::Wait {
-                reason: WaitReason::SensorUnavailable,
-            }
-            | Self::Block {
-                cause: BlockCause::SensorStale,
-            } => Urgency::Recovery,
             Self::Allow
             | Self::Bypass
             | Self::Block {

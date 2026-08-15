@@ -384,7 +384,7 @@ impl PowerState {
 /// Priority:
 ///
 /// 1. AC / Charger / USB / Mains online
-/// 2. USB Type-C attached hint (Source attached or Sink attached)
+/// 2. USB Type-C external power source attached hint (Source attached / Sink role)
 /// 3. disconnected
 pub fn get_power_state() -> Result<PowerState, ChargerError> {
     let mut source_available = false;
@@ -408,7 +408,7 @@ pub fn get_power_state() -> Result<PowerState, ChargerError> {
     for path_str in TYPEC_MODE_NODES {
         if let Ok(typec) = read_sysfs(Path::new(path_str)) {
             source_available = true;
-            if typec.contains("Source attached") || typec.contains("Sink attached") {
+            if is_typec_source_attached(&typec) {
                 return Ok(PowerState::Attached);
             }
         }
@@ -421,9 +421,76 @@ pub fn get_power_state() -> Result<PowerState, ChargerError> {
     }
 }
 
+/// Discriminate whether a Type-C connection represents an incoming power source (charger)
+/// versus an outgoing power sink (OTG flash drive, accessory, or reverse charging).
+///
+/// Kernel Type-C mode conventions:
+/// - Qualcomm `typec_mode`: "Source attached ..." indicates the partner device is a power Source (phone is charging).
+///   "Sink attached ..." indicates the partner is a Sink (phone is powering OTG accessory).
+/// - Linux standard `power_role`: "sink" (or "[sink] source") indicates the local port is a Sink (phone is charging).
+///   "source" indicates the local port is a Source (phone is powering OTG accessory).
+pub fn is_typec_source_attached(raw: &str) -> bool {
+    let lower = raw.trim().to_lowercase();
+
+    // Explicitly reject OTG, accessory, or idle states
+    if lower.contains("sink attached")
+        || lower.contains("nothing attached")
+        || lower.contains("audio adapter")
+        || lower.contains("debug accessory")
+        || lower == "none"
+        || lower == "source"
+        || lower.starts_with("[source]")
+    {
+        return false;
+    }
+
+    // 1. Qualcomm/Android typec_mode: partner is a Source (supplying power to phone)
+    if lower.contains("source attached") {
+        return true;
+    }
+
+    // 2. Linux Type-C class power_role: phone is Sink (consuming power)
+    if lower == "sink" || lower.starts_with("[sink]") {
+        return true;
+    }
+
+    false
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_is_typec_source_attached() {
+        // Chargers (Incoming power Source attached)
+        assert!(is_typec_source_attached(
+            "Source attached (default current)"
+        ));
+        assert!(is_typec_source_attached(
+            "Source attached (medium current 1.5A)"
+        ));
+        assert!(is_typec_source_attached(
+            "Source attached (high current 3.0A)"
+        ));
+        assert!(is_typec_source_attached(
+            "Source attached (non-compliant charger)"
+        ));
+        assert!(is_typec_source_attached("[sink] source"));
+        assert!(is_typec_source_attached("sink"));
+
+        // OTG / Reverse charging / Accessories (Should NOT be detected as charger!)
+        assert!(!is_typec_source_attached("Sink attached"));
+        assert!(!is_typec_source_attached("Sink attached (powered cable)"));
+        assert!(!is_typec_source_attached("Sink attached (debug accessory)"));
+        assert!(!is_typec_source_attached(
+            "Audio adapter accessory attached"
+        ));
+        assert!(!is_typec_source_attached("Nothing attached"));
+        assert!(!is_typec_source_attached("none"));
+        assert!(!is_typec_source_attached("[source] sink"));
+        assert!(!is_typec_source_attached("source"));
+    }
 
     #[test]
     fn test_wattage_calculation() {

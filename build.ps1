@@ -23,12 +23,21 @@ if (-not (Test-Path $BinDir)) {
     New-Item -ItemType Directory -Force -Path $BinDir | Out-Null
 }
 
-# Copy binary to module structure
-$BinSource = "$ProjectDir\target\aarch64-linux-android\release\ccrs"
-if (-not (Test-Path $BinSource)) {
-    $BinSource = "$ProjectDir\target\release\ccrs"
+# Copy binaries to module structure
+$Binaries = @("charger-daemon", "charger-ctl")
+
+foreach ($BinName in $Binaries) {
+    $BinSource = "$ProjectDir\target\aarch64-linux-android\release\$BinName"
+    if (-not (Test-Path $BinSource)) {
+        $BinSource = "$ProjectDir\target\release\$BinName"
+    }
+    if (Test-Path $BinSource) {
+        Copy-Item -Force $BinSource "$BinDir\$BinName"
+        Write-Host "Copied $BinName to $BinDir"
+    } else {
+        Write-Error "Binary $BinName not found at $BinSource"
+    }
 }
-Copy-Item -Force $BinSource "$BinDir\ccrs"
 
 # Zip the module
 $ZipName = "charger-control-module.zip"

@@ -46,7 +46,6 @@ mod tests {
         let _p0 = evaluate_policy(
             &observed,
             &config,
-            &PolicyResult::clear(),
             &mut runtime,
             now,
         );
@@ -63,7 +62,7 @@ mod tests {
             }),
             after_grace,
         );
-        let policy1 = evaluate_policy(&observed, &config, &_p0, &mut runtime, after_grace);
+        let policy1 = evaluate_policy(&observed, &config, &mut runtime, after_grace);
         assert!(policy1.is_blocked_by(PolicyBlock::ChargeLimit));
 
         // SOC 99% masih di atas resume (98%) → tetap blocked (hysteresis)
@@ -78,7 +77,7 @@ mod tests {
             after_grace,
         );
 
-        let policy2 = evaluate_policy(&observed, &config, &policy1, &mut runtime, after_grace);
+        let policy2 = evaluate_policy(&observed, &config, &mut runtime, after_grace);
         assert!(policy2.is_blocked_by(PolicyBlock::ChargeLimit));
 
         // SOC 97% di bawah resume (98%) → unblocked
@@ -93,7 +92,7 @@ mod tests {
             after_grace,
         );
 
-        let policy3 = evaluate_policy(&observed, &config, &policy2, &mut runtime, after_grace);
+        let policy3 = evaluate_policy(&observed, &config, &mut runtime, after_grace);
         assert!(!policy3.is_blocked_by(PolicyBlock::ChargeLimit));
     }
 
@@ -121,7 +120,6 @@ mod tests {
         let policy1 = evaluate_policy(
             &observed,
             &config,
-            &PolicyResult::clear(),
             &mut runtime,
             now,
         );
@@ -139,7 +137,7 @@ mod tests {
             now,
         );
 
-        let policy2 = evaluate_policy(&observed, &config, &policy1, &mut runtime, now);
+        let policy2 = evaluate_policy(&observed, &config, &mut runtime, now);
         assert!(policy2.is_blocked_by(PolicyBlock::ThermalEmergency));
 
         now += Duration::from_secs(10);
@@ -154,7 +152,7 @@ mod tests {
             now,
         );
 
-        let policy3 = evaluate_policy(&observed, &config, &policy2, &mut runtime, now);
+        let policy3 = evaluate_policy(&observed, &config, &mut runtime, now);
         assert!(!policy3.is_blocked_by(PolicyBlock::ThermalEmergency));
     }
 
@@ -433,7 +431,6 @@ mod tests {
         let p1 = evaluate_policy(
             &observed,
             &config,
-            &PolicyResult::clear(),
             &mut runtime,
             now,
         );
@@ -455,7 +452,7 @@ mod tests {
             }),
             t2,
         );
-        let p2 = evaluate_policy(&observed, &config, &p1, &mut runtime, t2);
+        let p2 = evaluate_policy(&observed, &config, &mut runtime, t2);
         assert!(!p2.is_blocked_by(PolicyBlock::ChargeLimit));
 
         // t=5m: grace period selesai → BLOCK!
@@ -470,7 +467,7 @@ mod tests {
             }),
             t5,
         );
-        let p3 = evaluate_policy(&observed, &config, &p2, &mut runtime, t5);
+        let p3 = evaluate_policy(&observed, &config, &mut runtime, t5);
         assert!(p3.is_blocked_by(PolicyBlock::ChargeLimit));
     }
 
@@ -499,7 +496,6 @@ mod tests {
         let p1 = evaluate_policy(
             &observed,
             &config,
-            &PolicyResult::clear(),
             &mut runtime,
             now,
         );
@@ -521,7 +517,7 @@ mod tests {
             }),
             t3,
         );
-        let p2 = evaluate_policy(&observed, &config, &p1, &mut runtime, t3);
+        let p2 = evaluate_policy(&observed, &config, &mut runtime, t3);
         assert!(!p2.is_blocked_by(PolicyBlock::ChargeLimit));
         assert_eq!(runtime.charge_limit_state, ChargeLimitState::Normal); // Timer reset!
 
@@ -536,7 +532,7 @@ mod tests {
             }),
             t3,
         );
-        let p3 = evaluate_policy(&observed, &config, &p2, &mut runtime, t3);
+        let p3 = evaluate_policy(&observed, &config, &mut runtime, t3);
         assert!(!p3.is_blocked_by(PolicyBlock::ChargeLimit));
         assert_eq!(
             runtime.charge_limit_state,
@@ -555,7 +551,7 @@ mod tests {
             }),
             t5_from_start,
         );
-        let p4 = evaluate_policy(&observed, &config, &p3, &mut runtime, t5_from_start);
+        let p4 = evaluate_policy(&observed, &config, &mut runtime, t5_from_start);
         assert!(!p4.is_blocked_by(PolicyBlock::ChargeLimit)); // Belum 5 menit dari t3!
 
         // t=8m (t3 + 5m) → SEKARANG baru block
@@ -570,7 +566,7 @@ mod tests {
             }),
             t8,
         );
-        let p5 = evaluate_policy(&observed, &config, &p4, &mut runtime, t8);
+        let p5 = evaluate_policy(&observed, &config, &mut runtime, t8);
         assert!(p5.is_blocked_by(PolicyBlock::ChargeLimit));
     }
 
@@ -599,7 +595,6 @@ mod tests {
         let p1 = evaluate_policy(
             &observed,
             &config,
-            &PolicyResult::clear(),
             &mut runtime,
             now,
         );
@@ -610,7 +605,7 @@ mod tests {
 
         // t=61s: sample sekarang stale → timer HARUS reset
         let t_stale = now + crate::monitor::reality::SAMPLE_STALE_THRESHOLD;
-        let p2 = evaluate_policy(&observed, &config, &p1, &mut runtime, t_stale);
+        let p2 = evaluate_policy(&observed, &config, &mut runtime, t_stale);
         assert!(p2.is_blocked_by(PolicyBlock::SensorStale));
         assert_eq!(runtime.charge_limit_state, ChargeLimitState::Normal); // Timer reset!
     }
@@ -640,7 +635,6 @@ mod tests {
         let mut p = evaluate_policy(
             &observed,
             &config,
-            &PolicyResult::clear(),
             &mut runtime,
             now,
         );
@@ -662,7 +656,7 @@ mod tests {
             }),
             now,
         );
-        p = evaluate_policy(&observed, &config, &p, &mut runtime, now);
+        p = evaluate_policy(&observed, &config, &mut runtime, now);
         assert!(!p.is_blocked_by(PolicyBlock::ChargeLimit));
 
         // 3. t=300s: SOC 80% (exact 5 mins) -> BLOCKED
@@ -677,7 +671,7 @@ mod tests {
             }),
             now,
         );
-        p = evaluate_policy(&observed, &config, &p, &mut runtime, now);
+        p = evaluate_policy(&observed, &config, &mut runtime, now);
         assert!(p.is_blocked_by(PolicyBlock::ChargeLimit));
 
         // 4. t=310s: SOC drops to 77% (below resume limit) -> UNBLOCKED and reset
@@ -692,7 +686,7 @@ mod tests {
             }),
             now,
         );
-        p = evaluate_policy(&observed, &config, &p, &mut runtime, now);
+        p = evaluate_policy(&observed, &config, &mut runtime, now);
         assert!(!p.is_blocked_by(PolicyBlock::ChargeLimit));
         assert_eq!(runtime.charge_limit_state, ChargeLimitState::Normal);
 
@@ -709,7 +703,7 @@ mod tests {
             now,
         );
         let start_time_2 = now;
-        p = evaluate_policy(&observed, &config, &p, &mut runtime, now);
+        p = evaluate_policy(&observed, &config, &mut runtime, now);
         assert!(!p.is_blocked_by(PolicyBlock::ChargeLimit));
         assert_eq!(
             runtime.charge_limit_state,
@@ -721,7 +715,7 @@ mod tests {
         // 6. t=330s: Disconnect happens! -> everything clears
         now += Duration::from_secs(10);
         observed.connection = ConnectionState::Disconnected;
-        p = evaluate_policy(&observed, &config, &p, &mut runtime, now);
+        p = evaluate_policy(&observed, &config, &mut runtime, now);
         assert!(!p.is_blocked_by(PolicyBlock::ChargeLimit));
         assert_eq!(runtime.charge_limit_state, ChargeLimitState::Normal);
 
@@ -738,7 +732,7 @@ mod tests {
             }),
             now,
         );
-        p = evaluate_policy(&observed, &config, &p, &mut runtime, now);
+        p = evaluate_policy(&observed, &config, &mut runtime, now);
         assert!(!p.is_blocked_by(PolicyBlock::ChargeLimit));
         assert_eq!(
             runtime.charge_limit_state,
@@ -774,7 +768,6 @@ mod tests {
         let p1 = evaluate_policy(
             &observed,
             &config,
-            &PolicyResult::clear(),
             &mut runtime,
             now,
         );
@@ -805,7 +798,7 @@ mod tests {
             changed,
         );
 
-        let p2 = evaluate_policy(&observed, &new_config, &p1, &mut runtime, changed);
+        let p2 = evaluate_policy(&observed, &new_config, &mut runtime, changed);
 
         // Harus BELUM blocked — timer baru saja dimulai dari `changed`
         assert!(!p2.is_blocked_by(PolicyBlock::ChargeLimit));
@@ -846,7 +839,6 @@ mod tests {
         let p0 = evaluate_policy(
             &observed,
             &config,
-            &PolicyResult::clear(),
             &mut runtime,
             now,
         );
@@ -863,7 +855,7 @@ mod tests {
             }),
             t5,
         );
-        let p_suspended = evaluate_policy(&observed, &config, &p0, &mut runtime, t5);
+        let p_suspended = evaluate_policy(&observed, &config, &mut runtime, t5);
         assert!(p_suspended.is_blocked_by(PolicyBlock::ChargeLimit));
         assert_eq!(runtime.charge_limit_state, ChargeLimitState::Suspended);
 
@@ -878,7 +870,7 @@ mod tests {
             }),
             t5,
         );
-        let p_above = evaluate_policy(&observed, &config, &p_suspended, &mut runtime, t5);
+        let p_above = evaluate_policy(&observed, &config, &mut runtime, t5);
         assert!(
             p_above.is_blocked_by(PolicyBlock::ChargeLimit),
             "78.1 > resume 78 harus tetap Block"
@@ -896,7 +888,7 @@ mod tests {
             }),
             t5,
         );
-        let p_at = evaluate_policy(&observed, &config, &p_above, &mut runtime, t5);
+        let p_at = evaluate_policy(&observed, &config, &mut runtime, t5);
         assert!(
             !p_at.is_blocked_by(PolicyBlock::ChargeLimit),
             "78.0 == resume 78 harus Allow"
@@ -914,7 +906,7 @@ mod tests {
             }),
             t5,
         );
-        let p_below = evaluate_policy(&observed, &config, &p_at, &mut runtime, t5);
+        let p_below = evaluate_policy(&observed, &config, &mut runtime, t5);
         assert!(
             !p_below.is_blocked_by(PolicyBlock::ChargeLimit),
             "77.9 < resume 78 harus Allow"
@@ -948,7 +940,6 @@ mod tests {
         let p0 = evaluate_policy(
             &observed,
             &config,
-            &PolicyResult::clear(),
             &mut runtime,
             now,
         );
@@ -964,7 +955,7 @@ mod tests {
             }),
             t5,
         );
-        let p_suspended = evaluate_policy(&observed, &config, &p0, &mut runtime, t5);
+        let p_suspended = evaluate_policy(&observed, &config, &mut runtime, t5);
         assert!(p_suspended.is_blocked_by(PolicyBlock::ChargeLimit));
         assert_eq!(runtime.charge_limit_state, ChargeLimitState::Suspended);
 
@@ -980,7 +971,7 @@ mod tests {
             }),
             t_resume,
         );
-        let p_normal = evaluate_policy(&observed, &config, &p_suspended, &mut runtime, t_resume);
+        let p_normal = evaluate_policy(&observed, &config, &mut runtime, t_resume);
         assert!(!p_normal.is_blocked_by(PolicyBlock::ChargeLimit));
         assert_eq!(runtime.charge_limit_state, ChargeLimitState::Normal);
 
@@ -996,7 +987,7 @@ mod tests {
             }),
             t_back,
         );
-        let p_grace = evaluate_policy(&observed, &config, &p_normal, &mut runtime, t_back);
+        let p_grace = evaluate_policy(&observed, &config, &mut runtime, t_back);
         assert!(
             !p_grace.is_blocked_by(PolicyBlock::ChargeLimit),
             "Baru naik ke limit lagi harus dalam Grace, belum Block"
@@ -1019,7 +1010,7 @@ mod tests {
             t_next_suspend,
         );
         let p_next_suspend =
-            evaluate_policy(&observed, &config, &p_grace, &mut runtime, t_next_suspend);
+            evaluate_policy(&observed, &config, &mut runtime, t_next_suspend);
         assert!(p_next_suspend.is_blocked_by(PolicyBlock::ChargeLimit));
         assert_eq!(runtime.charge_limit_state, ChargeLimitState::Suspended);
     }
@@ -1088,7 +1079,6 @@ mod tests {
         let p = evaluate_policy(
             &observed,
             &config,
-            &PolicyResult::clear(),
             &mut runtime,
             now,
         );
@@ -1105,7 +1095,7 @@ mod tests {
             Some(make_sample(100.0, t5)),
             t5,
         );
-        let p = evaluate_policy(&observed, &config, &p, &mut runtime, t5);
+        let p = evaluate_policy(&observed, &config, &mut runtime, t5);
         assert!(
             p.is_blocked_by(PolicyBlock::ChargeLimit),
             "SOC 100 setelah 5m harus Block"
@@ -1118,7 +1108,7 @@ mod tests {
             Some(make_sample(99.0, t5)),
             t5,
         );
-        let p = evaluate_policy(&observed, &config, &p, &mut runtime, t5);
+        let p = evaluate_policy(&observed, &config, &mut runtime, t5);
         assert!(
             p.is_blocked_by(PolicyBlock::ChargeLimit),
             "SOC 99 > resume 95 harus tetap Block"
@@ -1131,7 +1121,7 @@ mod tests {
             Some(make_sample(98.0, t5)),
             t5,
         );
-        let p = evaluate_policy(&observed, &config, &p, &mut runtime, t5);
+        let p = evaluate_policy(&observed, &config, &mut runtime, t5);
         assert!(
             p.is_blocked_by(PolicyBlock::ChargeLimit),
             "SOC 98 > resume 95 harus tetap Block"
@@ -1143,7 +1133,7 @@ mod tests {
             Some(make_sample(97.0, t5)),
             t5,
         );
-        let p = evaluate_policy(&observed, &config, &p, &mut runtime, t5);
+        let p = evaluate_policy(&observed, &config, &mut runtime, t5);
         assert!(
             p.is_blocked_by(PolicyBlock::ChargeLimit),
             "SOC 97 > resume 95 harus tetap Block"
@@ -1155,7 +1145,7 @@ mod tests {
             Some(make_sample(96.0, t5)),
             t5,
         );
-        let p = evaluate_policy(&observed, &config, &p, &mut runtime, t5);
+        let p = evaluate_policy(&observed, &config, &mut runtime, t5);
         assert!(
             p.is_blocked_by(PolicyBlock::ChargeLimit),
             "SOC 96 > resume 95 harus tetap Block"
@@ -1167,7 +1157,7 @@ mod tests {
             Some(make_sample(95.0, t5)),
             t5,
         );
-        let p = evaluate_policy(&observed, &config, &p, &mut runtime, t5);
+        let p = evaluate_policy(&observed, &config, &mut runtime, t5);
         assert!(
             !p.is_blocked_by(PolicyBlock::ChargeLimit),
             "SOC 95 == resume 95 harus Allow"
@@ -1180,7 +1170,7 @@ mod tests {
             Some(make_sample(94.0, t5)),
             t5,
         );
-        let p = evaluate_policy(&observed, &config, &p, &mut runtime, t5);
+        let p = evaluate_policy(&observed, &config, &mut runtime, t5);
         assert!(
             !p.is_blocked_by(PolicyBlock::ChargeLimit),
             "SOC 94 < resume 95 harus Allow"
@@ -1218,7 +1208,6 @@ mod tests {
         let p = evaluate_policy(
             &observed,
             &config,
-            &PolicyResult::clear(),
             &mut runtime,
             now,
         );
@@ -1234,7 +1223,7 @@ mod tests {
             }),
             t5,
         );
-        let p = evaluate_policy(&observed, &config, &p, &mut runtime, t5);
+        let p = evaluate_policy(&observed, &config, &mut runtime, t5);
         assert!(p.is_blocked_by(PolicyBlock::ChargeLimit));
         assert_eq!(runtime.charge_limit_state, ChargeLimitState::Suspended);
 
@@ -1243,7 +1232,7 @@ mod tests {
         observed.connection = ConnectionState::Disconnected;
         observed.clear_sample();
         let t_detach = t5 + Duration::from_secs(1);
-        let p_disconnected = evaluate_policy(&observed, &config, &p, &mut runtime, t_detach);
+        let p_disconnected = evaluate_policy(&observed, &config, &mut runtime, t_detach);
 
         // Bitmask policy result harus clear saat disconnected
         assert_eq!(
@@ -1274,7 +1263,6 @@ mod tests {
         let p_after = evaluate_policy(
             &observed,
             &config,
-            &p_disconnected,
             &mut runtime,
             t_reattach,
         );
@@ -1473,10 +1461,11 @@ mod tests {
     fn test_grace_period_current_cap() {
         let mut config = Config::default();
         config.max_charge_current_ma = 2500; // User set 2.5A
+        config.thermal_throttling_enabled = true;
         let mut runtime = PolicyRuntime::default();
         let now = Instant::now();
 
-        // When in Grace period, current MUST be capped to 1000 mA (top-off saturation protection)
+        // 1. When in Grace period, current MUST be capped to 1000 mA (top-off saturation protection)
         runtime.charge_limit_state = ChargeLimitState::Grace { started_at: now };
         let reg = resolve_current_regulation(&config, &runtime, &ChargingDecision::Allow);
         assert_eq!(
@@ -1486,7 +1475,31 @@ mod tests {
             }
         );
 
-        // If user set even lower (e.g. 500 mA), user lower limit wins!
+        // 2. Collision Test: Grace (1000 mA) + Thermal Step 1 (2500 mA) -> Grace Cap (1000 mA) MUST WIN!
+        runtime.thermal_step = ThermalStep::Step1; // 2500 mA
+        let reg_step1 = resolve_current_regulation(&config, &runtime, &ChargingDecision::Allow);
+        assert_eq!(
+            reg_step1,
+            CurrentRegulation::GraceCap {
+                target_ua: 1_000_000
+            },
+            "Grace Cap 1000 mA must take precedence over Thermal Step 1 (2500 mA)"
+        );
+
+        // 3. Collision Test: Grace (1000 mA) + Thermal Step 3 (800 mA) -> Thermal Step 3 MUST WIN (strictest limit)!
+        runtime.thermal_step = ThermalStep::Step3; // 800 mA
+        let reg_step3 = resolve_current_regulation(&config, &runtime, &ChargingDecision::Allow);
+        assert_eq!(
+            reg_step3,
+            CurrentRegulation::ThermalThrottle {
+                step: 3,
+                target_ua: 800_000
+            },
+            "Thermal Step 3 (800 mA) must take precedence over Grace Cap (1000 mA)"
+        );
+
+        // 4. If user set even lower (e.g. 500 mA), user lower limit wins!
+        runtime.thermal_step = ThermalStep::Normal;
         config.max_charge_current_ma = 500;
         let reg_low = resolve_current_regulation(&config, &runtime, &ChargingDecision::Allow);
         assert_eq!(reg_low, CurrentRegulation::GraceCap { target_ua: 500_000 });
@@ -1527,7 +1540,6 @@ mod tests {
         let p1 = evaluate_policy(
             &observed,
             &config,
-            &PolicyResult::clear(),
             &mut runtime,
             now,
         );
@@ -1545,7 +1557,7 @@ mod tests {
             }),
             now,
         );
-        let p2 = evaluate_policy(&observed, &config, &p1, &mut runtime, now);
+        let p2 = evaluate_policy(&observed, &config, &mut runtime, now);
         assert!(!p2.is_blocked_by(PolicyBlock::ChargeLimit));
         assert_eq!(runtime.charge_limit_state, ChargeLimitState::Normal);
     }
@@ -1556,12 +1568,12 @@ mod tests {
         let mut observed = ObservedState::new();
         let mut config = Config::default();
         config.max_temp_dc = 420; // 42.0 C
-                                  // Emergency offset is +3.0 C = 45.0 C (450 dc)
-                                  // Recovery offset is -4.0 C = 38.0 C (380 dc)
+        config.thermal_cutoff = true;
+        // Emergency offset is +3.0 C = 45.0 C (450 dc)
+        // Recovery offset is -4.0 C = 38.0 C (380 dc)
 
         observed.connection = ConnectionState::Attached;
         let mut runtime = PolicyRuntime::default();
-        let mut p = PolicyResult::clear();
 
         // 1. T = 44.5 C (< 45.0 C emergency) -> Standard thermal block, but NOT emergency latch
         observed.update(
@@ -1574,7 +1586,7 @@ mod tests {
             }),
             now,
         );
-        p = evaluate_policy(&observed, &config, &p, &mut runtime, now);
+        let mut p = evaluate_policy(&observed, &config, &mut runtime, now);
         assert!(p.is_blocked_by(PolicyBlock::Thermal));
         assert!(!p.is_blocked_by(PolicyBlock::ThermalEmergency));
 
@@ -1589,7 +1601,7 @@ mod tests {
             }),
             now,
         );
-        p = evaluate_policy(&observed, &config, &p, &mut runtime, now);
+        p = evaluate_policy(&observed, &config, &mut runtime, now);
         assert!(p.is_blocked_by(PolicyBlock::ThermalEmergency));
 
         // 3. T drops to 40.0 C (> 38.0 C release threshold) -> MUST REMAIN LATCHED
@@ -1603,7 +1615,7 @@ mod tests {
             }),
             now,
         );
-        p = evaluate_policy(&observed, &config, &p, &mut runtime, now);
+        p = evaluate_policy(&observed, &config, &mut runtime, now);
         assert!(
             p.is_blocked_by(PolicyBlock::ThermalEmergency),
             "Latch must hold at 40C"
@@ -1620,12 +1632,46 @@ mod tests {
             }),
             now,
         );
-        p = evaluate_policy(&observed, &config, &p, &mut runtime, now);
+        p = evaluate_policy(&observed, &config, &mut runtime, now);
         assert!(
             !p.is_blocked_by(PolicyBlock::ThermalEmergency),
             "Latch must release at 37.5C"
         );
         assert!(!p.is_blocked_by(PolicyBlock::Thermal));
+    }
+
+    #[test]
+    fn test_thermal_cutoff_toggle_behavior() {
+        let now = Instant::now();
+        let mut observed = ObservedState::new();
+        let mut config = Config::default();
+        config.max_temp_dc = 400; // 40.0 C
+        config.thermal_cutoff = false; // Disabled!
+
+        observed.connection = ConnectionState::Attached;
+        let mut runtime = PolicyRuntime::default();
+
+        // 1. T = 41.0 C (> 40.0 C max_temp_dc, but < 43.0 C emergency):
+        // Since thermal_cutoff is false, it should NOT block!
+        observed.update(
+            charger_core::battery::reader::PowerState::Connected,
+            Some(Sample {
+                capacity: 50.0,
+                temperature_c: 41.0,
+                power_state: charger_core::battery::reader::PowerState::Connected,
+                timestamp: now,
+            }),
+            now,
+        );
+        let p1 = evaluate_policy(&observed, &config, &mut runtime, now);
+        assert!(!p1.is_blocked_by(PolicyBlock::Thermal));
+        assert!(!p1.is_blocked_by(PolicyBlock::ThermalEmergency));
+
+        // 2. Enable thermal_cutoff -> now 41.0 C MUST block with PolicyBlock::Thermal!
+        config.thermal_cutoff = true;
+        let p2 = evaluate_policy(&observed, &config, &mut runtime, now);
+        assert!(p2.is_blocked_by(PolicyBlock::Thermal));
+        assert!(!p2.is_blocked_by(PolicyBlock::ThermalEmergency));
     }
 
     #[test]
@@ -1670,5 +1716,66 @@ mod tests {
         let intent_normal = OperatingIntent::normal();
         let dec_normal = ChargingDecision::resolve(&observed, &intent_normal, &policy_res, now);
         assert_eq!(dec_normal, ChargingDecision::Allow);
+    }
+
+    #[test]
+    fn test_sensor_stale_defensive_safety_block() {
+        let now = Instant::now();
+        let observed = ObservedState {
+            connection: ConnectionState::Attached,
+            power_state: charger_core::battery::reader::PowerState::Connected,
+            sample: None, // No sensor data available
+            timestamp: now,
+            sample_retry_at: None,
+        };
+        let config = Config::default();
+        let mut runtime = PolicyRuntime::default();
+
+        let policy_res = evaluate_policy(&observed, &config, &mut runtime, now);
+        assert!(policy_res.is_blocked_by(PolicyBlock::SensorStale));
+
+        let intent = OperatingIntent::normal();
+        let dec = ChargingDecision::resolve(&observed, &intent, &policy_res, now);
+
+        // Sensor stale MUST resolve to Safety Block (SensorStale) to physically disable charging!
+        assert_eq!(
+            dec,
+            ChargingDecision::Block {
+                cause: BlockCause::SensorStale
+            }
+        );
+        assert_eq!(
+            dec.to_desired_hardware(),
+            DesiredHardwareState::ChargingDisabled
+        );
+        assert_eq!(dec.to_urgency(), Urgency::Recovery);
+    }
+
+    #[test]
+    fn test_thermal_step_deadline_scheduler_integration() {
+        let now = Instant::now();
+        let mut runtime = PolicyRuntime::default();
+
+        // 1. Normal -> no deadline
+        assert_eq!(runtime.thermal_step_deadline(), None);
+
+        // 2. When throttled to Step 2 -> hold window deadline active
+        runtime.thermal_step = ThermalStep::Step2;
+        runtime.thermal_step_updated_at = Some(now);
+        assert_eq!(
+            runtime.thermal_step_deadline(),
+            Some(now + Duration::from_secs(10))
+        );
+    }
+
+    #[test]
+    fn test_disconnect_cleans_applied_current_limit() {
+        let mut track = HardwareTrack::new();
+        track.applied_current_limit_ua = Some(2_000_000);
+        track.current_verification_needed = false;
+
+        track.reset_on_disconnect();
+        assert_eq!(track.applied_current_limit_ua, None);
+        assert!(track.current_verification_needed);
     }
 }

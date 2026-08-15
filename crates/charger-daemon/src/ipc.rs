@@ -38,6 +38,7 @@ pub struct DaemonDiagnostics {
     pub fsm_state: RwLock<String>,
     pub target_decision: RwLock<String>,
     pub current_regulation: RwLock<String>,
+    pub convergence_state: RwLock<String>,
 }
 
 impl DaemonDiagnostics {
@@ -54,6 +55,7 @@ impl DaemonDiagnostics {
             fsm_state: RwLock::new("Normal".to_string()),
             target_decision: RwLock::new("Allow".to_string()),
             current_regulation: RwLock::new("Unconstrained".to_string()),
+            convergence_state: RwLock::new("Converged".to_string()),
         }
     }
 }
@@ -580,12 +582,21 @@ fn handle_status(
         .read()
         .unwrap_or_else(|p| p.into_inner());
     let power_state = ps_guard.clone();
+    drop(ps_guard);
+
     let cur_guard = diagnostics
         .current_regulation
         .read()
         .unwrap_or_else(|p| p.into_inner());
     let current_regulation = cur_guard.clone();
     drop(cur_guard);
+
+    let conv_guard = diagnostics
+        .convergence_state
+        .read()
+        .unwrap_or_else(|p| p.into_inner());
+    let convergence_state = conv_guard.clone();
+    drop(conv_guard);
 
     let netlink_available = diagnostics.netlink_available.load(Ordering::Relaxed);
     let is_idle = diagnostics.is_idle.load(Ordering::Relaxed);
@@ -634,6 +645,7 @@ fn handle_status(
          • FSM State    : {}\n\
          • Target Action: {}\n\
          • Hardware     : {}\n\
+         • Convergence  : {}\n\
          • Current Reg  : {}\n\
          \n\
          [ MONITOR DIAGNOSTICS ]\n\
@@ -666,6 +678,7 @@ fn handle_status(
         fsm_state,
         target_decision,
         hardware,
+        convergence_state,
         current_regulation,
         mode_str,
         netlink_str,
@@ -679,22 +692,22 @@ fn handle_status(
         config_guard.resume_limit,
         max_current_str,
         if config_guard.thermal_throttling_enabled {
-            "ON (Stepped)"
+            "Enabled (Stepped)"
         } else {
-            "OFF"
+            "Disabled"
         },
         if config_guard.thermal_cutoff {
-            "ON"
+            "Enabled"
         } else {
-            "OFF"
+            "Disabled"
         },
-        config_guard.max_temp_dc as f32 / 10.0,
+        config_guard.max_temp_dc as f32 / 10.0
     );
 
     let _ = stream.write_all(message.as_bytes());
 }
 
-#[derive(serde::Serialize)]
+#[derive(Debug, serde::Serialize)]
 pub struct DaemonStatusResponse {
     pub pid: u32,
     pub memory_rss_mb: f32,
@@ -705,6 +718,7 @@ pub struct DaemonStatusResponse {
     pub target_decision: String,
     pub current_regulation: String,
     pub hardware_state: String,
+    pub convergence_state: String,
     pub netlink_available: bool,
     pub poll_interval_ms: u64,
     pub error_backoff_ms: u64,
@@ -755,6 +769,13 @@ fn handle_status_json(
         .unwrap_or_else(|p| p.into_inner());
     let current_regulation = cur_guard.clone();
     drop(cur_guard);
+
+    let conv_guard = diagnostics
+        .convergence_state
+        .read()
+        .unwrap_or_else(|p| p.into_inner());
+    let convergence_state = conv_guard.clone();
+    drop(conv_guard);
 
     let hw_guard = diagnostics
         .hardware_state
@@ -807,6 +828,7 @@ fn handle_status_json(
         target_decision,
         current_regulation,
         hardware_state,
+        convergence_state,
         netlink_available,
         poll_interval_ms: interval_ms,
         error_backoff_ms: backoff_ms,

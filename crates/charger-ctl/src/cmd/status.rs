@@ -28,6 +28,9 @@ pub fn run(json: bool) -> Result<(), ChargerError> {
             if let Some(hw) = data["hardware_state"].as_str() {
                 display::key_val("Hardware State", hw);
             }
+            if let Some(conv) = data["convergence_state"].as_str() {
+                display::key_val("Convergence", conv);
+            }
             display::key_val(
                 "Daemon CPU",
                 format!("{:.2}%", data["cpu_percent"].as_f64().unwrap_or(0.0)),
