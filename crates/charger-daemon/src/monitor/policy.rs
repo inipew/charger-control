@@ -188,7 +188,8 @@ impl PolicyRuntime {
     /// Digunakan oleh scheduler untuk wake-up tepat waktu saat temperatur mulai mendingin.
     pub fn thermal_step_deadline(&self) -> Option<Instant> {
         if self.thermal_step != ThermalStep::Normal {
-            self.thermal_step_updated_at.map(|t| t + THERMAL_STEP_HOLD_WINDOW)
+            self.thermal_step_updated_at
+                .map(|t| t + THERMAL_STEP_HOLD_WINDOW)
         } else {
             None
         }
@@ -289,7 +290,11 @@ pub fn evaluate_policy(
     result
 }
 
-fn evaluate_thermal_emergency(sample: Sample, config: &Config, runtime: &mut PolicyRuntime) -> bool {
+fn evaluate_thermal_emergency(
+    sample: Sample,
+    config: &Config,
+    runtime: &mut PolicyRuntime,
+) -> bool {
     let temp_dc = (sample.temperature_c * 10.0).round() as i32;
     let emergency_dc = config.max_temp_dc + THERMAL_EMERGENCY_OFFSET_DC;
     let release_dc = config.max_temp_dc - THERMAL_EMERGENCY_RELEASE_OFFSET_DC;

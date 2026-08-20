@@ -29,6 +29,8 @@ const IPC_POLL_TIMEOUT_MS: i32 = -1;
 pub struct DaemonDiagnostics {
     pub netlink_available: AtomicBool,
     pub is_idle: AtomicBool,
+    pub total_wakeups: AtomicU64,
+    pub last_wake_reason: RwLock<String>,
     pub poll_interval_ms: AtomicU64,
     pub error_backoff_ms: AtomicU64,
     pub battery_level_percent: AtomicU8,
@@ -46,6 +48,8 @@ impl DaemonDiagnostics {
         Self {
             netlink_available: AtomicBool::new(false),
             is_idle: AtomicBool::new(false),
+            total_wakeups: AtomicU64::new(0),
+            last_wake_reason: RwLock::new("Initial Startup".to_string()),
             poll_interval_ms: AtomicU64::new(0),
             error_backoff_ms: AtomicU64::new(0),
             battery_level_percent: AtomicU8::new(255),
@@ -600,6 +604,13 @@ fn handle_status(
 
     let netlink_available = diagnostics.netlink_available.load(Ordering::Relaxed);
     let is_idle = diagnostics.is_idle.load(Ordering::Relaxed);
+    let total_wakeups = diagnostics.total_wakeups.load(Ordering::Relaxed);
+    let wake_reason_guard = diagnostics
+        .last_wake_reason
+        .read()
+        .unwrap_or_else(|p| p.into_inner());
+    let last_wake_reason = wake_reason_guard.clone();
+    drop(wake_reason_guard);
     let interval_ms = diagnostics.poll_interval_ms.load(Ordering::Relaxed);
     let backoff_ms = diagnostics.error_backoff_ms.load(Ordering::Relaxed);
 
@@ -653,6 +664,8 @@ fn handle_status(
          • Netlink      : {}\n\
          • Poll Interval: {}\n\
          • Error Backoff: {}\n\
+         • Wakeup Count : {} times\n\
+         • Last Wakeup  : {}\n\
          \n\
          [ BATTERY ]\n\
          • Level        : {}\n\
@@ -684,6 +697,8 @@ fn handle_status(
         netlink_str,
         interval_str,
         backoff_str,
+        total_wakeups,
+        last_wake_reason,
         battery,
         temperature,
         power_state,
@@ -720,6 +735,8 @@ pub struct DaemonStatusResponse {
     pub hardware_state: String,
     pub convergence_state: String,
     pub netlink_available: bool,
+    pub total_wakeups: u64,
+    pub last_wake_reason: String,
     pub poll_interval_ms: u64,
     pub error_backoff_ms: u64,
     pub battery_level_percent: Option<u8>,
@@ -807,6 +824,13 @@ fn handle_status_json(
 
     let netlink_available = diagnostics.netlink_available.load(Ordering::Relaxed);
     let is_idle = diagnostics.is_idle.load(Ordering::Relaxed);
+    let total_wakeups = diagnostics.total_wakeups.load(Ordering::Relaxed);
+    let wake_reason_guard = diagnostics
+        .last_wake_reason
+        .read()
+        .unwrap_or_else(|p| p.into_inner());
+    let last_wake_reason = wake_reason_guard.clone();
+    drop(wake_reason_guard);
     let interval_ms = diagnostics.poll_interval_ms.load(Ordering::Relaxed);
     let backoff_ms = diagnostics.error_backoff_ms.load(Ordering::Relaxed);
 
@@ -830,6 +854,8 @@ fn handle_status_json(
         hardware_state,
         convergence_state,
         netlink_available,
+        total_wakeups,
+        last_wake_reason,
         poll_interval_ms: interval_ms,
         error_backoff_ms: backoff_ms,
         battery_level_percent: battery,

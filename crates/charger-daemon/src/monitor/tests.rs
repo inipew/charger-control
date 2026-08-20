@@ -18,7 +18,7 @@ mod tests {
             PolicyResult, PolicyRuntime, ThermalStep, CHARGE_LIMIT_SUSPEND_DELAY,
         },
         reality::{ConnectionState, ObservedState, Sample},
-        scheduler::Urgency,
+        scheduler::{AdaptiveScheduler, Urgency},
     };
 
     #[test]
@@ -43,12 +43,7 @@ mod tests {
             }),
             now,
         );
-        let _p0 = evaluate_policy(
-            &observed,
-            &config,
-            &mut runtime,
-            now,
-        );
+        let _p0 = evaluate_policy(&observed, &config, &mut runtime, now);
 
         // t=5m: grace period selesai → ChargeLimit blocked
         let after_grace = now + CHARGE_LIMIT_SUSPEND_DELAY;
@@ -117,12 +112,7 @@ mod tests {
         );
         observed.connection = ConnectionState::Attached;
 
-        let policy1 = evaluate_policy(
-            &observed,
-            &config,
-            &mut runtime,
-            now,
-        );
+        let policy1 = evaluate_policy(&observed, &config, &mut runtime, now);
         assert!(policy1.is_blocked_by(PolicyBlock::ThermalEmergency));
 
         now += Duration::from_secs(10);
@@ -164,7 +154,7 @@ mod tests {
         // Intent = Normal, Policy = Allow, Hardware = Fault => Decision = Allow
         let mut hw_track = HardwareTrack::new();
         let now = Instant::now();
-        hw_track.mark_fault(HardwareFault::WriteFailed, now);
+        hw_track.charger.mark_fault(HardwareFault::WriteFailed, now);
 
         let mut observed = ObservedState::new();
         observed.connection = ConnectionState::Attached;
@@ -185,7 +175,7 @@ mod tests {
         // Invariant B: Fault tidak menyebabkan mutation ke state yang salah (Deferred)
         let mut hw_track = HardwareTrack::new();
         let now = Instant::now();
-        hw_track.mark_fault(HardwareFault::WriteFailed, now);
+        hw_track.charger.mark_fault(HardwareFault::WriteFailed, now);
 
         let early_now = now + Duration::from_secs(1);
         let opts = crate::monitor::hardware::ReconcileOptions {
@@ -213,7 +203,7 @@ mod tests {
         // Jika status Fault dan retry belum due, harus tetap Deferred meskipun force_verification = true.
         let mut hw_track = HardwareTrack::new();
         let now = Instant::now();
-        hw_track.mark_fault(HardwareFault::WriteFailed, now); // Retry dalam 5 detik
+        hw_track.charger.mark_fault(HardwareFault::WriteFailed, now); // Retry dalam 5 detik
 
         let early_now = now + Duration::from_secs(1); // Belum 5 detik
 
@@ -246,7 +236,7 @@ mod tests {
         // Decision urgency = Safety, Retry pending = true => scheduler urgency = Safety
         let mut hw_track = HardwareTrack::new();
         let now = Instant::now();
-        hw_track.mark_fault(HardwareFault::WriteFailed, now); // Next deadline is some
+        hw_track.charger.mark_fault(HardwareFault::WriteFailed, now); // Next deadline is some
 
         let decision_urgency = Urgency::Safety;
         let retry_urgency = Urgency::Recovery;
@@ -262,8 +252,8 @@ mod tests {
         // Invariant F: Unknown verification tidak dianggap fresh
         // verified_at = None => verification_needed = true
         let hw_track = HardwareTrack::new();
-        assert!(hw_track.last_verified_obs.verified_at.is_none());
-        assert!(hw_track.verification_needed);
+        assert!(hw_track.charger.observation.verified_at.is_none());
+        assert!(hw_track.charger.verification_needed);
     }
 
     #[test]
@@ -304,33 +294,36 @@ mod tests {
     fn test_invariant_j_disconnect_clears_observation() {
         // Invariant J: Disconnect mereset current_obs dan meminta verifikasi
         let mut track = HardwareTrack::new();
-        track.update_observation(
+        let now = Instant::now();
+        track.charger.update_observation(
             charger_core::battery::control::ActualHardwareMode::ChargingEnabled,
-            Instant::now(),
+            now,
         );
 
         assert_eq!(
-            track.last_verified_obs.mode,
+            track.charger.observation.mode,
             charger_core::battery::control::ActualHardwareMode::ChargingEnabled
         );
-        assert!(track.last_verified_obs.verified_at.is_some());
-        assert!(!track.verification_needed);
+        assert!(track.charger.observation.verified_at.is_some());
+        assert!(!track.charger.verification_needed);
 
         track.reset_on_disconnect();
 
         assert_eq!(
-            track.last_verified_obs.mode,
+            track.charger.observation.mode,
             charger_core::battery::control::ActualHardwareMode::Unknown
         );
-        assert!(track.last_verified_obs.verified_at.is_none());
-        assert!(track.verification_needed);
+        assert!(track.charger.observation.verified_at.is_none());
+        assert!(track.charger.verification_needed);
     }
 
     #[test]
     fn test_invariant_k_permission_denied_never_retry_preserves_deferral() {
         // Invariant K: Fault dengan retry Never akan selalu Deferred kecuali ada bypass_retry_delay
         let mut track = HardwareTrack::new();
-        track.mark_fault(HardwareFault::PermissionDenied, Instant::now());
+        track
+            .charger
+            .mark_fault(HardwareFault::PermissionDenied, Instant::now());
 
         let opts = crate::monitor::hardware::ReconcileOptions {
             bypass_retry_delay: false,
@@ -355,7 +348,9 @@ mod tests {
     fn test_permission_denied_emergency_bypass_still_deferred() {
         // Confirming that PermissionDenied (FaultRetryPolicy::Never) returns Deferred even if bypass_retry_delay is true
         let mut track = HardwareTrack::new();
-        track.mark_fault(HardwareFault::PermissionDenied, Instant::now());
+        track
+            .charger
+            .mark_fault(HardwareFault::PermissionDenied, Instant::now());
 
         let opts = crate::monitor::hardware::ReconcileOptions {
             bypass_retry_delay: true,
@@ -428,12 +423,7 @@ mod tests {
         observed.connection = ConnectionState::Attached;
 
         // t=0: SOC >= limit, tapi grace period belum habis → belum block
-        let p1 = evaluate_policy(
-            &observed,
-            &config,
-            &mut runtime,
-            now,
-        );
+        let p1 = evaluate_policy(&observed, &config, &mut runtime, now);
         assert!(!p1.is_blocked_by(PolicyBlock::ChargeLimit));
         assert!(matches!(
             runtime.charge_limit_state,
@@ -493,12 +483,7 @@ mod tests {
             }),
             now,
         );
-        let p1 = evaluate_policy(
-            &observed,
-            &config,
-            &mut runtime,
-            now,
-        );
+        let p1 = evaluate_policy(&observed, &config, &mut runtime, now);
         assert!(!p1.is_blocked_by(PolicyBlock::ChargeLimit));
         assert!(matches!(
             runtime.charge_limit_state,
@@ -592,12 +577,7 @@ mod tests {
             }),
             now,
         );
-        let p1 = evaluate_policy(
-            &observed,
-            &config,
-            &mut runtime,
-            now,
-        );
+        let p1 = evaluate_policy(&observed, &config, &mut runtime, now);
         assert!(matches!(
             runtime.charge_limit_state,
             ChargeLimitState::Grace { .. }
@@ -632,12 +612,7 @@ mod tests {
             }),
             now,
         );
-        let mut p = evaluate_policy(
-            &observed,
-            &config,
-            &mut runtime,
-            now,
-        );
+        let mut p = evaluate_policy(&observed, &config, &mut runtime, now);
         assert!(!p.is_blocked_by(PolicyBlock::ChargeLimit));
         assert_eq!(
             runtime.charge_limit_state,
@@ -765,12 +740,7 @@ mod tests {
         );
 
         // t=0: SOC 80% → timer mulai
-        let p1 = evaluate_policy(
-            &observed,
-            &config,
-            &mut runtime,
-            now,
-        );
+        let p1 = evaluate_policy(&observed, &config, &mut runtime, now);
         assert!(!p1.is_blocked_by(PolicyBlock::ChargeLimit));
         assert_eq!(
             runtime.charge_limit_state,
@@ -836,12 +806,7 @@ mod tests {
             }),
             now,
         );
-        let p0 = evaluate_policy(
-            &observed,
-            &config,
-            &mut runtime,
-            now,
-        );
+        let p0 = evaluate_policy(&observed, &config, &mut runtime, now);
         assert!(!p0.is_blocked_by(PolicyBlock::ChargeLimit));
 
         let t5 = now + CHARGE_LIMIT_SUSPEND_DELAY;
@@ -937,12 +902,7 @@ mod tests {
             }),
             now,
         );
-        let p0 = evaluate_policy(
-            &observed,
-            &config,
-            &mut runtime,
-            now,
-        );
+        let p0 = evaluate_policy(&observed, &config, &mut runtime, now);
 
         let t5 = now + CHARGE_LIMIT_SUSPEND_DELAY;
         observed.update(
@@ -1009,8 +969,7 @@ mod tests {
             }),
             t_next_suspend,
         );
-        let p_next_suspend =
-            evaluate_policy(&observed, &config, &mut runtime, t_next_suspend);
+        let p_next_suspend = evaluate_policy(&observed, &config, &mut runtime, t_next_suspend);
         assert!(p_next_suspend.is_blocked_by(PolicyBlock::ChargeLimit));
         assert_eq!(runtime.charge_limit_state, ChargeLimitState::Suspended);
     }
@@ -1076,12 +1035,7 @@ mod tests {
             Some(make_sample(100.0, now)),
             now,
         );
-        let p = evaluate_policy(
-            &observed,
-            &config,
-            &mut runtime,
-            now,
-        );
+        let p = evaluate_policy(&observed, &config, &mut runtime, now);
         assert!(!p.is_blocked_by(PolicyBlock::ChargeLimit));
         assert!(matches!(
             runtime.charge_limit_state,
@@ -1205,12 +1159,7 @@ mod tests {
             }),
             now,
         );
-        let p = evaluate_policy(
-            &observed,
-            &config,
-            &mut runtime,
-            now,
-        );
+        let p = evaluate_policy(&observed, &config, &mut runtime, now);
 
         let t5 = now + CHARGE_LIMIT_SUSPEND_DELAY;
         observed.update(
@@ -1260,12 +1209,7 @@ mod tests {
             }),
             t_reattach,
         );
-        let p_after = evaluate_policy(
-            &observed,
-            &config,
-            &mut runtime,
-            t_reattach,
-        );
+        let p_after = evaluate_policy(&observed, &config, &mut runtime, t_reattach);
 
         // SOC 99 > resume 95 → harus tetap Block karena runtime masih Suspended
         assert!(
@@ -1537,12 +1481,7 @@ mod tests {
             }),
             now,
         );
-        let p1 = evaluate_policy(
-            &observed,
-            &config,
-            &mut runtime,
-            now,
-        );
+        let p1 = evaluate_policy(&observed, &config, &mut runtime, now);
         assert!(p1.is_blocked_by(PolicyBlock::ChargeLimit));
         assert_eq!(runtime.charge_limit_state, ChargeLimitState::Suspended);
 
@@ -1771,11 +1710,379 @@ mod tests {
     #[test]
     fn test_disconnect_cleans_applied_current_limit() {
         let mut track = HardwareTrack::new();
-        track.applied_current_limit_ua = Some(2_000_000);
-        track.current_verification_needed = false;
+        track.current_limit.applied_limit_ua = Some(2_000_000);
+        track.current_limit.reconcile_needed = false;
 
         track.reset_on_disconnect();
-        assert_eq!(track.applied_current_limit_ua, None);
-        assert!(track.current_verification_needed);
+
+        // Disconnect cleans in-memory applied limit without physical sysfs write.
+        // It resets applied_limit_ua to None and reconcile_needed to true.
+        assert_eq!(track.current_limit.applied_limit_ua, None);
+        assert!(track.current_limit.reconcile_needed);
+        assert_eq!(
+            track.current_limit.status,
+            crate::monitor::hardware::CurrentLimitStatus::Unknown
+        );
+    }
+
+    #[test]
+    fn test_adaptive_scheduler_suspended_proximity_fix() {
+        let now = Instant::now();
+        // charge_limit = 80%, resume_limit = 75%, base_interval = 5s
+        let mut sched = AdaptiveScheduler::new(Duration::from_secs(5), 80.0, 75.0, 42.0);
+
+        // Case 1: SOC 79% (suspended mode). In old buggy logic, 80 - 79 = 1 <= 5, which caused
+        // aggressive 2.5s polling. With fix, it checks 79 - 75 = 4 > 1, so interval is relaxed to 2.0x base (10.0s).
+        let sample_far = Sample {
+            capacity: 79.0,
+            temperature_c: 30.0,
+            power_state: charger_core::battery::reader::PowerState::Connected,
+            timestamp: now,
+        };
+        sched.update_sample(&sample_far);
+        let interval_far = sched.calculate_next_interval(Urgency::Monitoring, None, now);
+        assert_eq!(interval_far, Duration::from_secs(10));
+
+        // Case 2: SOC 75.8% (suspended mode, close to resume_limit 75.0%).
+        // 75.8 - 75.0 = 0.8 <= 1.0 -> Accelerate to max(2.0s, 5.0s * 0.5) = 2.5s.
+        let sample_close = Sample {
+            capacity: 75.8,
+            temperature_c: 30.0,
+            power_state: charger_core::battery::reader::PowerState::Connected,
+            timestamp: now,
+        };
+        sched.update_sample(&sample_close);
+        let interval_close = sched.calculate_next_interval(Urgency::Monitoring, None, now);
+        assert_eq!(interval_close, Duration::from_millis(2500));
+    }
+
+    #[test]
+    fn test_adaptive_scheduler_normal_proximity() {
+        let now = Instant::now();
+        let mut sched = AdaptiveScheduler::new(Duration::from_secs(5), 80.0, 75.0, 42.0);
+
+        // Case 1: SOC 70% (far from charge_limit 80%).
+        // 80 - 70 = 10 > 3.0 -> Standard normal interval (1.0x base = 5.0s).
+        let sample_far = Sample {
+            capacity: 70.0,
+            temperature_c: 30.0,
+            power_state: charger_core::battery::reader::PowerState::Connected,
+            timestamp: now,
+        };
+        sched.update_sample(&sample_far);
+        let interval_far = sched.calculate_next_interval(Urgency::Normal, None, now);
+        assert_eq!(interval_far, Duration::from_secs(5));
+
+        // Case 2: SOC 78% (close to charge_limit 80%).
+        // 80 - 78 = 2 <= 3.0 -> Accelerate to max(2.0s, 5.0s * 0.5) = 2.5s.
+        let sample_close = Sample {
+            capacity: 78.0,
+            temperature_c: 30.0,
+            power_state: charger_core::battery::reader::PowerState::Connected,
+            timestamp: now,
+        };
+        sched.update_sample(&sample_close);
+        let interval_close = sched.calculate_next_interval(Urgency::Normal, None, now);
+        assert_eq!(interval_close, Duration::from_millis(2500));
+    }
+
+    #[test]
+    fn test_adaptive_scheduler_idle_and_safety() {
+        let now = Instant::now();
+        let sched = AdaptiveScheduler::new(Duration::from_secs(5), 80.0, 75.0, 42.0);
+
+        // Idle: 6.0x base = 30.0s
+        let interval_idle = sched.calculate_next_interval(Urgency::Idle, None, now);
+        assert_eq!(interval_idle, Duration::from_secs(30));
+
+        // Safety: 2.0s fixed
+        let interval_safety = sched.calculate_next_interval(Urgency::Safety, None, now);
+        assert_eq!(interval_safety, Duration::from_secs(2));
+    }
+
+    #[test]
+    fn test_actuator_fault_isolation() {
+        let now = Instant::now();
+        let mut track = HardwareTrack::new();
+
+        // 1. Charger binary is verified and stable
+        track.charger.update_observation(
+            charger_core::battery::control::ActualHardwareMode::ChargingEnabled,
+            now,
+        );
+        assert_eq!(
+            track.charger.observation.mode,
+            charger_core::battery::control::ActualHardwareMode::ChargingEnabled
+        );
+        assert_eq!(
+            track.charger.status,
+            crate::monitor::hardware::HardwareStatus::Stable {
+                mode: charger_core::battery::control::ActualHardwareMode::ChargingEnabled
+            }
+        );
+
+        // 2. Current limit fails with CurrentLimitWriteFailed
+        track
+            .current_limit
+            .mark_fault(HardwareFault::CurrentLimitWriteFailed, now);
+
+        // 3. Charger binary observation and status MUST NOT be polluted!
+        assert_eq!(
+            track.charger.observation.mode,
+            charger_core::battery::control::ActualHardwareMode::ChargingEnabled
+        );
+        assert_eq!(
+            track.charger.status,
+            crate::monitor::hardware::HardwareStatus::Stable {
+                mode: charger_core::battery::control::ActualHardwareMode::ChargingEnabled
+            }
+        );
+
+        // 4. Current limit is in Fault, charger is Converged -> overall convergence is Fault
+        assert_eq!(
+            track.charger.convergence(),
+            crate::monitor::hardware::ConvergenceState::Converged
+        );
+        assert_eq!(
+            track.current_limit.convergence(),
+            crate::monitor::hardware::ConvergenceState::Fault
+        );
+        assert_eq!(
+            track.overall_convergence(),
+            crate::monitor::hardware::ConvergenceState::Fault
+        );
+
+        // 5. Binary reconciliation MUST NOT be deferred by current limit's fault!
+        let opts = crate::monitor::hardware::ReconcileOptions {
+            bypass_retry_delay: false,
+            force_verification: false,
+        };
+        let res = crate::monitor::hardware::reconcile(
+            DesiredHardwareState::ChargingEnabled,
+            &mut track,
+            false,
+            opts,
+            now,
+        );
+        assert!(matches!(
+            res,
+            crate::monitor::hardware::ReconcileResult::Stable(_)
+        ));
+    }
+
+    #[test]
+    fn test_actuator_combined_convergence() {
+        use crate::monitor::hardware::ConvergenceState;
+
+        assert_eq!(
+            ConvergenceState::Converged.combine(ConvergenceState::Converged),
+            ConvergenceState::Converged
+        );
+        assert_eq!(
+            ConvergenceState::Converged.combine(ConvergenceState::Deferred),
+            ConvergenceState::Deferred
+        );
+        assert_eq!(
+            ConvergenceState::Deferred.combine(ConvergenceState::Reconciling),
+            ConvergenceState::Reconciling
+        );
+        assert_eq!(
+            ConvergenceState::Reconciling.combine(ConvergenceState::Fault),
+            ConvergenceState::Fault
+        );
+        assert_eq!(
+            ConvergenceState::Fault.combine(ConvergenceState::Converged),
+            ConvergenceState::Fault
+        );
+    }
+
+    #[test]
+    fn test_current_limit_fault_respects_retry_deadline() {
+        use crate::monitor::decision::{CurrentRegulation, DesiredHardwareState};
+        use crate::monitor::hardware::{CurrentReconcileOptions, CurrentReconcileResult};
+
+        let now = Instant::now();
+        let mut track = HardwareTrack::new();
+
+        // 1. Current limit write fails at t0 with WriteFailed (retry delay = 5s)
+        track
+            .current_limit
+            .mark_fault(HardwareFault::CurrentLimitWriteFailed, now);
+
+        let target = CurrentRegulation::ConfigLimit {
+            target_ua: 1_500_000,
+        };
+        let default_opts = CurrentReconcileOptions {
+            bypass_retry_delay: false,
+        };
+        let bypass_opts = CurrentReconcileOptions {
+            bypass_retry_delay: true,
+        };
+
+        // 2. t = now + 1s (before 5s deadline, bypass = false): reconcile_current must return Deferred and not retry sysfs write
+        let t1 = now + Duration::from_secs(1);
+        let res1 = crate::monitor::hardware::reconcile_current(
+            DesiredHardwareState::ChargingEnabled,
+            target,
+            &mut track,
+            default_opts,
+            t1,
+        );
+        assert!(matches!(res1, CurrentReconcileResult::Deferred));
+        assert_eq!(
+            track.current_limit.convergence(),
+            crate::monitor::hardware::ConvergenceState::Fault
+        );
+
+        // 3. t = now + 4.9s (still before deadline): must still return Deferred
+        let t4_9 = now + Duration::from_millis(4900);
+        let res2 = crate::monitor::hardware::reconcile_current(
+            DesiredHardwareState::ChargingEnabled,
+            target,
+            &mut track,
+            default_opts,
+            t4_9,
+        );
+        assert!(matches!(res2, CurrentReconcileResult::Deferred));
+
+        // 4. t = now + 5.1s (deadline reached): retry is due and write is attempted (fails with NoChargingNodeFound on host)
+        let t5_1 = now + Duration::from_millis(5100);
+        let res_due = crate::monitor::hardware::reconcile_current(
+            DesiredHardwareState::ChargingEnabled,
+            target,
+            &mut track,
+            default_opts,
+            t5_1,
+        );
+        assert!(!matches!(res_due, CurrentReconcileResult::Deferred));
+
+        // 5. With new fault at t5_1 (NodeMissing with 30s delay), verify bypass_retry_delay = true bypasses delay
+        let t6 = t5_1 + Duration::from_secs(1);
+        let res_deferred = crate::monitor::hardware::reconcile_current(
+            DesiredHardwareState::ChargingEnabled,
+            target,
+            &mut track,
+            default_opts,
+            t6,
+        );
+        assert!(matches!(res_deferred, CurrentReconcileResult::Deferred));
+
+        let res_force = crate::monitor::hardware::reconcile_current(
+            DesiredHardwareState::ChargingEnabled,
+            target,
+            &mut track,
+            bypass_opts,
+            t6,
+        );
+        assert!(!matches!(res_force, CurrentReconcileResult::Deferred));
+    }
+
+    #[test]
+    fn test_current_limit_never_retry_always_deferred() {
+        use crate::monitor::decision::{CurrentRegulation, DesiredHardwareState};
+        use crate::monitor::hardware::{CurrentReconcileOptions, CurrentReconcileResult};
+
+        let now = Instant::now();
+        let mut track = HardwareTrack::new();
+        // PermissionDenied has FaultRetryPolicy::Never
+        track
+            .current_limit
+            .mark_fault(HardwareFault::PermissionDenied, now);
+
+        let target = CurrentRegulation::ConfigLimit {
+            target_ua: 1_500_000,
+        };
+        let bypass_opts = CurrentReconcileOptions {
+            bypass_retry_delay: true,
+        };
+
+        // Even with bypass_retry_delay = true, FaultRetryPolicy::Never remains Deferred
+        let res = crate::monitor::hardware::reconcile_current(
+            DesiredHardwareState::ChargingEnabled,
+            target,
+            &mut track,
+            bypass_opts,
+            now + Duration::from_secs(10),
+        );
+        assert!(matches!(res, CurrentReconcileResult::Deferred));
+    }
+
+    #[test]
+    fn test_current_limit_idempotency_cleans_reconcile_needed() {
+        use crate::monitor::decision::{CurrentRegulation, DesiredHardwareState};
+        use crate::monitor::hardware::{CurrentReconcileOptions, CurrentReconcileResult};
+
+        let now = Instant::now();
+        let mut track = HardwareTrack::new();
+
+        // 1. Initially mark_applied as 1.5A
+        track.current_limit.mark_applied(Some(1_500_000));
+        assert_eq!(track.current_limit.applied_limit_ua, Some(1_500_000));
+
+        // 2. An event turns on reconcile_needed = true
+        track.current_limit.reconcile_needed = true;
+
+        let target = CurrentRegulation::ConfigLimit {
+            target_ua: 1_500_000,
+        };
+        let opts = CurrentReconcileOptions {
+            bypass_retry_delay: false,
+        };
+
+        // 3. reconcile_current should immediately return Stable without writing to sysfs, and clean reconcile_needed
+        let res = crate::monitor::hardware::reconcile_current(
+            DesiredHardwareState::ChargingEnabled,
+            target,
+            &mut track,
+            opts,
+            now,
+        );
+        assert!(matches!(
+            res,
+            CurrentReconcileResult::Stable(Some(1_500_000))
+        ));
+        assert!(!track.current_limit.reconcile_needed);
+
+        // 4. Test Unconstrained (desired = None)
+        track.current_limit.mark_applied(None);
+        track.current_limit.reconcile_needed = true;
+
+        let target_unconstrained = CurrentRegulation::Unconstrained;
+        let res_unconstrained = crate::monitor::hardware::reconcile_current(
+            DesiredHardwareState::ChargingEnabled,
+            target_unconstrained,
+            &mut track,
+            opts,
+            now,
+        );
+        assert!(matches!(
+            res_unconstrained,
+            CurrentReconcileResult::Stable(None)
+        ));
+        assert!(!track.current_limit.reconcile_needed);
+    }
+
+    #[test]
+    fn test_current_limit_skipped_on_no_change() {
+        use crate::monitor::decision::{CurrentRegulation, DesiredHardwareState};
+        use crate::monitor::hardware::{CurrentReconcileOptions, CurrentReconcileResult};
+
+        let now = Instant::now();
+        let mut track = HardwareTrack::new();
+        track.current_limit.reconcile_needed = true;
+
+        let target = CurrentRegulation::Disabled;
+        let opts = CurrentReconcileOptions::default();
+
+        // When desired_hw is NoChange (e.g. Disconnected), reconcile_current must return Skipped without touching sysfs
+        let res = crate::monitor::hardware::reconcile_current(
+            DesiredHardwareState::NoChange,
+            target,
+            &mut track,
+            opts,
+            now,
+        );
+        assert!(matches!(res, CurrentReconcileResult::Skipped));
+        assert!(track.current_limit.reconcile_needed);
     }
 }

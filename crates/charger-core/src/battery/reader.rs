@@ -1,5 +1,6 @@
 use std::{
     fs,
+    io::Read,
     path::Path,
     sync::atomic::{AtomicUsize, Ordering},
 };
@@ -25,14 +26,27 @@ static TEMP_CACHED_IDX: AtomicUsize = AtomicUsize::new(usize::MAX);
 static CHARGE_FULL_CACHED_IDX: AtomicUsize = AtomicUsize::new(usize::MAX);
 static CYCLE_COUNT_CACHED_IDX: AtomicUsize = AtomicUsize::new(usize::MAX);
 
-/// Read and trim one sysfs value.
+/// Read and trim one sysfs value into a caller-provided buffer (Zero Heap Allocation).
+pub fn read_sysfs_buf<'a>(path: &Path, buf: &'a mut [u8]) -> Result<&'a str, ChargerError> {
+    let mut file = fs::File::open(path).map_err(|source| ChargerError::SysfsRead {
+        path: path.to_owned(),
+        source,
+    })?;
+    let bytes_read = file.read(buf).map_err(|source| ChargerError::SysfsRead {
+        path: path.to_owned(),
+        source,
+    })?;
+    let s = std::str::from_utf8(&buf[..bytes_read]).map_err(|_| ChargerError::SysfsRead {
+        path: path.to_owned(),
+        source: std::io::Error::new(std::io::ErrorKind::InvalidData, "invalid utf-8"),
+    })?;
+    Ok(s.trim())
+}
+
+/// Read and trim one sysfs value as a heap-allocated String.
 pub fn read_sysfs(path: &Path) -> Result<String, ChargerError> {
-    fs::read_to_string(path)
-        .map(|value| value.trim().to_owned())
-        .map_err(|source| ChargerError::SysfsRead {
-            path: path.to_owned(),
-            source,
-        })
+    let mut buf = [0u8; 128];
+    read_sysfs_buf(path, &mut buf).map(|s| s.to_owned())
 }
 
 /// Read the first valid value from a list of sysfs nodes with atomic index caching and resolution logging.
@@ -45,10 +59,11 @@ fn read_first_cached<T, F>(
 where
     F: Fn(&str) -> Option<T>,
 {
+    let mut buf = [0u8; 64];
     let idx = cached_idx.load(Ordering::Relaxed);
     if idx < paths.len() {
-        if let Ok(raw) = read_sysfs(Path::new(paths[idx])) {
-            if let Some(value) = parse(&raw) {
+        if let Ok(raw) = read_sysfs_buf(Path::new(paths[idx]), &mut buf) {
+            if let Some(value) = parse(raw) {
                 return Ok(value);
             }
         }
@@ -61,11 +76,11 @@ where
         if i == idx {
             continue;
         }
-        let Ok(raw) = read_sysfs(Path::new(path)) else {
+        let Ok(raw) = read_sysfs_buf(Path::new(path), &mut buf) else {
             continue;
         };
 
-        if let Some(value) = parse(&raw) {
+        if let Some(value) = parse(raw) {
             let prev = cached_idx.swap(i, Ordering::Relaxed);
             if prev != i {
                 tracing::info!(
@@ -388,13 +403,15 @@ impl PowerState {
 /// 3. disconnected
 pub fn get_power_state() -> Result<PowerState, ChargerError> {
     let mut source_available = false;
+    let mut buf = [0u8; 64];
 
     for path_str in ONLINE_NODES {
-        if let Ok(online) = read_sysfs(Path::new(path_str)) {
+        if let Ok(online) = read_sysfs_buf(Path::new(path_str), &mut buf) {
             source_available = true;
             if online == "1" {
-                let status = read_sysfs(Path::new(BATTERY_STATUS_NODE))
-                    .unwrap_or_else(|_| "Unknown".to_owned());
+                let mut status_buf = [0u8; 64];
+                let status = read_sysfs_buf(Path::new(BATTERY_STATUS_NODE), &mut status_buf)
+                    .unwrap_or("Unknown");
 
                 return Ok(if status.eq_ignore_ascii_case("Charging") {
                     PowerState::Charging
@@ -406,9 +423,9 @@ pub fn get_power_state() -> Result<PowerState, ChargerError> {
     }
 
     for path_str in TYPEC_MODE_NODES {
-        if let Ok(typec) = read_sysfs(Path::new(path_str)) {
+        if let Ok(typec) = read_sysfs_buf(Path::new(path_str), &mut buf) {
             source_available = true;
-            if is_typec_source_attached(&typec) {
+            if is_typec_source_attached(typec) {
                 return Ok(PowerState::Attached);
             }
         }

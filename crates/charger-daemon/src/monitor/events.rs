@@ -22,21 +22,47 @@ pub enum MonitorEvent {
 /// Dispatcher Reducer untuk memproses event pada `MonitorContext`.
 pub fn handle_event(ctx: &mut MonitorContext, event: MonitorEvent, now: Instant) {
     match event {
-        MonitorEvent::ChargerAttached
-        | MonitorEvent::AcChanged
-        | MonitorEvent::UsbChanged
-        | MonitorEvent::TypeCChanged => {
+        MonitorEvent::ChargerAttached => {
             ctx.hardware_track.mark_verification_needed();
+            ctx.mark_evaluation_requested();
+        }
+        MonitorEvent::AcChanged | MonitorEvent::UsbChanged | MonitorEvent::TypeCChanged => {
+            // Jika kabel belum terhubung stabil (misal saat disconnect atau settling), verifikasi hardware
+            if !matches!(
+                ctx.observed.connection,
+                super::reality::ConnectionState::Attached
+            ) {
+                ctx.hardware_track.mark_verification_needed();
+            }
             ctx.mark_evaluation_requested();
         }
         MonitorEvent::ChargerDetached => {
             ctx.reset_on_detach();
             ctx.hardware_track.reset_on_disconnect();
+
+            // Pulihkan status fisik hardware ke kondisi default pabrik (1x eksekusi saat detach)
+            // agar PMIC tidak tertinggal dalam status input_suspend saat berjalan dengan baterai
+            let _ = charger_core::battery::control::set_charging(true);
+            let _ = charger_core::battery::control::reset_fast_charge_current();
+
             ctx.observed.clear_sample();
             ctx.mark_evaluation_requested();
         }
         MonitorEvent::BatteryChanged | MonitorEvent::BmsChanged => {
-            ctx.mark_evaluation_requested();
+            // Throttle 1.5s berlaku umum (baik saat connected maupun disconnected)
+            // kecuali jika sedang terjadi Thermal Emergency.
+            let is_emergency = ctx.policy_result.strongest_block()
+                == Some(super::decision::BlockCause::ThermalEmergency);
+
+            let should_throttle = !is_emergency
+                && ctx.diag.last_battery_event_eval.is_some_and(|last| {
+                    now.duration_since(last) < std::time::Duration::from_millis(1500)
+                });
+
+            if !should_throttle {
+                ctx.diag.last_battery_event_eval = Some(now);
+                ctx.mark_evaluation_requested();
+            }
         }
         MonitorEvent::IpcCommand(cmd) => match cmd {
             DaemonCommand::BypassOn => {

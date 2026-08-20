@@ -1,8 +1,16 @@
 [target.aarch64-linux-android]
-ar = "C:/Users/dhima/AppData/Local/Android/Sdk/ndk/30.0.15729638/toolchains/llvm/prebuilt/windows-x86_64/bin/llvm-ar.exe"
-linker = "C:/Users/dhima/AppData/Local/Android/Sdk/ndk/30.0.15729638/toolchains/llvm/prebuilt/windows-x86_64/bin/aarch64-linux-android36-clang.cmd"
+linker = "/home/dhimas/android-ndk/r30-beta2/toolchains/llvm/prebuilt/linux-x86_64/bin/aarch64-linux-android36-clang"
 rustflags = [
     "-C", "link-arg=-Wl,-z,max-page-size=16384",
     "-C", "link-arg=-Wl,-z,common-page-size=16384",
     "-C", "link-arg=-Wl,--hash-style=both"
+]
+
+[target.aarch64-unknown-linux-musl]
+linker = "clang"
+rustflags = [
+    "-C", "link-arg=--target=aarch64-unknown-linux-musl",
+    "-C", "link-arg=-fuse-ld=lld",
+    "-C", "link-arg=-Wl,-z,max-page-size=16384",
+    "-C", "link-arg=-Wl,-z,common-page-size=16384",
 ]

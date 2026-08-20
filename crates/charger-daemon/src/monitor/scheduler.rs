@@ -86,25 +86,39 @@ impl SchedulingState {
 pub struct AdaptiveScheduler {
     pub configured_interval: Duration,
     pub charge_limit: f32,
+    pub resume_limit: f32,
     pub max_temp_c: f32,
     pub last_capacity: Option<f32>,
     pub last_temp_c: Option<f32>,
 }
 
 impl AdaptiveScheduler {
-    pub fn new(configured_interval: Duration, charge_limit: f32, max_temp_c: f32) -> Self {
+    pub fn new(
+        configured_interval: Duration,
+        charge_limit: f32,
+        resume_limit: f32,
+        max_temp_c: f32,
+    ) -> Self {
         Self {
             configured_interval,
             charge_limit,
+            resume_limit,
             max_temp_c,
             last_capacity: None,
             last_temp_c: None,
         }
     }
 
-    pub fn update_config(&mut self, interval: Duration, charge_limit: f32, max_temp_c: f32) {
+    pub fn update_config(
+        &mut self,
+        interval: Duration,
+        charge_limit: f32,
+        resume_limit: f32,
+        max_temp_c: f32,
+    ) {
         self.configured_interval = interval;
         self.charge_limit = charge_limit;
+        self.resume_limit = resume_limit;
         self.max_temp_c = max_temp_c;
     }
 
@@ -138,22 +152,32 @@ impl AdaptiveScheduler {
         let mut secs = match urgency {
             Urgency::Idle => base_secs * 6.0,
             Urgency::Normal => base_secs,
-            Urgency::Monitoring => base_secs * 0.5,
+            Urgency::Monitoring => base_secs * 2.0,
             Urgency::Recovery => ERROR_BACKOFF_INITIAL.as_secs_f32(),
             Urgency::Safety => 2.0,
         };
 
-        // Adaptasi Dinamis: Jika mendekati batas charge limit (< 5%) atau batas suhu (< 2.0°C), percepat interval
-        if urgency == Urgency::Normal || urgency == Urgency::Monitoring {
+        // Adaptasi Dinamis Berbasis State:
+        // 1. Saat Normal (Charging): Jika mendekati charge limit (<= 3.0%) atau suhu mendekati limit (<= 2.0°C), percepat interval
+        if urgency == Urgency::Normal {
             let close_to_limit = self
                 .last_capacity
-                .is_some_and(|cap| cap < self.charge_limit && (self.charge_limit - cap) <= 5.0);
+                .is_some_and(|cap| cap < self.charge_limit && (self.charge_limit - cap) <= 3.0);
             let close_to_temp = self
                 .last_temp_c
                 .is_some_and(|temp| temp < self.max_temp_c && (self.max_temp_c - temp) <= 2.0);
 
             if close_to_limit || close_to_temp {
-                secs = (secs * 0.5).max(2.0);
+                secs = (base_secs * 0.5).max(2.0);
+            }
+        } else if urgency == Urgency::Monitoring {
+            // 2. Saat Monitoring (Suspended): Hanya percepat jika mendekati batas resume (<= 1.0%)
+            let close_to_resume = self
+                .last_capacity
+                .is_some_and(|cap| cap > self.resume_limit && (cap - self.resume_limit) <= 1.0);
+
+            if close_to_resume {
+                secs = (base_secs * 0.5).max(2.0);
             }
         }
 

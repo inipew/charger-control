@@ -56,6 +56,12 @@ pub struct DiagnosticsState {
     pub last_heartbeat_log: Option<Instant>,
     pub last_error: Option<HardwareFault>,
     pub last_error_log: Option<Instant>,
+    pub last_battery_event_eval: Option<Instant>,
+    pub last_fsm_str: Option<String>,
+    pub last_decision_str: Option<String>,
+    pub last_current_reg_str: Option<String>,
+    pub last_power_state_str: Option<String>,
+    pub last_conv_str: Option<String>,
 }
 
 impl DiagnosticsState {
@@ -135,6 +141,7 @@ impl MonitorContext {
             adaptive_scheduler: AdaptiveScheduler::new(
                 Duration::from_secs(config.poll_interval_secs),
                 config.charge_limit as f32,
+                config.resume_limit as f32,
                 config.max_temp_dc as f32 / 10.0,
             ),
             diag: DiagnosticsState::default(),
@@ -204,7 +211,7 @@ fn can_sleep_forever(ctx: &MonitorContext) -> bool {
         reality::ConnectionState::Disconnected
     ) && !ctx.sched.evaluation_requested
         && ctx.intent.next_deadline().is_none()
-        && ctx.hardware_track.next_deadline().is_none()
+        // Saat disconnected, retry hardware actuator di-pause sampai charger terpasang kembali
         && ctx.observed.next_sensor_retry().is_none()
 }
 
@@ -318,6 +325,7 @@ pub fn run_monitor_loop(
             ctx.adaptive_scheduler.update_config(
                 Duration::from_secs(ctx.config.poll_interval_secs),
                 ctx.config.charge_limit as f32,
+                ctx.config.resume_limit as f32,
                 ctx.config.max_temp_dc as f32 / 10.0,
             );
 
@@ -361,9 +369,14 @@ pub fn run_monitor_loop(
 
             ctx.observed.update(power_state, sample, now_eval);
 
-            if let Ok(mut ps) = diagnostics.power_state.write() {
-                *ps = format!("{power_state:?}");
+            let ps_str = format!("{power_state:?}");
+            if ctx.diag.last_power_state_str.as_deref() != Some(&ps_str) {
+                if let Ok(mut ps) = diagnostics.power_state.write() {
+                    *ps = ps_str.clone();
+                }
+                ctx.diag.last_power_state_str = Some(ps_str);
             }
+
             if let Some(s) = &ctx.observed.sample {
                 diagnostics
                     .battery_level_percent
@@ -410,61 +423,86 @@ pub fn run_monitor_loop(
             let current_reg =
                 decision::resolve_current_regulation(&ctx.config, &ctx.policy_runtime, &decision);
 
-            if let Ok(mut fsm) = diagnostics.fsm_state.write() {
-                *fsm = match &ctx.policy_runtime.charge_limit_state {
-                    policy::ChargeLimitState::Normal => "Normal (Charging)".to_string(),
-                    policy::ChargeLimitState::Grace { started_at } => {
-                        let elapsed = now_eval.duration_since(*started_at);
-                        let remaining = policy::CHARGE_LIMIT_SUSPEND_DELAY
-                            .saturating_sub(elapsed)
-                            .as_secs();
-                        format!("Grace Period ({remaining}s remaining top-off)")
-                    }
-                    policy::ChargeLimitState::Suspended => "Suspended (Limit reached)".to_string(),
-                };
+            let fsm_str = match &ctx.policy_runtime.charge_limit_state {
+                policy::ChargeLimitState::Normal => "Normal (Charging)".to_string(),
+                policy::ChargeLimitState::Grace { started_at } => {
+                    let elapsed = now_eval.duration_since(*started_at);
+                    let remaining = policy::CHARGE_LIMIT_SUSPEND_DELAY
+                        .saturating_sub(elapsed)
+                        .as_secs();
+                    format!("Grace Period ({remaining}s remaining top-off)")
+                }
+                policy::ChargeLimitState::Suspended => "Suspended (Limit reached)".to_string(),
+            };
+            if ctx.diag.last_fsm_str.as_deref() != Some(&fsm_str) {
+                if let Ok(mut fsm) = diagnostics.fsm_state.write() {
+                    *fsm = fsm_str.clone();
+                }
+                ctx.diag.last_fsm_str = Some(fsm_str);
             }
 
-            if let Ok(mut dec) = diagnostics.target_decision.write() {
-                *dec = match &decision {
-                    ChargingDecision::Allow => "Allow".to_string(),
-                    ChargingDecision::Block { cause } => format!("Block ({cause:?})"),
-                    ChargingDecision::Bypass => "Bypass".to_string(),
-                    ChargingDecision::Wait { reason } => format!("Wait ({reason:?})"),
-                };
+            let dec_str = match &decision {
+                ChargingDecision::Allow => "Allow".to_string(),
+                ChargingDecision::Block { cause } => format!("Block ({cause:?})"),
+                ChargingDecision::Bypass => "Bypass".to_string(),
+                ChargingDecision::Wait { reason } => format!("Wait ({reason:?})"),
+            };
+            if ctx.diag.last_decision_str.as_deref() != Some(&dec_str) {
+                if let Ok(mut dec) = diagnostics.target_decision.write() {
+                    *dec = dec_str.clone();
+                }
+                ctx.diag.last_decision_str = Some(dec_str);
             }
 
-            if let Ok(mut cur) = diagnostics.current_regulation.write() {
-                *cur = match &current_reg {
-                    decision::CurrentRegulation::Unconstrained => {
-                        "Unconstrained (Full Speed)".to_string()
-                    }
-                    decision::CurrentRegulation::ConfigLimit { target_ua } => {
-                        format!("User Limit ({} mA)", target_ua / 1000)
-                    }
-                    decision::CurrentRegulation::ThermalThrottle { step, target_ua } => {
-                        format!("Thermal Step {step} ({} mA)", target_ua / 1000)
-                    }
-                    decision::CurrentRegulation::GraceCap { target_ua } => {
-                        format!("Grace Top-Off Cap ({} mA)", target_ua / 1000)
-                    }
-                    decision::CurrentRegulation::Disabled => "Disabled (0 mA)".to_string(),
-                };
+            let cur_str = match &current_reg {
+                decision::CurrentRegulation::Unconstrained => {
+                    "Unconstrained (Full Speed)".to_string()
+                }
+                decision::CurrentRegulation::ConfigLimit { target_ua } => {
+                    format!("User Limit ({} mA)", target_ua / 1000)
+                }
+                decision::CurrentRegulation::ThermalThrottle { step, target_ua } => {
+                    format!("Thermal Step {step} ({} mA)", target_ua / 1000)
+                }
+                decision::CurrentRegulation::GraceCap { target_ua } => {
+                    format!("Grace Top-Off Cap ({} mA)", target_ua / 1000)
+                }
+                decision::CurrentRegulation::Disabled => "Disabled (0 mA)".to_string(),
+            };
+            if ctx.diag.last_current_reg_str.as_deref() != Some(&cur_str) {
+                if let Ok(mut cur) = diagnostics.current_regulation.write() {
+                    *cur = cur_str.clone();
+                }
+                ctx.diag.last_current_reg_str = Some(cur_str);
             }
 
             // 5. Rekonsiliasi Hardware (Binary Switch + Current Limit)
-            let _ = hardware::reconcile_current(
-                current_reg,
-                &mut ctx.hardware_track,
-                ctx.sched.force_hardware_verification,
-                now_eval,
-            );
-
             let is_emergency = matches!(
                 decision,
                 ChargingDecision::Block {
                     cause: BlockCause::ThermalEmergency
                 }
             );
+            let current_opts = hardware::CurrentReconcileOptions {
+                bypass_retry_delay: is_emergency,
+            };
+
+            if let hardware::CurrentReconcileResult::Failed(error) = hardware::reconcile_current(
+                desired_hw,
+                current_reg,
+                &mut ctx.hardware_track,
+                current_opts,
+                now_eval,
+            ) {
+                if let hardware::CurrentLimitStatus::Fault { error: fault, .. } =
+                    ctx.hardware_track.current_limit.status
+                {
+                    if ctx.diag.should_log_error(fault, now_eval) {
+                        tracing::warn!(?fault, error = %error, "Fast charge current limit reconciliation failed");
+                    }
+                }
+            }
+
             let opts = hardware::ReconcileOptions {
                 bypass_retry_delay: is_emergency,
                 force_verification: is_emergency || ctx.sched.force_hardware_verification,
@@ -519,7 +557,7 @@ pub fn run_monitor_loop(
                     ctx.sched.clear_hardware_verification_request();
 
                     if let hardware::HardwareStatus::Fault { error: fault, .. } =
-                        ctx.hardware_track.status
+                        ctx.hardware_track.charger.status
                     {
                         if ctx.diag.should_log_error(fault, now_eval) {
                             tracing::warn!(?fault, error = %error, "Hardware reconciliation failed");
@@ -528,8 +566,13 @@ pub fn run_monitor_loop(
                 }
             }
 
-            if let Ok(mut conv) = diagnostics.convergence_state.write() {
-                *conv = format!("{:?}", ctx.hardware_track.convergence);
+            let conv = ctx.hardware_track.overall_convergence();
+            let conv_str = format!("{conv:?}");
+            if ctx.diag.last_conv_str.as_deref() != Some(&conv_str) {
+                if let Ok(mut c) = diagnostics.convergence_state.write() {
+                    *c = conv_str.clone();
+                }
+                ctx.diag.last_conv_str = Some(conv_str);
             }
 
             ctx.clear_evaluation_request();
@@ -616,68 +659,78 @@ pub fn run_monitor_loop(
         }
 
         let wake_now = Instant::now();
+        diagnostics.total_wakeups.fetch_add(1, Ordering::Relaxed);
 
         if events.is_empty() {
             // Poll timeout (deadline atau interval monitoring telah tiba)
+            if let Ok(mut r) = diagnostics.last_wake_reason.write() {
+                *r = "Poll Timeout (Deadline)".to_string();
+            }
             ctx.mark_evaluation_requested();
         } else {
             let mut batch = UeventBatch::default();
             let mut ipc_shutdown = false;
+            let mut has_ipc = false;
 
             for event in events.iter() {
                 match event.token() {
-                    IPC => loop {
-                        match mio_rx.recv(&mut msg_buf) {
-                            Ok(0) => {
-                                tracing::error!("Internal IPC channel closed unexpectedly");
-                                ipc_shutdown = true;
-                                break;
-                            }
-                            Ok(_len) => {
-                                let cmd_code = msg_buf[0];
-                                match cmd_code {
-                                    1 => handle_event(
-                                        &mut ctx,
-                                        MonitorEvent::IpcCommand(DaemonCommand::Reload),
-                                        wake_now,
-                                    ),
-                                    2 => {
-                                        tracing::info!("Shutdown signal received in monitor loop");
-                                        ipc_shutdown = true;
-                                        break;
+                    IPC => {
+                        has_ipc = true;
+                        loop {
+                            match mio_rx.recv(&mut msg_buf) {
+                                Ok(0) => {
+                                    tracing::error!("Internal IPC channel closed unexpectedly");
+                                    ipc_shutdown = true;
+                                    break;
+                                }
+                                Ok(_len) => {
+                                    let cmd_code = msg_buf[0];
+                                    match cmd_code {
+                                        1 => handle_event(
+                                            &mut ctx,
+                                            MonitorEvent::IpcCommand(DaemonCommand::Reload),
+                                            wake_now,
+                                        ),
+                                        2 => {
+                                            tracing::info!(
+                                                "Shutdown signal received in monitor loop"
+                                            );
+                                            ipc_shutdown = true;
+                                            break;
+                                        }
+                                        3 => handle_event(
+                                            &mut ctx,
+                                            MonitorEvent::IpcCommand(DaemonCommand::BypassOn),
+                                            wake_now,
+                                        ),
+                                        4 => handle_event(
+                                            &mut ctx,
+                                            MonitorEvent::IpcCommand(DaemonCommand::BypassOff),
+                                            wake_now,
+                                        ),
+                                        5 => handle_event(
+                                            &mut ctx,
+                                            MonitorEvent::IpcCommand(DaemonCommand::DisableOn),
+                                            wake_now,
+                                        ),
+                                        6 => handle_event(
+                                            &mut ctx,
+                                            MonitorEvent::IpcCommand(DaemonCommand::DisableOff),
+                                            wake_now,
+                                        ),
+                                        _ => {}
                                     }
-                                    3 => handle_event(
-                                        &mut ctx,
-                                        MonitorEvent::IpcCommand(DaemonCommand::BypassOn),
-                                        wake_now,
-                                    ),
-                                    4 => handle_event(
-                                        &mut ctx,
-                                        MonitorEvent::IpcCommand(DaemonCommand::BypassOff),
-                                        wake_now,
-                                    ),
-                                    5 => handle_event(
-                                        &mut ctx,
-                                        MonitorEvent::IpcCommand(DaemonCommand::DisableOn),
-                                        wake_now,
-                                    ),
-                                    6 => handle_event(
-                                        &mut ctx,
-                                        MonitorEvent::IpcCommand(DaemonCommand::DisableOff),
-                                        wake_now,
-                                    ),
-                                    _ => {}
+                                }
+                                Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                                    break;
+                                }
+                                Err(e) => {
+                                    tracing::error!(error = %e, "IPC recv error");
+                                    break;
                                 }
                             }
-                            Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
-                                break;
-                            }
-                            Err(e) => {
-                                tracing::error!(error = %e, "IPC recv error");
-                                break;
-                            }
                         }
-                    },
+                    }
                     NETLINK => {
                         if event.is_error() || event.is_read_closed() {
                             batch.netlink_broken = true;
@@ -740,6 +793,18 @@ pub fn run_monitor_loop(
 
             if ipc_shutdown {
                 return;
+            }
+
+            if let Ok(mut r) = diagnostics.last_wake_reason.write() {
+                if has_ipc {
+                    *r = "IPC Command".to_string();
+                } else if batch.ac || batch.usb || batch.typec {
+                    *r = "Netlink Uevent (Charger/USB)".to_string();
+                } else if batch.battery || batch.bms {
+                    *r = "Netlink Uevent (Battery/BMS)".to_string();
+                } else if batch.overflow || batch.netlink_broken {
+                    *r = "Netlink Uevent (Recovery)".to_string();
+                }
             }
 
             if batch.ac {
