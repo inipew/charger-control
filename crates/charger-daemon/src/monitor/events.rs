@@ -66,7 +66,7 @@ pub fn handle_event(ctx: &mut MonitorContext, event: MonitorEvent, now: Instant)
         }
         MonitorEvent::IpcCommand(cmd) => match cmd {
             DaemonCommand::BypassOn => {
-                ctx.intent = OperatingIntent::bypass(now, None);
+                ctx.intent = OperatingIntent::bypass_with_safety_ttl(now);
                 ctx.mark_force_hardware_verification();
                 ctx.mark_evaluation_requested();
             }

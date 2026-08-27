@@ -201,8 +201,15 @@ fn main() {
 
     monitor::run_monitor_loop(Arc::clone(&shared_config), rx, shared_diagnostics);
 
-    tracing::info!("Monitor requested daemon shutdown");
+    // 1. Matikan listener IPC server terlebih dahulu agar tidak ada command baru masuk
+    ipc_shutdown.store(true, Ordering::Release);
+    let _ = std::os::unix::net::UnixStream::connect(ipc::SOCKET_PATH);
 
+    if let Err(error) = ipc_thread.join() {
+        tracing::error!(?error, "IPC thread terminated unexpectedly");
+    }
+
+    // 2. Pulihkan status fisik hardware ke default aman pabrik
     if let Err(error) = charger_core::battery::control::set_charging(true) {
         tracing::error!(
             error = %error,
@@ -221,13 +228,7 @@ fn main() {
         tracing::info!("Fast charge current limit reset successfully");
     }
 
-    ipc_shutdown.store(true, Ordering::Release);
-    let _ = std::os::unix::net::UnixStream::connect(ipc::SOCKET_PATH);
-
-    if let Err(error) = ipc_thread.join() {
-        tracing::error!(?error, "IPC thread terminated unexpectedly");
-    }
-
+    // 3. Bersihkan file PID dan socket IPC
     cleanup_pid_file();
     let _ = std::fs::remove_file(ipc::SOCKET_PATH);
 

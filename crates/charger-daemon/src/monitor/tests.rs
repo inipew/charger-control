@@ -161,8 +161,13 @@ mod tests {
         observed.connection = ConnectionState::Attached;
         let policy = PolicyResult::clear();
 
-        let decision =
-            ChargingDecision::resolve(&observed, &OperatingIntent::normal(), &policy, now);
+        let decision = ChargingDecision::resolve(
+            &observed,
+            &OperatingIntent::normal(),
+            &policy,
+            hw_track.safety_fault(),
+            now,
+        );
 
         assert_eq!(decision, ChargingDecision::Allow);
         assert_eq!(
@@ -265,7 +270,7 @@ mod tests {
         let policy = PolicyResult::clear();
 
         let decision =
-            ChargingDecision::resolve(&observed, &OperatingIntent::normal(), &policy, now);
+            ChargingDecision::resolve(&observed, &OperatingIntent::normal(), &policy, None, now);
         assert_eq!(
             decision,
             ChargingDecision::Wait {
@@ -1282,7 +1287,7 @@ mod tests {
         };
         let intent = OperatingIntent::normal();
         let policy_res = PolicyResult::clear();
-        let dec = ChargingDecision::resolve(&observed, &intent, &policy_res, now);
+        let dec = ChargingDecision::resolve(&observed, &intent, &policy_res, None, now);
         assert_eq!(
             dec,
             ChargingDecision::Wait {
@@ -1636,7 +1641,8 @@ mod tests {
             mode: crate::monitor::intent::IntentMode::Disabled,
             expires_at: None,
         };
-        let dec_disabled = ChargingDecision::resolve(&observed, &intent_disabled, &policy_res, now);
+        let dec_disabled =
+            ChargingDecision::resolve(&observed, &intent_disabled, &policy_res, None, now);
         assert_eq!(
             dec_disabled,
             ChargingDecision::Block {
@@ -1649,12 +1655,14 @@ mod tests {
             mode: crate::monitor::intent::IntentMode::Bypass,
             expires_at: None,
         };
-        let dec_bypass = ChargingDecision::resolve(&observed, &intent_bypass, &policy_res, now);
+        let dec_bypass =
+            ChargingDecision::resolve(&observed, &intent_bypass, &policy_res, None, now);
         assert_eq!(dec_bypass, ChargingDecision::Bypass);
 
         // 3. Intent Normal -> Allow
         let intent_normal = OperatingIntent::normal();
-        let dec_normal = ChargingDecision::resolve(&observed, &intent_normal, &policy_res, now);
+        let dec_normal =
+            ChargingDecision::resolve(&observed, &intent_normal, &policy_res, None, now);
         assert_eq!(dec_normal, ChargingDecision::Allow);
     }
 
@@ -1675,7 +1683,7 @@ mod tests {
         assert!(policy_res.is_blocked_by(PolicyBlock::SensorStale));
 
         let intent = OperatingIntent::normal();
-        let dec = ChargingDecision::resolve(&observed, &intent, &policy_res, now);
+        let dec = ChargingDecision::resolve(&observed, &intent, &policy_res, None, now);
 
         // Sensor stale MUST resolve to Safety Block (SensorStale) to physically disable charging!
         assert_eq!(
@@ -2304,5 +2312,115 @@ mod tests {
         let unknown = ActualHardwareMode::Unknown;
         assert!(!unknown.is_known());
     }
+
+    #[test]
+    fn test_cold_start_suspended_reconstruction() {
+        let mut runtime = PolicyRuntime::default();
+        assert_eq!(runtime.charge_limit_state, ChargeLimitState::Normal);
+
+        let mut config = Config::default();
+        config.charge_limit = 80;
+
+        let sample_95 = Sample {
+            capacity: 95.0,
+            temperature_c: 28.0,
+            power_state: charger_core::battery::reader::PowerState::Charging,
+            timestamp: Instant::now(),
+        };
+
+        // If daemon starts/restarts with SOC >= charge_limit, it must initialize directly to Suspended
+        runtime.reconstruct_cold_start(sample_95, &config);
+        assert_eq!(runtime.charge_limit_state, ChargeLimitState::Suspended);
+    }
+
+    #[test]
+    fn test_attaching_does_not_advance_grace_timer() {
+        let now = Instant::now();
+        let mut observed = ObservedState::new();
+        observed.connection = ConnectionState::Attaching { since: now };
+        observed.sample = Some(Sample {
+            capacity: 85.0,
+            temperature_c: 28.0,
+            power_state: charger_core::battery::reader::PowerState::Charging,
+            timestamp: now,
+        });
+
+        let mut config = Config::default();
+        config.charge_limit = 80;
+        let mut runtime = PolicyRuntime::default();
+
+        let policy_res = evaluate_policy(&observed, &config, &mut runtime, now);
+        // During attaching (not operational), policy must clear and timer must remain Normal
+        assert_eq!(policy_res, PolicyResult::clear());
+        assert_eq!(runtime.charge_limit_state, ChargeLimitState::Normal);
+    }
+
+    #[test]
+    fn test_hardware_safety_fault_dominates_decision() {
+        let now = Instant::now();
+        let mut observed = ObservedState::new();
+        observed.connection = ConnectionState::Attached;
+        let policy_res = PolicyResult::clear();
+        let intent = OperatingIntent::normal();
+
+        // When charger has a SafetyFault (PermissionDenied), decision resolves to Block(HardwareSafetyFault)
+        let dec = ChargingDecision::resolve(
+            &observed,
+            &intent,
+            &policy_res,
+            Some(HardwareFault::PermissionDenied),
+            now,
+        );
+
+        assert_eq!(
+            dec,
+            ChargingDecision::Block {
+                cause: BlockCause::HardwareSafetyFault(HardwareFault::PermissionDenied),
+            }
+        );
+        assert_eq!(
+            dec.to_desired_hardware(),
+            DesiredHardwareState::ChargingDisabled
+        );
+    }
+
+    #[test]
+    fn test_bypass_safety_ttl_auto_expiration() {
+        use crate::monitor::intent::{DEFAULT_MAX_BYPASS_TTL, IntentMode};
+
+        let now = Instant::now();
+        let mut intent = OperatingIntent::bypass_with_safety_ttl(now);
+
+        assert_eq!(intent.current_mode(now), IntentMode::Bypass);
+        assert_eq!(
+            intent.next_deadline(),
+            Some(now + DEFAULT_MAX_BYPASS_TTL)
+        );
+
+        // Before TTL expiration (11 hours) -> Bypass
+        let t_11h = now + Duration::from_secs(11 * 3600);
+        assert_eq!(intent.current_mode(t_11h), IntentMode::Bypass);
+
+        // After TTL expiration (13 hours) -> Auto reverts to Normal
+        let t_13h = now + Duration::from_secs(13 * 3600);
+        assert_eq!(intent.current_mode(t_13h), IntentMode::Normal);
+        intent.normalize(t_13h);
+        assert_eq!(intent.mode, IntentMode::Normal);
+    }
+
+    #[test]
+    fn test_hardware_capabilities_probe() {
+        use charger_core::battery::control::HardwareCapabilities;
+
+        let caps = HardwareCapabilities::probe();
+        // HardwareCapabilities must probe without panicking
+        assert!(matches!(
+            caps.charging_control,
+            charger_core::battery::control::CapabilityStatus::Unavailable
+                | charger_core::battery::control::CapabilityStatus::Writable
+                | charger_core::battery::control::CapabilityStatus::Verified
+        ));
+    }
 }
+
 

@@ -426,6 +426,15 @@ impl HardwareTrack {
             .combine(self.current_limit.convergence())
             .combine(self.fast_charge.convergence())
     }
+
+    pub fn safety_fault(&self) -> Option<HardwareFault> {
+        if let HardwareStatus::Fault { error, .. } = self.charger.status {
+            if error.is_safety_fault() {
+                return Some(error);
+            }
+        }
+        None
+    }
 }
 
 /// Hasil rekonsiliasi hardware actuator.

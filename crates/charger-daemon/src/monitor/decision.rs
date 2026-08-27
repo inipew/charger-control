@@ -3,6 +3,7 @@ use std::time::Instant;
 use charger_core::{battery::control, config::schema::Config};
 
 use super::{
+    hardware::HardwareFault,
     intent::{IntentMode, OperatingIntent},
     policy::{ChargeLimitState, PolicyResult, PolicyRuntime, ThermalStep, GRACE_CURRENT_CAP_UA},
     reality::{ConnectionState, ObservedState},
@@ -137,6 +138,7 @@ pub enum BlockCause {
     Thermal,
     ChargeLimit,
     SensorStale,
+    HardwareSafetyFault(HardwareFault),
     UserDisabled,
 }
 
@@ -161,14 +163,13 @@ impl ChargingDecision {
     /// 1. Connection check (Disconnect -> Wait(Disconnected))
     /// 2. Attaching window check (Attaching -> Wait(AttachingSettleWindow))
     /// 3. System Safety Policy Check (via strongest_block()) -> Block(Cause)
-    /// 4. User/Operating Intent check (Disabled / Bypass / Normal)
-    ///
-    /// Hardware fault/recovery sengaja tidak termasuk dalam decision domain.
-    /// Hardware actuator direkonsiliasi secara terpisah oleh `hardware::reconcile`.
+    /// 4. Hardware Safety Fault (PermissionDenied, ReadbackMismatch) -> Block(HardwareSafetyFault)
+    /// 5. User/Operating Intent check (Disabled / Bypass / Normal)
     pub fn resolve(
         observed: &ObservedState,
         intent: &OperatingIntent,
         policy: &PolicyResult,
+        safety_fault: Option<HardwareFault>,
         now: Instant,
     ) -> Self {
         match observed.connection {
@@ -179,12 +180,21 @@ impl ChargingDecision {
                 reason: WaitReason::AttachingSettleWindow,
             },
             ConnectionState::Attached => {
-                // 1. Safety SELALU menang di atas Hardware Fault dan User Intent
+                // 1. Safety Policy SELALU menang
                 if let Some(cause) = policy.strongest_block() {
                     return Self::Block { cause };
                 }
 
-                // 2. Evaluasi Operating Intent (Disabled vs Bypass vs Normal)
+                // 2. Hardware Safety Fault (PermissionDenied atau ReadbackMismatch)
+                if let Some(fault) = safety_fault {
+                    if fault.is_safety_fault() {
+                        return Self::Block {
+                            cause: BlockCause::HardwareSafetyFault(fault),
+                        };
+                    }
+                }
+
+                // 3. Evaluasi Operating Intent (Disabled vs Bypass vs Normal)
                 match intent.current_mode(now) {
                     IntentMode::Disabled => Self::Block {
                         cause: BlockCause::UserDisabled,
@@ -218,7 +228,7 @@ impl ChargingDecision {
                 cause: BlockCause::ChargeLimit,
             } => Urgency::Monitoring,
             Self::Block {
-                cause: BlockCause::SensorStale,
+                cause: BlockCause::SensorStale | BlockCause::HardwareSafetyFault(_),
             } => Urgency::Recovery,
             Self::Wait {
                 reason: WaitReason::Disconnected,

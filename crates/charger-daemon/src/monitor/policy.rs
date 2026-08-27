@@ -194,6 +194,11 @@ impl PolicyRuntime {
             None
         }
     }
+    pub fn reconstruct_cold_start(&mut self, sample: Sample, config: &Config) {
+        if config.charge_limit > 0 && sample.capacity >= config.charge_limit as f32 {
+            self.charge_limit_state = ChargeLimitState::Suspended;
+        }
+    }
 }
 
 /// Evaluasi Stepped Thermal Throttling dengan Hold Hysteresis (10 detik).
@@ -252,6 +257,12 @@ pub fn evaluate_policy(
         if matches!(runtime.charge_limit_state, ChargeLimitState::Grace { .. }) {
             runtime.charge_limit_state = ChargeLimitState::Normal;
         }
+        return PolicyResult::clear();
+    }
+
+    // 1b. Jika koneksi steker masih dalam masa stabilisasi (Attaching 5 detik),
+    // jangan majukan timer policy reguler agar Attaching murni menjadi state isolasi transisi.
+    if !observed.connection.is_operational() {
         return PolicyResult::clear();
     }
 
@@ -440,7 +451,7 @@ pub fn evaluate_fast_charge_policy(
         return FastChargePolicy::Disabled;
     }
 
-    if !observed.connection.is_connected() {
+    if !observed.connection.is_operational() {
         return FastChargePolicy::Disabled;
     }
 

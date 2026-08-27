@@ -121,6 +121,8 @@ pub struct MonitorContext {
     pub diag: DiagnosticsState,
     pub has_distinct_bypass: bool,
     pub policy_runtime: PolicyRuntime,
+    pub evaluation_id: u64,
+    pub cold_start_reconstructed: bool,
 }
 
 impl MonitorContext {
@@ -147,6 +149,8 @@ impl MonitorContext {
             diag: DiagnosticsState::default(),
             has_distinct_bypass,
             policy_runtime: PolicyRuntime::default(),
+            evaluation_id: 0,
+            cold_start_reconstructed: false,
         }
     }
 
@@ -398,7 +402,14 @@ pub fn run_monitor_loop(
             }
 
             // 3. Evaluasi Policy Engine & Stepped Thermal Regulation
+            ctx.evaluation_id += 1;
+
             if let Some(s) = &ctx.observed.sample {
+                if !ctx.cold_start_reconstructed {
+                    ctx.policy_runtime.reconstruct_cold_start(*s, &ctx.config);
+                    ctx.cold_start_reconstructed = true;
+                }
+
                 let temp_dc = (s.temperature_c * 10.0) as i32;
                 policy::evaluate_thermal_stepping(
                     temp_dc,
@@ -415,9 +426,15 @@ pub fn run_monitor_loop(
                 now_eval,
             );
 
-            // 4. Resolve Decision & Map to Desired Hardware State
-            let decision =
-                ChargingDecision::resolve(&ctx.observed, &ctx.intent, &ctx.policy_result, now_eval);
+            // 4. Resolve Decision & Map to Desired Hardware State (Passing Hardware Safety Fault)
+            let safety_fault = ctx.hardware_track.safety_fault();
+            let decision = ChargingDecision::resolve(
+                &ctx.observed,
+                &ctx.intent,
+                &ctx.policy_result,
+                safety_fault,
+                now_eval,
+            );
             ctx.diag.last_computed_decision = Some(decision.clone());
             let desired_hw = decision.to_desired_hardware();
             let current_reg =

@@ -684,3 +684,68 @@ pub fn grant_node_permissions() -> Result<(), ChargerError> {
 pub fn grant_node_permissions() -> Result<(), ChargerError> {
     Ok(())
 }
+
+/// Status kemampuan kendali sysfs perangkat.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CapabilityStatus {
+    Unavailable,
+    ReadOnly,
+    Writable,
+    Verified,
+}
+
+/// Model kapabilitas hardware charger control.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct HardwareCapabilities {
+    pub charging_control: CapabilityStatus,
+    pub input_suspend: CapabilityStatus,
+    pub current_limit: CapabilityStatus,
+    pub fast_charge: CapabilityStatus,
+}
+
+impl HardwareCapabilities {
+    pub fn probe() -> Self {
+        let charging_control = if charging_node().is_some() {
+            CapabilityStatus::Writable
+        } else {
+            CapabilityStatus::Unavailable
+        };
+
+        let input_suspend = if suspend_node().is_some() {
+            CapabilityStatus::Writable
+        } else {
+            CapabilityStatus::Unavailable
+        };
+
+        let current_limit = if fast_charge_node().is_some() {
+            if read_fast_charge_current().is_some() {
+                CapabilityStatus::Verified
+            } else {
+                CapabilityStatus::Writable
+            }
+        } else {
+            CapabilityStatus::Unavailable
+        };
+
+        let fast_charge_nodes = [
+            "/sys/class/power_supply/usb/fastcharge_mode",
+            "/sys/class/power_supply/bms/fastcharge_mode",
+            "/sys/class/power_supply/usb/pd_active",
+            "/sys/class/power_supply/ln8000/charging_enabled",
+        ];
+        let has_fc = fast_charge_nodes.iter().any(|p| Path::new(p).exists());
+        let fast_charge = if has_fc {
+            CapabilityStatus::Writable
+        } else {
+            CapabilityStatus::Unavailable
+        };
+
+        Self {
+            charging_control,
+            input_suspend,
+            current_limit,
+            fast_charge,
+        }
+    }
+}
+

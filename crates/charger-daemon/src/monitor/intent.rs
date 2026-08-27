@@ -8,6 +8,9 @@ pub enum IntentMode {
     Disabled,
 }
 
+/// Batas waktu kedaluwarsa keamanan default untuk mode bypass via IPC (12 jam).
+pub const DEFAULT_MAX_BYPASS_TTL: Duration = Duration::from_secs(12 * 3600);
+
 /// Niat pengoperasian dengan batas waktu kedaluwarsa opsional.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct OperatingIntent {
@@ -41,6 +44,10 @@ impl OperatingIntent {
             mode: IntentMode::Bypass,
             expires_at: expires_in.map(|d| now + d),
         }
+    }
+
+    pub fn bypass_with_safety_ttl(now: Instant) -> Self {
+        Self::bypass(now, Some(DEFAULT_MAX_BYPASS_TTL))
     }
 
     pub fn current_mode(&self, now: Instant) -> IntentMode {
