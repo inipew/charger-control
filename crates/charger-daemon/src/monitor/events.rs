@@ -39,12 +39,6 @@ pub fn handle_event(ctx: &mut MonitorContext, event: MonitorEvent, now: Instant)
         MonitorEvent::ChargerDetached => {
             ctx.reset_on_detach();
             ctx.hardware_track.reset_on_disconnect();
-
-            // Pulihkan status fisik hardware ke kondisi default pabrik (1x eksekusi saat detach)
-            // agar PMIC tidak tertinggal dalam status input_suspend saat berjalan dengan baterai
-            let _ = charger_core::battery::control::set_charging(true);
-            let _ = charger_core::battery::control::reset_fast_charge_current();
-
             ctx.observed.clear_sample();
             ctx.mark_evaluation_requested();
         }

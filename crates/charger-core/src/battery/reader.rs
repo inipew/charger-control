@@ -189,16 +189,7 @@ pub fn read_input_current_ua() -> Result<i64, ChargerError> {
     read_first_cached(
         INPUT_CURRENT_NODES,
         &INPUT_CURRENT_CACHED_IDX,
-        |raw| {
-            let value = raw.parse::<i64>().ok()?;
-            // Guard: skip 0 to avoid returning driver-configured limits
-            // when charger is not actively supplying current.
-            if value == 0 {
-                None
-            } else {
-                Some(value)
-            }
-        },
+        |raw| raw.parse::<i64>().ok(),
         "input_current_ua",
     )
 }

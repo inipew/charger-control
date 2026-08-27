@@ -102,6 +102,40 @@ impl ConnectionState {
     }
 }
 
+/// Status kesehatan pembacaan sensor telemetry.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SensorHealth {
+    pub consecutive_failures: u32,
+    pub last_failure_at: Option<Instant>,
+    pub last_success_at: Option<Instant>,
+}
+
+impl SensorHealth {
+    pub const fn new() -> Self {
+        Self {
+            consecutive_failures: 0,
+            last_failure_at: None,
+            last_success_at: None,
+        }
+    }
+
+    pub fn mark_success(&mut self, now: Instant) {
+        self.consecutive_failures = 0;
+        self.last_success_at = Some(now);
+    }
+
+    pub fn mark_failure(&mut self, now: Instant) {
+        self.consecutive_failures = self.consecutive_failures.saturating_add(1);
+        self.last_failure_at = Some(now);
+    }
+}
+
+impl Default for SensorHealth {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 /// Fakta murni dari sensor (Power State & Battery Snapshot).
 ///
 /// Modul ini TIDAK menyimpan boolean policy atau status hardware yang diharapkan.
@@ -112,6 +146,7 @@ pub struct ObservedState {
     pub sample: Option<Sample>,
     pub timestamp: Instant,
     pub sample_retry_at: Option<Instant>,
+    pub sensor_health: SensorHealth,
 }
 
 impl ObservedState {
@@ -122,6 +157,7 @@ impl ObservedState {
             sample: None,
             timestamp: Instant::now(),
             sample_retry_at: None,
+            sensor_health: SensorHealth::new(),
         }
     }
 
@@ -136,12 +172,14 @@ impl ObservedState {
         if let Some(s) = sample {
             self.sample = Some(s);
             self.sample_retry_at = None;
+            self.sensor_health.mark_success(now);
         }
         self.timestamp = now;
     }
 
-    pub fn mark_sample_failed(&mut self, retry_at: Instant) {
+    pub fn mark_sample_failed(&mut self, retry_at: Instant, now: Instant) {
         self.sample_retry_at = Some(retry_at);
+        self.sensor_health.mark_failure(now);
     }
 
     pub fn clear_sample(&mut self) {
@@ -155,6 +193,20 @@ impl ObservedState {
 
     #[allow(dead_code)]
     pub fn has_fresh_sample(&self, now: Instant) -> bool {
+        match self.sample {
+            Some(s) => !s.is_stale(now),
+            None => false,
+        }
+    }
+
+    /// Memeriksa apakah data sensor aman dan valid untuk evaluasi kebijakan keselamatan.
+    ///
+    /// Jika pembacaan sensor gagal berulang (consecutive_failures >= 2), data sensor lama
+    /// tidak boleh dipercaya demi keselamatan fisik/termal baterai.
+    pub fn is_sensor_safe(&self, now: Instant) -> bool {
+        if self.sensor_health.consecutive_failures >= 2 {
+            return false;
+        }
         match self.sample {
             Some(s) => !s.is_stale(now),
             None => false,

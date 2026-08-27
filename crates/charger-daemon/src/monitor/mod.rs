@@ -233,10 +233,6 @@ pub fn run_monitor_loop(
 
     let mut ctx = MonitorContext::new(&initial_config);
 
-    if let Err(error) = control::grant_node_permissions() {
-        tracing::warn!(error = %error, "Failed setting sysfs node permissions");
-    }
-
     let mut poll = Poll::new().expect("Failed to create mio::Poll");
     let mut events = Events::with_capacity(64);
     const IPC: Token = Token(0);
@@ -363,7 +359,7 @@ pub fn run_monitor_loop(
                     Err(error) => {
                         tracing::warn!(error = %error, "Failed reading battery snapshot");
                         let backoff = ctx.sched.mark_snapshot_failure();
-                        ctx.observed.mark_sample_failed(now_eval + backoff);
+                        ctx.observed.mark_sample_failed(now_eval + backoff, now_eval);
                         None
                     }
                 }

@@ -333,13 +333,113 @@ pub fn reset_fast_charge_current() -> Result<(), ChargerError> {
 /// usb/fastcharge_mode, bms/fastcharge_mode, usb/pd_active, usb/pd_type, usb/pd_authentication,
 /// bms/mtk_soc_decimal_rate, ln8000 charge pump).
 ///
+/// Rekaman snapshot nilai node sysfs sebelum mutasi.
+#[derive(Debug, Clone)]
+pub struct SysfsSnapshot {
+    pub path: &'static str,
+    pub original_value: Option<String>,
+}
+
+/// Transaksi penulisan multi-node dengan rollback otomatis nilai asli dalam urutan terbalik.
+pub struct HardwareTransaction {
+    snapshots: Vec<SysfsSnapshot>,
+    written_indices: Vec<usize>,
+}
+
+impl HardwareTransaction {
+    pub fn new() -> Self {
+        Self {
+            snapshots: Vec::new(),
+            written_indices: Vec::new(),
+        }
+    }
+
+    /// Menambahkan node ke dalam transaksi dan mengambil snapshot nilai aslinya jika node ada.
+    pub fn stage(&mut self, path: &'static str) -> bool {
+        let p = Path::new(path);
+        if p.exists() {
+            let original_value = fs::read_to_string(p).ok().map(|s| s.trim().to_string());
+            self.snapshots.push(SysfsSnapshot {
+                path,
+                original_value,
+            });
+            true
+        } else {
+            false
+        }
+    }
+
+    /// Menjalankan penulisan terurut. Jika salah satu gagal, lakukan rollback snapshot dalam urutan terbalik.
+    pub fn commit(&mut self, writes: &[(&'static str, &str)]) -> Result<(), ChargerError> {
+        self.written_indices.clear();
+        for (i, &(path, val)) in writes.iter().enumerate() {
+            match write_sysfs(Path::new(path), val) {
+                Ok(()) => {
+                    self.written_indices.push(i);
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        path,
+                        error = %e,
+                        "HardwareTransaction write failed, rolling back snapshotted values in reverse order"
+                    );
+                    self.rollback();
+                    return Err(e);
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Mengembalikan semua node yang telah ditulis ke nilai aslinya dalam urutan terbalik.
+    pub fn rollback(&mut self) {
+        for &idx in self.written_indices.iter().rev() {
+            if let Some(snap) = self.snapshots.get(idx) {
+                if let Some(ref orig) = snap.original_value {
+                    let _ = write_sysfs(Path::new(snap.path), orig);
+                }
+            }
+        }
+        self.written_indices.clear();
+    }
+}
+
+impl Default for HardwareTransaction {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+/// Daftar seluruh node fast-charge yang didukung untuk mutasi dan rilis simetris.
+pub const FAST_CHARGE_ALL_NODES: &[&str] = &[
+    "/sys/class/power_supply/battery/fast_charge_current",
+    "/sys/class/power_supply/battery/thermal_input_current",
+    "/sys/class/power_supply/usb/fastcharge_mode",
+    "/sys/class/power_supply/bms/fastcharge_mode",
+    "/sys/class/power_supply/usb/pd_active",
+    "/sys/class/power_supply/usb/pd_type",
+    "/sys/class/power_supply/usb/pd_authentication",
+    "/sys/class/power_supply/bms/mtk_soc_decimal_rate",
+    "/sys/class/power_supply/ln8000/charging_enabled",
+    "/sys/class/power_supply/ln8000/hv_charge_enable",
+    "/sys/class/power_supply/ln8000/input_current_limit",
+    "/sys/class/power_supply/ln8000/bq_charge_done",
+    "/sys/class/power_supply/ln8000/ti_bypass_mode_enable",
+];
+
+/// Terapkan / Rilis mode Fast Charge & USB-PD Bypass ke kernel sysfs secara transaksional dan simetris.
+///
+/// When `enable = true`:
+/// Mengambil snapshot nilai awal seluruh node yang ada, menulis nilai target, dan melakukan rollback otomatis
+/// ke nilai snapshot asli dalam urutan terbalik jika terjadi kegagalan parsial.
+///
 /// When `enable = false`:
-/// Resets the bypass flags gracefully without interrupting normal charging.
+/// Merilis seluruh node fast-charge secara simetris ke default aman pabrik tanpa kebocoran state (*state leakage*).
 pub fn apply_fast_charge_bypass(enable: bool, current_ua: u32) -> Result<(), ChargerError> {
     let current_str = (current_ua.max(500_000)).to_string();
 
     if enable {
-        let nodes: &[(&str, &str)] = &[
+        let nodes: &[(&'static str, &str)] = &[
             (
                 "/sys/class/power_supply/battery/fast_charge_current",
                 &current_str,
@@ -364,59 +464,33 @@ pub fn apply_fast_charge_bypass(enable: bool, current_ua: u32) -> Result<(), Cha
             ("/sys/class/power_supply/ln8000/ti_bypass_mode_enable", "0"),
         ];
 
-        let mut existing_nodes = Vec::new();
+        let mut tx = HardwareTransaction::new();
+        let mut writes_to_commit = Vec::new();
+
         for &(path, val) in nodes {
-            if Path::new(path).exists() {
-                existing_nodes.push((path, val));
+            if tx.stage(path) {
+                writes_to_commit.push((path, val));
             }
         }
 
-        if existing_nodes.is_empty() {
+        if writes_to_commit.is_empty() {
             return Err(ChargerError::NoChargingNodeFound);
         }
 
-        let mut succeeded = 0usize;
-        let mut failed = 0usize;
-        let mut written_paths = Vec::new();
-
-        for (path, val) in existing_nodes {
-            match write_sysfs(Path::new(path), val) {
-                Ok(()) => {
-                    succeeded += 1;
-                    written_paths.push(path);
-                }
-                Err(e) => {
-                    tracing::warn!(path, error = %e, "Failed to write fast charge bypass node");
-                    failed += 1;
-                }
-            }
-        }
-
-        if failed > 0 {
-            // Rollback on partial failure to prevent split-brain hardware state
-            tracing::warn!(
-                succeeded,
-                failed,
-                "Rolling back partial fast charge bypass writes"
-            );
-            for path in written_paths {
-                let reset_val = if path.contains("current") {
-                    "500000"
-                } else {
-                    "0"
-                };
-                let _ = write_sysfs(Path::new(path), reset_val);
-            }
-            return Err(ChargerError::PartialWriteFailure { succeeded, failed });
-        }
+        tx.commit(&writes_to_commit)?;
     } else {
-        let reset_nodes: &[(&str, &str)] = &[
+        // Symmetrical release: reset all supported fast charge nodes
+        let reset_nodes: &[(&'static str, &str)] = &[
             ("/sys/class/power_supply/usb/fastcharge_mode", "0"),
             ("/sys/class/power_supply/bms/fastcharge_mode", "0"),
             ("/sys/class/power_supply/usb/pd_active", "0"),
+            ("/sys/class/power_supply/usb/pd_type", "0"),
             ("/sys/class/power_supply/usb/pd_authentication", "0"),
+            ("/sys/class/power_supply/bms/mtk_soc_decimal_rate", "0"),
             ("/sys/class/power_supply/ln8000/charging_enabled", "0"),
             ("/sys/class/power_supply/ln8000/hv_charge_enable", "0"),
+            ("/sys/class/power_supply/ln8000/bq_charge_done", "0"),
+            ("/sys/class/power_supply/ln8000/ti_bypass_mode_enable", "0"),
         ];
 
         for &(path, value) in reset_nodes {
@@ -427,6 +501,14 @@ pub fn apply_fast_charge_bypass(enable: bool, current_ua: u32) -> Result<(), Cha
         }
     }
 
+    Ok(())
+}
+
+/// Pulihkan status fisik hardware ke kondisi default aman pabrik (Charging Enabled, Current Reset, Fast Charge Released).
+pub fn restore_factory_safe_state() -> Result<(), ChargerError> {
+    let _ = set_charging(true);
+    let _ = reset_fast_charge_current();
+    let _ = apply_fast_charge_bypass(false, 0);
     Ok(())
 }
 

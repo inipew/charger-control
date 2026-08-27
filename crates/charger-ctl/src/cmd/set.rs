@@ -59,7 +59,7 @@ pub fn limit(value: u8) -> Result<(), ChargerError> {
      * -> resume automatically becomes 65
      */
     if cfg.resume_limit >= value {
-        let new_resume = value.saturating_sub(5).max(40);
+        let new_resume = value.saturating_sub(2).max(40);
 
         if new_resume >= value {
             let msg = "Unable to create a valid resume limit for this charge limit.";

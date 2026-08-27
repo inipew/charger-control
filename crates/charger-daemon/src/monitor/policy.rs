@@ -266,13 +266,23 @@ pub fn evaluate_policy(
         return PolicyResult::clear();
     }
 
-    // 2. Periksa kesegaran data sensor
+    // 2. Periksa kesegaran dan keselamatan data sensor
+    if !observed.is_sensor_safe(now) {
+        // Sensor stale / unsafe: daemon kehilangan observability atau sensor mengalami error berulang.
+        // - Grace: reset ke Normal (belum ada konfirmasi 5 menit penuh dengan data segar).
+        // - Suspended: PERTAHANKAN (fail-safe, sama seperti kebijakan disconnect).
+        if matches!(runtime.charge_limit_state, ChargeLimitState::Grace { .. }) {
+            runtime.charge_limit_state = ChargeLimitState::Normal;
+        }
+        runtime.thermal_step = ThermalStep::Normal;
+        runtime.thermal_step_updated_at = None;
+        result.add(PolicyBlock::SensorStale);
+        return result;
+    }
+
     let sample = match observed.sample {
-        Some(s) if !s.is_stale(now) => s,
-        _ => {
-            // Sensor stale: daemon kehilangan observability.
-            // - Grace: reset ke Normal (belum ada konfirmasi 5 menit penuh dengan data segar).
-            // - Suspended: PERTAHANKAN (fail-safe, sama seperti kebijakan disconnect).
+        Some(s) => s,
+        None => {
             if matches!(runtime.charge_limit_state, ChargeLimitState::Grace { .. }) {
                 runtime.charge_limit_state = ChargeLimitState::Normal;
             }
@@ -455,9 +465,13 @@ pub fn evaluate_fast_charge_policy(
         return FastChargePolicy::Disabled;
     }
 
+    if !observed.is_sensor_safe(now) {
+        return FastChargePolicy::SuppressedSafety;
+    }
+
     let sample = match observed.sample {
-        Some(s) if !s.is_stale(now) => s,
-        _ => return FastChargePolicy::SuppressedSafety,
+        Some(s) => s,
+        None => return FastChargePolicy::SuppressedSafety,
     };
 
     // 1. Cek keamanan termal

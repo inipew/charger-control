@@ -38,11 +38,17 @@ impl fmt::Display for BatteryHealth {
     }
 }
 
+pub const BATTERY_HEALTH_NODES: &[&str] = &[
+    "/sys/class/power_supply/battery/health",
+    "/sys/class/power_supply/bms/health",
+];
+
 pub fn read_health() -> Result<BatteryHealth, ChargerError> {
-    let path = Path::new("/sys/class/power_supply/battery/health");
-    if let Ok(raw) = read_sysfs(path) {
-        Ok(BatteryHealth::from_sysfs(&raw))
-    } else {
-        Ok(BatteryHealth::Unknown)
+    for &path_str in BATTERY_HEALTH_NODES {
+        let path = Path::new(path_str);
+        if let Ok(raw) = read_sysfs(path) {
+            return Ok(BatteryHealth::from_sysfs(&raw));
+        }
     }
+    Ok(BatteryHealth::Unknown)
 }

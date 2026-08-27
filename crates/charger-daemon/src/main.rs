@@ -210,22 +210,13 @@ fn main() {
     }
 
     // 2. Pulihkan status fisik hardware ke default aman pabrik
-    if let Err(error) = charger_core::battery::control::set_charging(true) {
+    if let Err(error) = charger_core::battery::control::restore_factory_safe_state() {
         tracing::error!(
             error = %error,
-            "Failed to restore charging"
+            "Failed to restore factory safe hardware state"
         );
     } else {
-        tracing::info!("Charging restored successfully");
-    }
-
-    if let Err(error) = charger_core::battery::control::reset_fast_charge_current() {
-        tracing::warn!(
-            error = %error,
-            "Failed to reset fast charge current limit"
-        );
-    } else {
-        tracing::info!("Fast charge current limit reset successfully");
+        tracing::info!("Hardware state restored to factory-safe defaults successfully");
     }
 
     // 3. Bersihkan file PID dan socket IPC

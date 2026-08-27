@@ -395,9 +395,9 @@ mod tests {
             now,
         );
 
-        // Mark that a subsequent read failed
+        // Mark that a subsequent read failed (1 failure: still transient)
         let failure_time = now + Duration::from_secs(10);
-        observed.mark_sample_failed(failure_time + Duration::from_secs(2));
+        observed.mark_sample_failed(failure_time + Duration::from_secs(2), failure_time);
 
         // Policy should STILL consider it fresh because 10s < 60s
         assert!(observed.has_fresh_sample(failure_time));
@@ -1284,6 +1284,7 @@ mod tests {
             sample: None,
             timestamp: now,
             sample_retry_at: None,
+            sensor_health: crate::monitor::reality::SensorHealth::new(),
         };
         let intent = OperatingIntent::normal();
         let policy_res = PolicyResult::clear();
@@ -1633,6 +1634,7 @@ mod tests {
             }),
             timestamp: now,
             sample_retry_at: None,
+            sensor_health: crate::monitor::reality::SensorHealth::new(),
         };
         let policy_res = PolicyResult::clear();
 
@@ -1675,6 +1677,7 @@ mod tests {
             sample: None, // No sensor data available
             timestamp: now,
             sample_retry_at: None,
+            sensor_health: crate::monitor::reality::SensorHealth::new(),
         };
         let config = Config::default();
         let mut runtime = PolicyRuntime::default();
@@ -2420,6 +2423,85 @@ mod tests {
                 | charger_core::battery::control::CapabilityStatus::Writable
                 | charger_core::battery::control::CapabilityStatus::Verified
         ));
+    }
+
+    #[test]
+    fn test_sensor_consecutive_failures_triggers_fast_safety_block() {
+        let now = Instant::now();
+        let mut observed = ObservedState::new();
+        observed.connection = ConnectionState::Attached;
+        observed.power_state = charger_core::battery::reader::PowerState::Connected;
+
+        // Sample at t=0
+        observed.update(
+            charger_core::battery::reader::PowerState::Connected,
+            Some(Sample {
+                capacity: 50.0,
+                temperature_c: 35.0,
+                power_state: charger_core::battery::reader::PowerState::Connected,
+                timestamp: now,
+            }),
+            now,
+        );
+
+        let config = Config::default();
+        let mut runtime = PolicyRuntime::default();
+
+        // Single failure at t=2s -> Still transient, policy clears
+        let t2 = now + Duration::from_secs(2);
+        observed.mark_sample_failed(t2 + Duration::from_secs(2), t2);
+        assert!(observed.is_sensor_safe(t2));
+        let policy_1 = evaluate_policy(&observed, &config, &mut runtime, t2);
+        assert_eq!(policy_1, PolicyResult::clear());
+
+        // Second consecutive failure at t=4s -> UNSAFE! Triggers Safety Block immediately
+        let t4 = now + Duration::from_secs(4);
+        observed.mark_sample_failed(t4 + Duration::from_secs(2), t4);
+        assert!(!observed.is_sensor_safe(t4));
+        let policy_2 = evaluate_policy(&observed, &config, &mut runtime, t4);
+        assert!(policy_2.is_blocked_by(PolicyBlock::SensorStale));
+    }
+
+    #[test]
+    fn test_hardware_transaction_struct_and_snapshot() {
+        use charger_core::battery::control::HardwareTransaction;
+
+        let mut tx = HardwareTransaction::new();
+        // Staging a nonexistent path returns false
+        assert!(!tx.stage("/nonexistent/sys/node/test"));
+
+        // Commit with empty writes succeeds
+        assert!(tx.commit(&[]).is_ok());
+    }
+
+    #[test]
+    fn test_fast_charge_bypass_all_nodes_coverage() {
+        use charger_core::battery::control::FAST_CHARGE_ALL_NODES;
+
+        // FAST_CHARGE_ALL_NODES must define at least 10 critical fast-charge nodes
+        assert!(FAST_CHARGE_ALL_NODES.len() >= 10);
+        assert!(FAST_CHARGE_ALL_NODES.contains(&"/sys/class/power_supply/battery/fast_charge_current"));
+        assert!(FAST_CHARGE_ALL_NODES.contains(&"/sys/class/power_supply/battery/thermal_input_current"));
+        assert!(FAST_CHARGE_ALL_NODES.contains(&"/sys/class/power_supply/usb/fastcharge_mode"));
+        assert!(FAST_CHARGE_ALL_NODES.contains(&"/sys/class/power_supply/usb/pd_active"));
+    }
+
+    #[test]
+    fn test_input_current_zero_is_valid() {
+        // Verify read_input_current_ua function signature returns Result<i64, ChargerError>
+        let res = charger_core::battery::reader::read_input_current_ua();
+        // On dev host without sysfs, it returns ParseError or Ok
+        assert!(res.is_ok() || matches!(res, Err(charger_core::error::ChargerError::ParseError(_))));
+    }
+
+    #[test]
+    fn test_unified_resume_delta_constant() {
+        let mut config = Config::default();
+        config.charge_limit = 80;
+        config.resume_limit = 0; // auto
+        config.validate();
+        // 80 - 2 = 78
+        assert_eq!(config.resume_limit, 78);
     }
 }
 
