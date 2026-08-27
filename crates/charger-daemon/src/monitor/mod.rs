@@ -476,7 +476,38 @@ pub fn run_monitor_loop(
                 ctx.diag.last_current_reg_str = Some(cur_str);
             }
 
-            // 5. Rekonsiliasi Hardware (Binary Switch + Current Limit)
+            let fast_charge_pol = policy::evaluate_fast_charge_policy(
+                &ctx.observed,
+                &ctx.config,
+                &ctx.policy_runtime,
+                &ctx.policy_result,
+                now_eval,
+            );
+
+            let fc_str = match &fast_charge_pol {
+                policy::FastChargePolicy::Active { target_ua } => {
+                    format!("Active (Force PD {} mA)", target_ua / 1000)
+                }
+                policy::FastChargePolicy::SuppressedSocLimit {
+                    current_soc,
+                    max_soc,
+                } => {
+                    format!("Suppressed (SOC {:.1}% >= {}%)", current_soc, max_soc)
+                }
+                policy::FastChargePolicy::SuppressedThermal => {
+                    "Suppressed (Thermal Throttling)".to_string()
+                }
+                policy::FastChargePolicy::SuppressedChargeLimit => {
+                    "Suppressed (Charge Limit)".to_string()
+                }
+                policy::FastChargePolicy::SuppressedSafety => "Suppressed (Safety)".to_string(),
+                policy::FastChargePolicy::Disabled => "Disabled".to_string(),
+            };
+            if let Ok(mut fc) = diagnostics.fast_charge_status.write() {
+                *fc = fc_str;
+            }
+
+            // 5. Rekonsiliasi Hardware (Binary Switch + Current Limit + Fast Charge Bypass)
             let is_emergency = matches!(
                 decision,
                 ChargingDecision::Block {
@@ -499,6 +530,24 @@ pub fn run_monitor_loop(
                 {
                     if ctx.diag.should_log_error(fault, now_eval) {
                         tracing::warn!(?fault, error = %error, "Fast charge current limit reconciliation failed");
+                    }
+                }
+            }
+
+            if let hardware::CurrentReconcileResult::Failed(error) =
+                hardware::reconcile_fast_charge(
+                    desired_hw,
+                    fast_charge_pol,
+                    &mut ctx.hardware_track,
+                    current_opts,
+                    now_eval,
+                )
+            {
+                if let hardware::FastChargeStatus::Fault { error: fault, .. } =
+                    ctx.hardware_track.fast_charge.status
+                {
+                    if ctx.diag.should_log_error(fault, now_eval) {
+                        tracing::warn!(?fault, error = %error, "Fast charge bypass reconciliation failed");
                     }
                 }
             }
@@ -751,7 +800,7 @@ pub fn run_monitor_loop(
                                         let err = std::io::Error::last_os_error();
                                         match err.raw_os_error() {
                                             // Buffer exhausted: treat as recoverable overflow.
-                                            #[cfg(target_os = "android")]
+                                            #[cfg(any(target_os = "android", target_os = "linux"))]
                                             Some(libc::ENOBUFS) => {
                                                 batch.overflow = true;
                                                 break;
@@ -855,7 +904,7 @@ pub fn run_monitor_loop(
 
 #[cfg(unix)]
 fn setup_netlink_socket() -> Option<OwnedFd> {
-    #[cfg(target_os = "android")]
+    #[cfg(any(target_os = "android", target_os = "linux"))]
     {
         unsafe {
             let fd = libc::socket(
@@ -890,7 +939,7 @@ fn setup_netlink_socket() -> Option<OwnedFd> {
             Some(OwnedFd::from_raw_fd(fd))
         }
     }
-    #[cfg(not(target_os = "android"))]
+    #[cfg(not(any(target_os = "android", target_os = "linux")))]
     {
         None
     }

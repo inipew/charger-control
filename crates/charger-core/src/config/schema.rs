@@ -48,6 +48,12 @@ pub struct Config {
     /// Aktifkan regulasi termal bertingkat adaptif (Stepped Thermal Throttling)
     pub thermal_throttling_enabled: bool,
 
+    /// Paksa aktifkan fast charging / USB-PD bypass pada charger non-OEM
+    pub fast_charge: bool,
+
+    /// Batas maksimum persentase baterai untuk aktivasi fast charge bypass (default: 90%)
+    pub fast_charge_max_soc: u8,
+
     /// Path log file
     pub log_path: PathBuf,
 }
@@ -66,6 +72,8 @@ impl Default for Config {
             poll_interval_secs: 10,
             max_charge_current_ma: 0,
             thermal_throttling_enabled: true,
+            fast_charge: true,
+            fast_charge_max_soc: 90,
 
             log_path: PathBuf::from("/data/adb/charger-control/charger-control.log"),
         }
@@ -98,6 +106,9 @@ impl Config {
         if self.max_charge_current_ma > 0 {
             self.max_charge_current_ma = self.max_charge_current_ma.clamp(500, 10000);
         }
+
+        // Clamp fast_charge_max_soc antara 50% hingga 100%
+        self.fast_charge_max_soc = self.fast_charge_max_soc.clamp(50, 100);
     }
 
     pub fn load(path: &PathBuf) -> Result<Self, crate::error::ChargerError> {
@@ -224,6 +235,8 @@ mod tests {
             poll_interval_secs: 5,
             max_charge_current_ma: 1800,
             thermal_throttling_enabled: true,
+            fast_charge: true,
+            fast_charge_max_soc: 90,
             log_path: PathBuf::from("/data/adb/test.log"),
         };
 
@@ -236,6 +249,8 @@ mod tests {
         assert_eq!(parsed.max_charge_current_ma, 1800);
         assert!(parsed.thermal_throttling_enabled);
         assert!(parsed.thermal_cutoff);
+        assert!(parsed.fast_charge);
+        assert_eq!(parsed.fast_charge_max_soc, 90);
     }
 
     #[test]

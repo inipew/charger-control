@@ -84,6 +84,50 @@ pub const TYPEC_MODE_NODES: &[&str] = &[
 
 pub const BATTERY_STATUS_NODE: &str = "/sys/class/power_supply/battery/status";
 
+pub const BATTERY_CHARGE_CONTROL_LIMIT_NODES: &[&str] = &[
+    "/sys/class/power_supply/battery/charge_control_limit",
+];
+
+pub const USB_FASTCHARGE_MODE_NODES: &[&str] = &[
+    "/sys/class/power_supply/usb/fastcharge_mode",
+];
+
+pub const BMS_FASTCHARGE_MODE_NODES: &[&str] = &[
+    "/sys/class/power_supply/bms/fastcharge_mode",
+];
+
+pub const USB_PD_ACTIVE_NODES: &[&str] = &[
+    "/sys/class/power_supply/usb/pd_active",
+];
+
+pub const USB_PD_TYPE_NODES: &[&str] = &[
+    "/sys/class/power_supply/usb/pd_type",
+];
+
+pub const USB_PD_AUTH_NODES: &[&str] = &[
+    "/sys/class/power_supply/usb/pd_authentication",
+];
+
+pub const MTK_SOC_DECIMAL_RATE_NODES: &[&str] = &[
+    "/sys/class/power_supply/bms/mtk_soc_decimal_rate",
+];
+
+pub const LN8000_CHARGING_NODES: &[&str] = &[
+    "/sys/class/power_supply/ln8000/charging_enabled",
+];
+
+pub const LN8000_HV_CHARGE_NODES: &[&str] = &[
+    "/sys/class/power_supply/ln8000/hv_charge_enable",
+];
+
+pub const LN8000_INPUT_CURRENT_LIMIT_NODES: &[&str] = &[
+    "/sys/class/power_supply/ln8000/input_current_limit",
+];
+
+pub const LN8000_BQ_CHARGE_DONE_NODES: &[&str] = &[
+    "/sys/class/power_supply/ln8000/bq_charge_done",
+];
+
 /// Finds the first available sysfs path.
 pub fn detect_node(candidates: &[&'static str]) -> Option<&'static str> {
     candidates

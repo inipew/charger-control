@@ -2085,4 +2085,140 @@ mod tests {
         assert!(matches!(res, CurrentReconcileResult::Skipped));
         assert!(track.current_limit.reconcile_needed);
     }
+
+    #[test]
+    fn test_fast_charge_policy_under_90_percent_active() {
+        use crate::monitor::policy::{evaluate_fast_charge_policy, FastChargePolicy};
+
+        let now = Instant::now();
+        let mut observed = ObservedState::new();
+        observed.connection = ConnectionState::Attached;
+        observed.update(
+            charger_core::battery::reader::PowerState::Charging,
+            Some(Sample {
+                capacity: 85.0,
+                temperature_c: 32.0,
+                power_state: charger_core::battery::reader::PowerState::Charging,
+                timestamp: now,
+            }),
+            now,
+        );
+
+        let mut config = Config::default();
+        config.fast_charge = true;
+        config.fast_charge_max_soc = 90;
+
+        let runtime = PolicyRuntime::default();
+        let policy_res = PolicyResult::clear();
+
+        let fc_pol = evaluate_fast_charge_policy(&observed, &config, &runtime, &policy_res, now);
+        assert_eq!(
+            fc_pol,
+            FastChargePolicy::Active {
+                target_ua: 5_850_000
+            }
+        );
+        assert!(fc_pol.is_active());
+    }
+
+    #[test]
+    fn test_fast_charge_policy_at_or_above_90_percent_suppressed() {
+        use crate::monitor::policy::{evaluate_fast_charge_policy, FastChargePolicy};
+
+        let now = Instant::now();
+        let mut observed = ObservedState::new();
+        observed.connection = ConnectionState::Attached;
+        observed.update(
+            charger_core::battery::reader::PowerState::Charging,
+            Some(Sample {
+                capacity: 90.5,
+                temperature_c: 32.0,
+                power_state: charger_core::battery::reader::PowerState::Charging,
+                timestamp: now,
+            }),
+            now,
+        );
+
+        let mut config = Config::default();
+        config.fast_charge = true;
+        config.fast_charge_max_soc = 90;
+
+        let runtime = PolicyRuntime::default();
+        let policy_res = PolicyResult::clear();
+
+        let fc_pol = evaluate_fast_charge_policy(&observed, &config, &runtime, &policy_res, now);
+        assert_eq!(
+            fc_pol,
+            FastChargePolicy::SuppressedSocLimit {
+                current_soc: 90.5,
+                max_soc: 90
+            }
+        );
+        assert!(!fc_pol.is_active());
+    }
+
+    #[test]
+    fn test_fast_charge_policy_suppressed_on_thermal_or_charge_limit() {
+        use crate::monitor::policy::{evaluate_fast_charge_policy, FastChargePolicy};
+
+        let now = Instant::now();
+        let mut observed = ObservedState::new();
+        observed.connection = ConnectionState::Attached;
+        observed.update(
+            charger_core::battery::reader::PowerState::Charging,
+            Some(Sample {
+                capacity: 75.0,
+                temperature_c: 42.0,
+                power_state: charger_core::battery::reader::PowerState::Charging,
+                timestamp: now,
+            }),
+            now,
+        );
+
+        let mut config = Config::default();
+        config.fast_charge = true;
+        config.fast_charge_max_soc = 90;
+
+        let mut runtime = PolicyRuntime::default();
+        runtime.thermal_step = ThermalStep::Step2; // Throttling active
+        let policy_res = PolicyResult::clear();
+
+        let fc_pol = evaluate_fast_charge_policy(&observed, &config, &runtime, &policy_res, now);
+        assert_eq!(fc_pol, FastChargePolicy::SuppressedThermal);
+    }
+
+    #[test]
+    fn test_fast_charge_policy_respects_user_max_current() {
+        use crate::monitor::policy::{evaluate_fast_charge_policy, FastChargePolicy};
+
+        let now = Instant::now();
+        let mut observed = ObservedState::new();
+        observed.connection = ConnectionState::Attached;
+        observed.update(
+            charger_core::battery::reader::PowerState::Charging,
+            Some(Sample {
+                capacity: 60.0,
+                temperature_c: 30.0,
+                power_state: charger_core::battery::reader::PowerState::Charging,
+                timestamp: now,
+            }),
+            now,
+        );
+
+        let mut config = Config::default();
+        config.fast_charge = true;
+        config.fast_charge_max_soc = 90;
+        config.max_charge_current_ma = 2000; // User sets limit to 2000 mA
+
+        let runtime = PolicyRuntime::default();
+        let policy_res = PolicyResult::clear();
+
+        let fc_pol = evaluate_fast_charge_policy(&observed, &config, &runtime, &policy_res, now);
+        assert_eq!(
+            fc_pol,
+            FastChargePolicy::Active {
+                target_ua: 2_000_000
+            }
+        );
+    }
 }

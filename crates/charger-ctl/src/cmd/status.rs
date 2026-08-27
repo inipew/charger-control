@@ -102,6 +102,20 @@ pub fn run(json: bool) -> Result<(), ChargerError> {
                 display::key_val("Max Charge Current", "Unconstrained (Full Speed)");
             }
 
+            if let Some(fc_status) = data["fast_charge_status"].as_str() {
+                display::key_val("Fast Charge Bypass", fc_status);
+            } else if let Some(fc) = data["fast_charge"].as_bool() {
+                let max_soc = data["fast_charge_max_soc"].as_u64().unwrap_or(90);
+                display::key_val(
+                    "Fast Charge Bypass",
+                    if fc {
+                        format!("Enabled (Max: {max_soc}%)")
+                    } else {
+                        "Disabled".to_string()
+                    },
+                );
+            }
+
             display::key_val(
                 "Thermal Throttling",
                 if data["thermal_throttling_enabled"].as_bool().unwrap_or(true) {

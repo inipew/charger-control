@@ -41,6 +41,7 @@ pub struct DaemonDiagnostics {
     pub target_decision: RwLock<String>,
     pub current_regulation: RwLock<String>,
     pub convergence_state: RwLock<String>,
+    pub fast_charge_status: RwLock<String>,
 }
 
 impl DaemonDiagnostics {
@@ -60,6 +61,7 @@ impl DaemonDiagnostics {
             target_decision: RwLock::new("Allow".to_string()),
             current_regulation: RwLock::new("Unconstrained".to_string()),
             convergence_state: RwLock::new("Converged".to_string()),
+            fast_charge_status: RwLock::new("Disabled".to_string()),
         }
     }
 }
@@ -560,6 +562,27 @@ fn handle_status(
     let target_decision = dec_guard.clone();
     drop(dec_guard);
 
+    let cur_guard = diagnostics
+        .current_regulation
+        .read()
+        .unwrap_or_else(|p| p.into_inner());
+    let current_regulation = cur_guard.clone();
+    drop(cur_guard);
+
+    let fc_guard = diagnostics
+        .fast_charge_status
+        .read()
+        .unwrap_or_else(|p| p.into_inner());
+    let fast_charge_status = fc_guard.clone();
+    drop(fc_guard);
+
+    let conv_guard = diagnostics
+        .convergence_state
+        .read()
+        .unwrap_or_else(|p| p.into_inner());
+    let convergence_state = conv_guard.clone();
+    drop(conv_guard);
+
     let hw_guard = diagnostics
         .hardware_state
         .read()
@@ -571,7 +594,7 @@ fn handle_status(
     let battery = if level_val == 255 {
         "N/A".to_string()
     } else {
-        format!("{level_val}%")
+        format!("{}%", level_val)
     };
 
     let temp_val = diagnostics.battery_temperature_dc.load(Ordering::Relaxed);
@@ -587,20 +610,6 @@ fn handle_status(
         .unwrap_or_else(|p| p.into_inner());
     let power_state = ps_guard.clone();
     drop(ps_guard);
-
-    let cur_guard = diagnostics
-        .current_regulation
-        .read()
-        .unwrap_or_else(|p| p.into_inner());
-    let current_regulation = cur_guard.clone();
-    drop(cur_guard);
-
-    let conv_guard = diagnostics
-        .convergence_state
-        .read()
-        .unwrap_or_else(|p| p.into_inner());
-    let convergence_state = conv_guard.clone();
-    drop(conv_guard);
 
     let netlink_available = diagnostics.netlink_available.load(Ordering::Relaxed);
     let is_idle = diagnostics.is_idle.load(Ordering::Relaxed);
@@ -658,6 +667,7 @@ fn handle_status(
          • Hardware     : {}\n\
          • Convergence  : {}\n\
          • Current Reg  : {}\n\
+         • Fast Charge  : {}\n\
          \n\
          [ MONITOR DIAGNOSTICS ]\n\
          • Mode         : {}\n\
@@ -677,6 +687,7 @@ fn handle_status(
          • Charge Limit : {}%\n\
          • Resume Limit : {}%\n\
          • Max Current  : {}\n\
+         • Fast Charge  : {} (Max: {}%)\n\
          • Thermal Reg  : {}\n\
          • Thermal Cut  : {}\n\
          • Max Temp     : {:.1} C",
@@ -693,6 +704,7 @@ fn handle_status(
         hardware,
         convergence_state,
         current_regulation,
+        fast_charge_status,
         mode_str,
         netlink_str,
         interval_str,
@@ -706,6 +718,12 @@ fn handle_status(
         config_guard.charge_limit,
         config_guard.resume_limit,
         max_current_str,
+        if config_guard.fast_charge {
+            "Enabled"
+        } else {
+            "Disabled"
+        },
+        config_guard.fast_charge_max_soc,
         if config_guard.thermal_throttling_enabled {
             "Enabled (Stepped)"
         } else {
@@ -732,6 +750,7 @@ pub struct DaemonStatusResponse {
     pub fsm_state: String,
     pub target_decision: String,
     pub current_regulation: String,
+    pub fast_charge_status: String,
     pub hardware_state: String,
     pub convergence_state: String,
     pub netlink_available: bool,
@@ -745,6 +764,8 @@ pub struct DaemonStatusResponse {
     pub charge_limit: u8,
     pub resume_limit: u8,
     pub max_charge_current_ma: u32,
+    pub fast_charge: bool,
+    pub fast_charge_max_soc: u8,
     pub thermal_throttling_enabled: bool,
     pub thermal_cutoff: bool,
     pub max_temp_c: f32,
@@ -786,6 +807,13 @@ fn handle_status_json(
         .unwrap_or_else(|p| p.into_inner());
     let current_regulation = cur_guard.clone();
     drop(cur_guard);
+
+    let fc_guard = diagnostics
+        .fast_charge_status
+        .read()
+        .unwrap_or_else(|p| p.into_inner());
+    let fast_charge_status = fc_guard.clone();
+    drop(fc_guard);
 
     let conv_guard = diagnostics
         .convergence_state
@@ -851,6 +879,7 @@ fn handle_status_json(
         fsm_state,
         target_decision,
         current_regulation,
+        fast_charge_status,
         hardware_state,
         convergence_state,
         netlink_available,
@@ -864,6 +893,8 @@ fn handle_status_json(
         charge_limit: config_guard.charge_limit,
         resume_limit: config_guard.resume_limit,
         max_charge_current_ma: config_guard.max_charge_current_ma,
+        fast_charge: config_guard.fast_charge,
+        fast_charge_max_soc: config_guard.fast_charge_max_soc,
         thermal_throttling_enabled: config_guard.thermal_throttling_enabled,
         thermal_cutoff: config_guard.thermal_cutoff,
         max_temp_c: config_guard.max_temp_dc as f32 / 10.0,

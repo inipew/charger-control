@@ -202,3 +202,34 @@ pub fn enable(enabled: bool) -> Result<(), ChargerError> {
     notify_daemon();
     Ok(())
 }
+
+pub fn fast_charge(enabled: bool) -> Result<(), ChargerError> {
+    let mut cfg = load_config()?;
+    cfg.fast_charge = enabled;
+    save_config(&cfg)?;
+
+    display::success(&format!(
+        "Fast charge bypass {}",
+        if enabled { "enabled" } else { "disabled" }
+    ));
+
+    notify_daemon();
+    Ok(())
+}
+
+pub fn fast_charge_max_soc(value: u8) -> Result<(), ChargerError> {
+    if !(50..=100).contains(&value) {
+        let msg = "Fast charge max SOC must be between 50 and 100%";
+        display::error(msg);
+        return Err(ChargerError::InvalidInput(msg.to_string()));
+    }
+
+    let mut cfg = load_config()?;
+    cfg.fast_charge_max_soc = value;
+    save_config(&cfg)?;
+
+    display::success(&format!("Fast charge max SOC set to {}%", value));
+
+    notify_daemon();
+    Ok(())
+}

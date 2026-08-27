@@ -265,11 +265,100 @@ impl CurrentLimitTrack {
     }
 }
 
-/// Tracking status rekonsiliasi hardware gabungan yang mengisolasi domain charger dan domain limit arus.
+/// Status rekonsiliasi Fast Charge Bypass.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum FastChargeStatus {
+    Unknown,
+    Applied { target_ua: u32 },
+    Released,
+    Fault {
+        error: HardwareFault,
+        failed_at: Instant,
+        retry: FaultRetryPolicy,
+    },
+}
+
+/// Penjejak status Fast Charge & USB-PD Bypass actuator.
+#[derive(Debug)]
+pub struct FastChargeTrack {
+    pub status: FastChargeStatus,
+    pub applied_target_ua: Option<u32>,
+    pub reconcile_needed: bool,
+}
+
+impl FastChargeTrack {
+    pub fn new() -> Self {
+        Self {
+            status: FastChargeStatus::Unknown,
+            applied_target_ua: None,
+            reconcile_needed: true,
+        }
+    }
+
+    pub fn mark_applied(&mut self, target_ua: u32) {
+        self.applied_target_ua = Some(target_ua);
+        self.status = FastChargeStatus::Applied { target_ua };
+        self.reconcile_needed = false;
+    }
+
+    pub fn mark_released(&mut self) {
+        self.applied_target_ua = None;
+        self.status = FastChargeStatus::Released;
+        self.reconcile_needed = false;
+    }
+
+    pub fn mark_fault(&mut self, error: HardwareFault, now: Instant) {
+        let retry = error.retry_policy();
+        self.status = FastChargeStatus::Fault {
+            error,
+            failed_at: now,
+            retry,
+        };
+        self.reconcile_needed = false;
+    }
+
+    pub fn next_deadline(&self) -> Option<Instant> {
+        if let FastChargeStatus::Fault {
+            failed_at,
+            retry: FaultRetryPolicy::After(dur),
+            ..
+        } = self.status
+        {
+            Some(failed_at + dur)
+        } else {
+            None
+        }
+    }
+
+    pub fn reset_on_disconnect(&mut self) {
+        self.status = FastChargeStatus::Unknown;
+        self.applied_target_ua = None;
+        self.reconcile_needed = true;
+    }
+
+    pub fn convergence(&self) -> ConvergenceState {
+        match self.status {
+            FastChargeStatus::Fault { .. } => ConvergenceState::Fault,
+            FastChargeStatus::Applied { .. } | FastChargeStatus::Released => {
+                ConvergenceState::Converged
+            }
+            FastChargeStatus::Unknown => {
+                if self.reconcile_needed {
+                    ConvergenceState::Deferred
+                } else {
+                    ConvergenceState::Converged
+                }
+            }
+        }
+    }
+}
+
+/// Tracking status rekonsiliasi hardware gabungan yang mengisolasi domain charger, limit arus, dan fast-charge bypass.
 #[derive(Debug)]
 pub struct HardwareTrack {
     pub charger: ChargerActuatorTrack,
     pub current_limit: CurrentLimitTrack,
+    pub fast_charge: FastChargeTrack,
 }
 
 impl HardwareTrack {
@@ -277,35 +366,42 @@ impl HardwareTrack {
         Self {
             charger: ChargerActuatorTrack::new(),
             current_limit: CurrentLimitTrack::new(),
+            fast_charge: FastChargeTrack::new(),
         }
     }
 
     pub fn mark_verification_needed(&mut self) {
         self.charger.mark_verification_needed();
         self.current_limit.reconcile_needed = true;
+        self.fast_charge.reconcile_needed = true;
     }
 
     pub fn next_deadline(&self) -> Option<Instant> {
-        match (
+        let mut min_d: Option<Instant> = None;
+        for d in [
             self.charger.next_deadline(),
             self.current_limit.next_deadline(),
-        ) {
-            (Some(d1), Some(d2)) => Some(d1.min(d2)),
-            (Some(d1), None) => Some(d1),
-            (None, Some(d2)) => Some(d2),
-            (None, None) => None,
+            self.fast_charge.next_deadline(),
+        ]
+        .into_iter()
+        .flatten()
+        {
+            min_d = Some(min_d.map_or(d, |cur| cur.min(d)));
         }
+        min_d
     }
 
     pub fn reset_on_disconnect(&mut self) {
         self.charger.reset_on_disconnect();
         self.current_limit.reset_on_disconnect();
+        self.fast_charge.reset_on_disconnect();
     }
 
     pub fn overall_convergence(&self) -> ConvergenceState {
         self.charger
             .convergence()
             .combine(self.current_limit.convergence())
+            .combine(self.fast_charge.convergence())
     }
 }
 
@@ -460,6 +556,7 @@ pub struct CurrentReconcileOptions {
 
 /// Hasil rekonsiliasi limit arus hardware actuator.
 #[derive(Debug)]
+#[allow(dead_code)]
 pub enum CurrentReconcileResult {
     Skipped,
     Stable(Option<u32>),
@@ -586,6 +683,99 @@ pub fn reconcile_current(
             }
         } else {
             track.current_limit.reconcile_needed = false;
+            CurrentReconcileResult::Stable(None)
+        }
+    }
+}
+
+/// Rekonsiliasi Fast Charge & USB-PD Bypass ke sysfs secara idempotent, terisolasi, dan aman.
+pub fn reconcile_fast_charge(
+    desired_hw: DesiredHardwareState,
+    policy: super::policy::FastChargePolicy,
+    track: &mut HardwareTrack,
+    opts: CurrentReconcileOptions,
+    now: Instant,
+) -> CurrentReconcileResult {
+    // 0. GUARD: Jika Disconnected / NoChange, jangan lakukan mutasi fisik
+    if desired_hw == DesiredHardwareState::NoChange {
+        return CurrentReconcileResult::Skipped;
+    }
+
+    // 1. Deferral check
+    let fault_retry_blocked = match &track.fast_charge.status {
+        FastChargeStatus::Fault {
+            failed_at,
+            retry: FaultRetryPolicy::After(delay),
+            ..
+        } => !opts.bypass_retry_delay && now < *failed_at + *delay,
+
+        FastChargeStatus::Fault {
+            retry: FaultRetryPolicy::Never,
+            ..
+        } => true,
+
+        _ => false,
+    };
+
+    if fault_retry_blocked {
+        return CurrentReconcileResult::Deferred;
+    }
+
+    // 2. Evaluasi apakah fast charge bypass harus aktif
+    let should_activate =
+        desired_hw == DesiredHardwareState::ChargingEnabled && policy.is_active();
+    let target_ua = policy.target_ua().unwrap_or(5_850_000);
+
+    if should_activate {
+        // IDEMPOTENCY: Jika sudah Applied dengan target yang sama persis, skip penulisan sysfs!
+        if !opts.bypass_retry_delay
+            && track.fast_charge.applied_target_ua == Some(target_ua)
+            && matches!(track.fast_charge.status, FastChargeStatus::Applied { .. })
+        {
+            track.fast_charge.reconcile_needed = false;
+            return CurrentReconcileResult::Stable(Some(target_ua));
+        }
+
+        match control::apply_fast_charge_bypass(true, target_ua) {
+            Ok(()) => {
+                let prev = track.fast_charge.applied_target_ua;
+                track.fast_charge.mark_applied(target_ua);
+                if prev != Some(target_ua) {
+                    CurrentReconcileResult::Changed(Some(target_ua))
+                } else {
+                    CurrentReconcileResult::Stable(Some(target_ua))
+                }
+            }
+            Err(e) => {
+                tracing::warn!(error = %e, "Failed applying fast charge bypass");
+                track.fast_charge.mark_fault(HardwareFault::WriteFailed, now);
+                CurrentReconcileResult::Failed(e)
+            }
+        }
+    } else {
+        // Should be Released / Inactive
+        if track.fast_charge.applied_target_ua.is_some()
+            || !matches!(track.fast_charge.status, FastChargeStatus::Released)
+            || opts.bypass_retry_delay
+        {
+            match control::apply_fast_charge_bypass(false, 0) {
+                Ok(()) => {
+                    let prev = track.fast_charge.applied_target_ua;
+                    track.fast_charge.mark_released();
+                    if prev.is_some() {
+                        CurrentReconcileResult::Changed(None)
+                    } else {
+                        CurrentReconcileResult::Stable(None)
+                    }
+                }
+                Err(e) => {
+                    tracing::warn!(error = %e, "Failed releasing fast charge bypass");
+                    track.fast_charge.mark_fault(HardwareFault::WriteFailed, now);
+                    CurrentReconcileResult::Failed(e)
+                }
+            }
+        } else {
+            track.fast_charge.reconcile_needed = false;
             CurrentReconcileResult::Stable(None)
         }
     }

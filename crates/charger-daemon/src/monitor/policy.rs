@@ -397,3 +397,91 @@ fn evaluate_limit_block(
         }
     }
 }
+
+/// Status evaluasi kebijakan Fast Charge & USB-PD Bypass.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum FastChargePolicy {
+    /// Fast charge bypass diizinkan aktif
+    Active { target_ua: u32 },
+    /// Ditekan karena baterai sudah mencapai batas pengisian cepat (SOC >= fast_charge_max_soc, default 90%)
+    SuppressedSocLimit { current_soc: f32, max_soc: u8 },
+    /// Ditekan karena suhu tinggi atau thermal throttling aktif
+    SuppressedThermal,
+    /// Ditekan karena pengisian daya diblokir oleh charge limit (Suspended / Grace)
+    SuppressedChargeLimit,
+    /// Ditekan demi keselamatan karena data sensor stale atau tidak ada
+    SuppressedSafety,
+    /// Dinonaktifkan oleh konfigurasi pengguna (fast_charge = false)
+    Disabled,
+}
+
+impl FastChargePolicy {
+    pub const fn is_active(&self) -> bool {
+        matches!(self, Self::Active { .. })
+    }
+
+    pub const fn target_ua(&self) -> Option<u32> {
+        match self {
+            Self::Active { target_ua } => Some(*target_ua),
+            _ => None,
+        }
+    }
+}
+
+/// Evaluasi kebijakan Fast Charge & USB-PD Bypass.
+pub fn evaluate_fast_charge_policy(
+    observed: &ObservedState,
+    config: &Config,
+    runtime: &PolicyRuntime,
+    policy_result: &PolicyResult,
+    now: Instant,
+) -> FastChargePolicy {
+    if !config.fast_charge {
+        return FastChargePolicy::Disabled;
+    }
+
+    if !observed.connection.is_connected() {
+        return FastChargePolicy::Disabled;
+    }
+
+    let sample = match observed.sample {
+        Some(s) if !s.is_stale(now) => s,
+        _ => return FastChargePolicy::SuppressedSafety,
+    };
+
+    // 1. Cek keamanan termal
+    if policy_result.is_blocked_by(PolicyBlock::ThermalEmergency)
+        || policy_result.is_blocked_by(PolicyBlock::Thermal)
+        || runtime.thermal_emergency_latched
+        || runtime.thermal_latched
+        || runtime.thermal_step != ThermalStep::Normal
+    {
+        return FastChargePolicy::SuppressedThermal;
+    }
+
+    // 2. Cek status charge limit
+    if policy_result.is_blocked_by(PolicyBlock::ChargeLimit)
+        || matches!(
+            runtime.charge_limit_state,
+            ChargeLimitState::Suspended | ChargeLimitState::Grace { .. }
+        )
+    {
+        return FastChargePolicy::SuppressedChargeLimit;
+    }
+
+    // 3. Cek batas SOC (Restriction: hanya aktif di bawah fast_charge_max_soc %, default 90%)
+    if sample.capacity >= config.fast_charge_max_soc as f32 {
+        return FastChargePolicy::SuppressedSocLimit {
+            current_soc: sample.capacity,
+            max_soc: config.fast_charge_max_soc,
+        };
+    }
+
+    let target_ua = if config.max_charge_current_ma > 0 {
+        (config.max_charge_current_ma.max(500) * 1000).min(5_850_000)
+    } else {
+        5_850_000
+    };
+
+    FastChargePolicy::Active { target_ua }
+}

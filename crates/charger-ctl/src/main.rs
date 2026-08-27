@@ -98,6 +98,29 @@ enum DebugCommands {
 
     /// Live raw kernel netlink uevent stream dumper
     Uevent,
+
+    /// Force-probe & trigger fast-charging / USB-PD by writing directly to kernel sysfs nodes
+    ForcePd {
+        /// File path to save output log
+        #[arg(short, long)]
+        output: Option<std::path::PathBuf>,
+
+        /// Target fast charge current limit in mA (default: 3000 mA)
+        #[arg(short, long, default_value = "3000")]
+        current: u32,
+
+        /// Target thermal input current limit in mA (default: 3000 mA)
+        #[arg(short, long, default_value = "3000")]
+        thermal_input: u32,
+
+        /// Enable LN8000 charge pump direct mode if available
+        #[arg(long, default_value_t = true)]
+        charge_pump: bool,
+
+        /// Observation duration in seconds after applying writes (default: 10s)
+        #[arg(short, long, default_value = "10")]
+        duration: u64,
+    },
 }
 
 #[derive(Subcommand)]
@@ -134,6 +157,17 @@ enum SetTarget {
     Enable {
         #[arg(value_parser = ["on", "off"])]
         state: String,
+    },
+
+    /// Enable or disable fast charging & USB-PD force bypass
+    FastCharge {
+        #[arg(value_parser = ["on", "off"])]
+        state: String,
+    },
+
+    /// Set maximum battery SOC percentage for fast charge bypass (50..=100%, default 90)
+    FastChargeMaxSoc {
+        value: u8,
     },
 }
 
@@ -172,6 +206,14 @@ fn main() -> Result<(), ChargerError> {
 
             SetTarget::Enable { state } => {
                 cmd::set::enable(state == "on")?;
+            }
+
+            SetTarget::FastCharge { state } => {
+                cmd::set::fast_charge(state == "on")?;
+            }
+
+            SetTarget::FastChargeMaxSoc { value } => {
+                cmd::set::fast_charge_max_soc(*value)?;
             }
         },
 
@@ -226,6 +268,21 @@ fn main() -> Result<(), ChargerError> {
             }
             DebugCommands::Uevent => {
                 cmd::debug::run_uevent_dumper()?;
+            }
+            DebugCommands::ForcePd {
+                output,
+                current,
+                thermal_input,
+                charge_pump,
+                duration,
+            } => {
+                cmd::debug::run_force_pd(
+                    output.as_deref(),
+                    *current,
+                    *thermal_input,
+                    *charge_pump,
+                    *duration,
+                )?;
             }
         },
     }

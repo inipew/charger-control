@@ -312,6 +312,68 @@ pub fn reset_fast_charge_current() -> Result<(), ChargerError> {
     set_fast_charge_current(5_850_000)
 }
 
+/// Apply or release fast-charge & USB-PD bypass.
+///
+/// When `enable = true`:
+/// Injects fast charge flags to known sysfs nodes (fast_charge_current, thermal_input_current,
+/// usb/fastcharge_mode, bms/fastcharge_mode, usb/pd_active, usb/pd_type, usb/pd_authentication,
+/// bms/mtk_soc_decimal_rate, ln8000 charge pump).
+///
+/// When `enable = false`:
+/// Resets the bypass flags gracefully without interrupting normal charging.
+pub fn apply_fast_charge_bypass(enable: bool, current_ua: u32) -> Result<(), ChargerError> {
+    let current_str = (current_ua.max(500_000)).to_string();
+
+    if enable {
+        let nodes: &[(&str, &str)] = &[
+            (
+                "/sys/class/power_supply/battery/fast_charge_current",
+                &current_str,
+            ),
+            (
+                "/sys/class/power_supply/battery/thermal_input_current",
+                &current_str,
+            ),
+            ("/sys/class/power_supply/usb/fastcharge_mode", "1"),
+            ("/sys/class/power_supply/bms/fastcharge_mode", "1"),
+            ("/sys/class/power_supply/usb/pd_active", "1"),
+            ("/sys/class/power_supply/usb/pd_type", "3"),
+            ("/sys/class/power_supply/usb/pd_authentication", "1"),
+            ("/sys/class/power_supply/bms/mtk_soc_decimal_rate", "100"),
+            ("/sys/class/power_supply/ln8000/charging_enabled", "1"),
+            ("/sys/class/power_supply/ln8000/hv_charge_enable", "1"),
+            (
+                "/sys/class/power_supply/ln8000/input_current_limit",
+                &current_str,
+            ),
+            ("/sys/class/power_supply/ln8000/bq_charge_done", "0"),
+            ("/sys/class/power_supply/ln8000/ti_bypass_mode_enable", "0"),
+        ];
+
+        for &(path, value) in nodes {
+            let p = Path::new(path);
+            if p.exists() {
+                let _ = write_optional_node(path, value);
+            }
+        }
+    } else {
+        let reset_nodes: &[(&str, &str)] = &[
+            ("/sys/class/power_supply/usb/fastcharge_mode", "0"),
+            ("/sys/class/power_supply/usb/pd_active", "0"),
+            ("/sys/class/power_supply/usb/pd_authentication", "0"),
+        ];
+
+        for &(path, value) in reset_nodes {
+            let p = Path::new(path);
+            if p.exists() {
+                let _ = write_optional_node(path, value);
+            }
+        }
+    }
+
+    Ok(())
+}
+
 /// Enable normal charging.
 ///
 /// Ordering:

@@ -808,3 +808,299 @@ pub fn run_uevent_dumper() -> Result<(), ChargerError> {
     println!("Netlink uevent dumper is only supported on Linux/Android.");
     Ok(())
 }
+
+/// Force-probe & trigger fast-charging / USB-PD by writing directly to kernel sysfs nodes.
+///
+/// Tries writing directly to known fast charge and USB-PD nodes discovered on MediaTek / Qualcomm
+/// platforms (including Xiaomi Redmi Note 10s: fastcharge_mode, pd_active, pd_type, pd_authentication,
+/// ln8000 charge pump, fast_charge_current, thermal_input_current).
+#[cfg(unix)]
+pub fn run_force_pd(
+    output_file: Option<&Path>,
+    current_ma: u32,
+    thermal_input_ma: u32,
+    charge_pump: bool,
+    duration_secs: u64,
+) -> Result<(), ChargerError> {
+    let mut logger = ObserverLogger::new(output_file)?;
+
+    logger.log_raw("===============================================================");
+    logger.log_raw("       ⚡ CHARGER-CONTROL: FORCE-PD / FAST-CHARGE INJECTOR     ");
+    logger.log_raw("  [EXPERIMENTAL PROBE] Directly writing to kernel sysfs nodes ");
+    logger.log_raw("===============================================================");
+
+    // 1. Grant permissions
+    let _ = control::grant_node_permissions();
+
+    // 2. Baseline measurement before force-writes
+    logger.log("📊 [1/4] Mengambil Baseline Telemetri Saat Ini...");
+    let base_power_state = reader::get_power_state().unwrap_or(reader::PowerState::Unknown);
+    let base_soc = reader::read_capacity_raw().unwrap_or(0.0);
+    let base_temp = reader::read_temperature_c().unwrap_or(0.0);
+    let base_volt = reader::read_voltage_uv().map(|uv| uv as f32 / 1_000_000.0).unwrap_or(0.0);
+    let base_metrics = reader::get_battery_metrics();
+    let base_in_curr = reader::read_input_current_ua().map(|ua| (ua / 1000) as i32).unwrap_or(0);
+    let base_fast_chg_node = control::read_fast_charge_current();
+
+    let (base_batt_curr, base_wattage) = match &base_metrics {
+        Ok(m) => {
+            let sign = if m.is_charging_flow { "+" } else { "-" };
+            (format!("{}{:.1} mA", sign, m.current_ma), format!("{:.2} W", m.wattage_w))
+        }
+        Err(_) => ("N/A".to_string(), "N/A".to_string()),
+    };
+
+    logger.log_raw(&format!("   • Power State     : {:?}", base_power_state));
+    logger.log_raw(&format!("   • Battery SOC     : {:.2}%", base_soc));
+    logger.log_raw(&format!("   • Battery Temp    : {:.1}°C", base_temp));
+    logger.log_raw(&format!("   • Battery Volt    : {:.2} V", base_volt));
+    logger.log_raw(&format!("   • Input Current   : {} mA", base_in_curr));
+    logger.log_raw(&format!("   • Battery Current : {}", base_batt_curr));
+    logger.log_raw(&format!("   • Battery Power   : {}", base_wattage));
+    logger.log_raw(&format!("   • Current Fast Chg: {:?}", base_fast_chg_node));
+
+    // 3. Define target nodes to write
+    let target_fast_curr_ua = (current_ma.max(500) * 1000).to_string();
+    let target_thermal_curr_ua = (thermal_input_ma.max(500) * 1000).to_string();
+
+    let mut nodes_to_write: Vec<(&str, &str, &str)> = vec![
+        (
+            "/sys/class/power_supply/battery/charging_enabled",
+            "1",
+            "Battery Charging Enabled Switch",
+        ),
+        (
+            "/sys/class/power_supply/battery/input_suspend",
+            "0",
+            "Battery Input Suspend Disable",
+        ),
+        (
+            "/sys/class/power_supply/battery/fast_charge_current",
+            &target_fast_curr_ua,
+            "Fast Charge Current Limit",
+        ),
+        (
+            "/sys/class/power_supply/battery/thermal_input_current",
+            &target_thermal_curr_ua,
+            "Thermal Input Current Limit",
+        ),
+        (
+            "/sys/class/power_supply/usb/fastcharge_mode",
+            "1",
+            "USB Fast Charge Mode",
+        ),
+        (
+            "/sys/class/power_supply/bms/fastcharge_mode",
+            "1",
+            "BMS Fast Charge Mode",
+        ),
+        (
+            "/sys/class/power_supply/usb/pd_active",
+            "1",
+            "USB-PD Protocol Active Switch",
+        ),
+        (
+            "/sys/class/power_supply/usb/pd_type",
+            "3",
+            "USB-PD Protocol Type (PPS / High Tier)",
+        ),
+        (
+            "/sys/class/power_supply/usb/pd_authentication",
+            "1",
+            "USB-PD Vendor Authentication Override",
+        ),
+        (
+            "/sys/class/power_supply/bms/mtk_soc_decimal_rate",
+            "100",
+            "MediaTek BMS Fast Charge Rate",
+        ),
+    ];
+
+    if charge_pump {
+        nodes_to_write.push((
+            "/sys/class/power_supply/ln8000/charging_enabled",
+            "1",
+            "LN8000 Charge Pump Charging Enabled",
+        ));
+        nodes_to_write.push((
+            "/sys/class/power_supply/ln8000/hv_charge_enable",
+            "1",
+            "LN8000 High-Voltage Direct Charge Enable",
+        ));
+        nodes_to_write.push((
+            "/sys/class/power_supply/ln8000/input_current_limit",
+            &target_thermal_curr_ua,
+            "LN8000 Input Current Limit",
+        ));
+        nodes_to_write.push((
+            "/sys/class/power_supply/ln8000/bq_charge_done",
+            "0",
+            "LN8000 Clear Charge Done Flag",
+        ));
+        nodes_to_write.push((
+            "/sys/class/power_supply/ln8000/ti_bypass_mode_enable",
+            "0",
+            "LN8000 Direct Charge Pump Mode",
+        ));
+    }
+
+    logger.log("\n💉 [2/4] Melakukan Injeksi Penulisan ke Node Sysfs Target...");
+    let mut applied_count = 0;
+    let mut failed_count = 0;
+    let mut missing_count = 0;
+
+    for &(path_str, target_val, desc) in &nodes_to_write {
+        let p = Path::new(path_str);
+        if !p.exists() {
+            logger.log_raw(&format!("   [-] [MISSING]  {path_str:<55} ({desc})"));
+            missing_count += 1;
+            continue;
+        }
+
+        let old_val = fs::read_to_string(p).map(|s| s.trim().to_string()).unwrap_or_else(|_| "?".into());
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            if let Ok(meta) = fs::metadata(p) {
+                let mut perms = meta.permissions();
+                perms.set_mode(0o666);
+                let _ = fs::set_permissions(p, perms);
+            }
+        }
+
+        match fs::write(p, target_val) {
+            Ok(()) => {
+                let readback = fs::read_to_string(p).map(|s| s.trim().to_string()).unwrap_or_else(|_| "?".into());
+                if readback == target_val {
+                    logger.log_raw(&format!(
+                        "   [+] [APPLIED]  {path_str:<55} : '{old_val}' -> '{target_val}'"
+                    ));
+                    applied_count += 1;
+                } else {
+                    logger.log_raw(&format!(
+                        "   [!] [OVERRIDE] {path_str:<55} : Wrote '{target_val}', but driver readback '{readback}'"
+                    ));
+                    applied_count += 1;
+                }
+            }
+            Err(e) => {
+                logger.log_raw(&format!(
+                    "   [x] [FAILED]   {path_str:<55} : Error '{e}' ({desc})"
+                ));
+                failed_count += 1;
+            }
+        }
+    }
+
+    logger.log(&format!(
+        "[*] Hasil Injeksi: {} Applied/Verified, {} Failed, {} Missing",
+        applied_count, failed_count, missing_count
+    ));
+
+    // 4. Real-time live monitoring
+    logger.log(&format!(
+        "\n📡 [3/4] Memantau Respon Real-Time Hardware Selama {} Detik...",
+        duration_secs
+    ));
+    logger.log("[*] Memeriksa apakah voltase VBUS naik atau arus charging meningkat...\n");
+
+    let mut peak_batt_ma: f32 = 0.0;
+    let mut peak_wattage_w: f32 = 0.0;
+    let mut final_vbus_v: f32 = 0.0;
+
+    let loop_deadline = Instant::now() + Duration::from_secs(duration_secs);
+    let mut step = 1;
+
+    while Instant::now() < loop_deadline {
+        std::thread::sleep(Duration::from_secs(1));
+
+        let power_state = reader::get_power_state().unwrap_or(reader::PowerState::Unknown);
+        let soc = reader::read_capacity_raw().unwrap_or(0.0);
+        let temp = reader::read_temperature_c().unwrap_or(0.0);
+        let volt = reader::read_voltage_uv().map(|uv| uv as f32 / 1_000_000.0).unwrap_or(0.0);
+        let metrics = reader::get_battery_metrics();
+        let in_curr = reader::read_input_current_ua().map(|ua| (ua / 1000) as i32).unwrap_or(0);
+        let batt_status = reader::read_sysfs(Path::new(charger_core::battery::nodes::BATTERY_STATUS_NODE))
+            .unwrap_or_else(|_| "Unknown".into());
+
+        // Read VBUS voltage from USB or LN8000
+        let vbus_mv = fs::read_to_string("/sys/class/power_supply/usb/voltage_now")
+            .ok()
+            .and_then(|s| s.trim().parse::<f32>().ok())
+            .map(|mv| mv / 1000.0)
+            .unwrap_or(0.0);
+        final_vbus_v = vbus_mv;
+
+        let (batt_str, watt_str) = match &metrics {
+            Ok(m) => {
+                if m.is_charging_flow {
+                    peak_batt_ma = peak_batt_ma.max(m.current_ma);
+                    peak_wattage_w = peak_wattage_w.max(m.wattage_w);
+                    (
+                        format!("+{:>5.1} mA", m.current_ma),
+                        format!("{:>4.2} W", m.wattage_w),
+                    )
+                } else {
+                    (
+                        format!("-{:>5.1} mA", m.current_ma),
+                        format!("{:>4.2} W", m.wattage_w),
+                    )
+                }
+            }
+            Err(_) => ("   ?   mA".into(), " ?  W".into()),
+        };
+
+        logger.log(&format!(
+            "[{step:>2}/{duration_secs}s] VBUS: {vbus_mv:>4.2}V | InCurr: {in_curr:>4}mA | Batt: {batt_str} ({watt_str}) | Volt: {volt:>4.2}V | Temp: {temp:>4.1}°C | SOC: {soc:>5.2}% | Power: {power_state:?} | Status: {batt_status}"
+        ));
+
+        step += 1;
+    }
+
+    // 5. Final Scientific Verdict
+    logger.log_raw("\n===============================================================");
+    logger.log_raw("       📊 FORCE-PD EXPERIMENTAL SUMMARY & VERDICT              ");
+    logger.log_raw("===============================================================");
+
+    let baseline_ma = base_metrics.as_ref().map(|m| m.current_ma).unwrap_or(0.0);
+    let delta_ma = peak_batt_ma - baseline_ma;
+    let delta_pct = if baseline_ma > 0.0 {
+        (delta_ma / baseline_ma) * 100.0
+    } else {
+        0.0
+    };
+
+    logger.log_raw(&format!("• Baseline Battery Current : {}", base_batt_curr));
+    logger.log_raw(&format!("• Baseline Battery Power   : {}", base_wattage));
+    logger.log_raw(&format!("• Peak Post-Force Current  : +{:.1} mA (Delta: {:+0.1} mA / {:+0.1}%)", peak_batt_ma, delta_ma, delta_pct));
+    logger.log_raw(&format!("• Peak Post-Force Power    : {:.2} W", peak_wattage_w));
+    logger.log_raw(&format!("• Final VBUS Voltage       : {:.2} V", final_vbus_v));
+
+    logger.log_raw("\n🔬 ANALISA RESPON HARDWARE:");
+    if delta_ma > 300.0 || final_vbus_v > 6.0 {
+        logger.log_raw("   ✅ SUKSES: Kernel & PMIC merespons injeksi node!");
+        logger.log_raw("      Pengisian daya berhasil dipaksa meningkat ke arus/daya lebih tinggi.");
+    } else {
+        logger.log_raw("   ℹ️  HARDWARE-LOCKED / PHY-DEPENDENT:");
+        logger.log_raw("      Penulisan ke sysfs berhasil, tetapi IC PHY Type-C (Richtek rt-pd-manager)");
+        logger.log_raw("      tetap membutuhkan negosiasi fisik paket CC/VDM dengan kepala charger untuk");
+        logger.log_raw("      menaikkan tegangan VBUS dari 5V ke 9V/PPS secara dinamis.");
+    }
+
+    logger.log_raw("===============================================================\n");
+
+    Ok(())
+}
+
+#[cfg(not(unix))]
+pub fn run_force_pd(
+    _output_file: Option<&Path>,
+    _current_ma: u32,
+    _thermal_input_ma: u32,
+    _charge_pump: bool,
+    _duration_secs: u64,
+) -> Result<(), ChargerError> {
+    println!("force-pd is only supported on Linux/Android.");
+    Ok(())
+}
