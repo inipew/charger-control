@@ -121,13 +121,11 @@ pub enum DesiredHardwareState {
 }
 
 impl DesiredHardwareState {
-    pub fn hardware_mode(self, has_distinct_bypass: bool) -> control::ActualHardwareMode {
+    pub fn hardware_mode(self, _has_distinct_bypass: bool) -> control::ActualHardwareMode {
         match self {
             Self::NoChange => control::ActualHardwareMode::Unknown,
             Self::ChargingEnabled => control::ActualHardwareMode::ChargingEnabled,
-            Self::ChargingDisabled => control::ActualHardwareMode::ChargingDisabled,
-            Self::Bypass if has_distinct_bypass => control::ActualHardwareMode::Bypass,
-            Self::Bypass => control::ActualHardwareMode::ChargingDisabled,
+            Self::ChargingDisabled | Self::Bypass => control::ActualHardwareMode::ChargingDisabled,
         }
     }
 }

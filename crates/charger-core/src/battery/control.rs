@@ -20,7 +20,6 @@ use crate::{
 ///
 /// - `ChargingEnabled` = `charging_enabled=1` + `input_suspend=0`
 /// - `ChargingDisabled` = `charging_enabled=0` + `input_suspend=1`
-/// - `Bypass` = not physically distinguishable from `ChargingDisabled`
 /// - `Inconsistent` = both nodes are readable but contain an unexpected combination
 /// - `Unknown` = one or both nodes cannot be read
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -28,7 +27,6 @@ pub enum ActualHardwareMode {
     Unknown,
     ChargingEnabled,
     ChargingDisabled,
-    Bypass,
     Inconsistent,
 }
 
@@ -259,37 +257,53 @@ pub fn reset_node_caches() {
 }
 
 /// Set fast charge current limit in microamperes (µA).
+/// Set fast charge current limit in microamperes (µA).
 ///
 /// Ensures a hardware safety floor of at least 500,000 µA (500 mA).
 pub fn set_fast_charge_current(current_ua: u32) -> Result<(), ChargerError> {
     let safe_ua = current_ua.max(500_000);
     let val_str = safe_ua.to_string();
-    let mut any_succeeded = false;
+    let mut succeeded = 0usize;
+    let mut failed = 0usize;
 
     if let Some(node) = fast_charge_node() {
-        if write_optional_node(node, &val_str).unwrap_or(false) {
-            tracing::info!(
-                path = node,
-                current_ua = safe_ua,
-                "fast charge current limit written"
-            );
-            any_succeeded = true;
+        match write_sysfs(Path::new(node), &val_str) {
+            Ok(()) => {
+                tracing::info!(
+                    path = node,
+                    current_ua = safe_ua,
+                    "fast charge current limit written"
+                );
+                succeeded += 1;
+            }
+            Err(e) => {
+                tracing::warn!(path = node, error = %e, "failed writing fast charge current");
+                failed += 1;
+            }
         }
     }
 
     if let Some(node) = thermal_input_node() {
-        if write_optional_node(node, &val_str).unwrap_or(false) {
-            tracing::info!(
-                path = node,
-                current_ua = safe_ua,
-                "thermal input current limit written"
-            );
-            any_succeeded = true;
+        match write_sysfs(Path::new(node), &val_str) {
+            Ok(()) => {
+                tracing::info!(
+                    path = node,
+                    current_ua = safe_ua,
+                    "thermal input current limit written"
+                );
+                succeeded += 1;
+            }
+            Err(e) => {
+                tracing::warn!(path = node, error = %e, "failed writing thermal input current");
+                failed += 1;
+            }
         }
     }
 
-    if any_succeeded {
+    if succeeded > 0 && failed == 0 {
         Ok(())
+    } else if succeeded > 0 && failed > 0 {
+        Err(ChargerError::PartialWriteFailure { succeeded, failed })
     } else {
         Err(ChargerError::NoChargingNodeFound)
     }
@@ -350,17 +364,59 @@ pub fn apply_fast_charge_bypass(enable: bool, current_ua: u32) -> Result<(), Cha
             ("/sys/class/power_supply/ln8000/ti_bypass_mode_enable", "0"),
         ];
 
-        for &(path, value) in nodes {
-            let p = Path::new(path);
-            if p.exists() {
-                let _ = write_optional_node(path, value);
+        let mut existing_nodes = Vec::new();
+        for &(path, val) in nodes {
+            if Path::new(path).exists() {
+                existing_nodes.push((path, val));
             }
+        }
+
+        if existing_nodes.is_empty() {
+            return Err(ChargerError::NoChargingNodeFound);
+        }
+
+        let mut succeeded = 0usize;
+        let mut failed = 0usize;
+        let mut written_paths = Vec::new();
+
+        for (path, val) in existing_nodes {
+            match write_sysfs(Path::new(path), val) {
+                Ok(()) => {
+                    succeeded += 1;
+                    written_paths.push(path);
+                }
+                Err(e) => {
+                    tracing::warn!(path, error = %e, "Failed to write fast charge bypass node");
+                    failed += 1;
+                }
+            }
+        }
+
+        if failed > 0 {
+            // Rollback on partial failure to prevent split-brain hardware state
+            tracing::warn!(
+                succeeded,
+                failed,
+                "Rolling back partial fast charge bypass writes"
+            );
+            for path in written_paths {
+                let reset_val = if path.contains("current") {
+                    "500000"
+                } else {
+                    "0"
+                };
+                let _ = write_sysfs(Path::new(path), reset_val);
+            }
+            return Err(ChargerError::PartialWriteFailure { succeeded, failed });
         }
     } else {
         let reset_nodes: &[(&str, &str)] = &[
             ("/sys/class/power_supply/usb/fastcharge_mode", "0"),
+            ("/sys/class/power_supply/bms/fastcharge_mode", "0"),
             ("/sys/class/power_supply/usb/pd_active", "0"),
             ("/sys/class/power_supply/usb/pd_authentication", "0"),
+            ("/sys/class/power_supply/ln8000/charging_enabled", "0"),
+            ("/sys/class/power_supply/ln8000/hv_charge_enable", "0"),
         ];
 
         for &(path, value) in reset_nodes {
@@ -429,32 +485,42 @@ pub fn set_charging(enable: bool) -> Result<(), ChargerError> {
 
 /// Emergency disable charging for thermal or safety failsafe.
 ///
-/// Unlike `disable_charging_nodes()`, which requires all candidate control nodes
-/// to be successfully updated and verified, `emergency_disable_charging()` attempts
-/// to write to input_suspend and charging_enabled independently.
-///
-/// It returns `Ok(())` if AT LEAST ONE disable operation succeeded, ensuring that
-/// a partial write failure does not cause safety failsafe logic to treat an effective
-/// hardware suspend as a complete failure.
-pub fn emergency_disable_charging() -> Result<(), ChargerError> {
-    let mut any_succeeded = false;
+/// Attempts to write to input_suspend and charging_enabled independently.
+/// Returns `Ok(true)` if all available nodes were disabled (full suspend),
+/// `Ok(false)` if only partial disable succeeded (partial suspend),
+/// or `Err` if no node was successfully written.
+pub fn emergency_disable_charging() -> Result<bool, ChargerError> {
+    let mut succeeded = 0usize;
+    let mut failed = 0usize;
 
     if let Some(suspend) = suspend_node() {
-        if write_optional_node(suspend, "1").unwrap_or(false) {
-            tracing::info!(path = suspend, "emergency input suspend written");
-            any_succeeded = true;
+        match write_optional_node(suspend, "1") {
+            Ok(true) => {
+                tracing::info!(path = suspend, "emergency input suspend written");
+                succeeded += 1;
+            }
+            _ => {
+                failed += 1;
+            }
         }
     }
 
     if let Some(charging) = charging_node() {
-        if write_optional_node(charging, "0").unwrap_or(false) {
-            tracing::info!(path = charging, "emergency charging disable written");
-            any_succeeded = true;
+        match write_optional_node(charging, "0") {
+            Ok(true) => {
+                tracing::info!(path = charging, "emergency charging disable written");
+                succeeded += 1;
+            }
+            _ => {
+                failed += 1;
+            }
         }
     }
 
-    if any_succeeded {
-        Ok(())
+    if succeeded > 0 && failed == 0 {
+        Ok(true)
+    } else if succeeded > 0 {
+        Ok(false)
     } else {
         Err(ChargerError::NoChargingNodeFound)
     }

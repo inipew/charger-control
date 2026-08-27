@@ -15,18 +15,17 @@ pub struct Config {
     /// Batas maksimum pengisian (50–100%)
     pub charge_limit: u8,
 
-    /// Batas resume pengisian.
+    /// Batas resume pengisian (dalam persentase SOC).
     ///
-    /// 0 = tidak menggunakan resume limit.
+    /// Nilai `0` = mode otomatis / auto hysteresis (`charge_limit - 2`).
     ///
     /// Contoh:
     /// charge_limit = 100
-    /// resume_limit = 95
+    /// resume_limit = 0  -> auto resume di 98%
     ///
-    /// Charging:
+    /// Jika dikonfigurasi eksplisit (misal 95):
     /// 100% -> OFF
     /// 99%  -> tetap OFF
-    /// 98%  -> tetap OFF
     /// ...
     /// 95%  -> ON kembali
     pub resume_limit: u8,

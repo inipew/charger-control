@@ -45,6 +45,21 @@ pub enum ConnectionState {
 }
 
 impl ConnectionState {
+    #[allow(dead_code)]
+    pub fn is_present(&self) -> bool {
+        !matches!(self, Self::Disconnected)
+    }
+
+    #[allow(dead_code)]
+    pub fn is_stable(&self) -> bool {
+        matches!(self, Self::Attached)
+    }
+
+    #[allow(dead_code)]
+    pub fn is_operational(&self) -> bool {
+        matches!(self, Self::Attached)
+    }
+
     pub fn is_connected(&self) -> bool {
         !matches!(self, Self::Disconnected)
     }

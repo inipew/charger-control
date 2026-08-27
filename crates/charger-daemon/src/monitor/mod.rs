@@ -36,7 +36,7 @@ use charger_core::{battery::control, config::schema::Config};
 
 #[cfg(unix)]
 use decision::BlockCause;
-use decision::ChargingDecision;
+use decision::{ChargingDecision, DesiredHardwareState};
 #[cfg(unix)]
 use events::{handle_event, MonitorEvent, UeventKind};
 use hardware::{HardwareFault, HardwareTrack};
@@ -507,7 +507,7 @@ pub fn run_monitor_loop(
                 *fc = fc_str;
             }
 
-            // 5. Rekonsiliasi Hardware (Binary Switch + Current Limit + Fast Charge Bypass)
+            // 5. Rekonsiliasi Hardware dengan Safety-First Ordering
             let is_emergency = matches!(
                 decision,
                 ChargingDecision::Block {
@@ -517,99 +517,191 @@ pub fn run_monitor_loop(
             let current_opts = hardware::CurrentReconcileOptions {
                 bypass_retry_delay: is_emergency,
             };
-
-            if let hardware::CurrentReconcileResult::Failed(error) = hardware::reconcile_current(
-                desired_hw,
-                current_reg,
-                &mut ctx.hardware_track,
-                current_opts,
-                now_eval,
-            ) {
-                if let hardware::CurrentLimitStatus::Fault { error: fault, .. } =
-                    ctx.hardware_track.current_limit.status
-                {
-                    if ctx.diag.should_log_error(fault, now_eval) {
-                        tracing::warn!(?fault, error = %error, "Fast charge current limit reconciliation failed");
-                    }
-                }
-            }
-
-            if let hardware::CurrentReconcileResult::Failed(error) =
-                hardware::reconcile_fast_charge(
-                    desired_hw,
-                    fast_charge_pol,
-                    &mut ctx.hardware_track,
-                    current_opts,
-                    now_eval,
-                )
-            {
-                if let hardware::FastChargeStatus::Fault { error: fault, .. } =
-                    ctx.hardware_track.fast_charge.status
-                {
-                    if ctx.diag.should_log_error(fault, now_eval) {
-                        tracing::warn!(?fault, error = %error, "Fast charge bypass reconciliation failed");
-                    }
-                }
-            }
-
             let opts = hardware::ReconcileOptions {
                 bypass_retry_delay: is_emergency,
                 force_verification: is_emergency || ctx.sched.force_hardware_verification,
             };
 
-            match hardware::reconcile(
-                desired_hw,
-                &mut ctx.hardware_track,
-                ctx.has_distinct_bypass,
-                opts,
-                now_eval,
-            ) {
-                hardware::ReconcileResult::Stable(actual)
-                | hardware::ReconcileResult::Changed(actual) => {
-                    ctx.sched.clear_hardware_verification_request();
-
-                    if ctx.diag.last_decision.as_ref() != Some(&decision)
-                        || ctx.diag.last_hw_mode != Some(actual)
-                    {
-                        tracing::info!(?decision, ?desired_hw, ?actual, "State transition updated");
-                        ctx.diag.last_decision = Some(decision.clone());
-                        ctx.diag.last_hw_mode = Some(actual);
-
-                        if let Ok(mut hw) = diagnostics.hardware_state.write() {
-                            *hw = format!("{actual:?}");
-                        }
-                    } else if ctx
-                        .diag
-                        .last_heartbeat_log
-                        .is_none_or(|t| now_eval.duration_since(t) >= Duration::from_secs(300))
-                    {
-                        tracing::debug!(?decision, ?actual, "Heartbeat status check OK");
-                        ctx.diag.last_heartbeat_log = Some(now_eval);
-                    }
-                }
-                // Skipped = desired was NoChange, hardware not actually verified.
-                hardware::ReconcileResult::Skipped(actual) => {
-                    if ctx.diag.last_decision.as_ref() != Some(&decision)
-                        || ctx.diag.last_hw_mode != Some(actual)
-                    {
-                        tracing::info!(?decision, ?desired_hw, ?actual, "State transition updated");
-                        ctx.diag.last_decision = Some(decision.clone());
-                        ctx.diag.last_hw_mode = Some(actual);
-
-                        if let Ok(mut hw) = diagnostics.hardware_state.write() {
-                            *hw = format!("{actual:?}");
+            // Safety Ordering:
+            // - Jika Menuju OFF / Suspended: Matikan binary charge path dahulu, kemudian rilis fast-charge, lalu limit arus.
+            // - Jika Menuju ON: Setel limit arus aman & rilis/set fast-charge dahulu, baru aktifkan binary charging.
+            if desired_hw != DesiredHardwareState::ChargingEnabled {
+                // 1. Binary switch disable FIRST
+                match hardware::reconcile(
+                    desired_hw,
+                    &mut ctx.hardware_track,
+                    ctx.has_distinct_bypass,
+                    opts,
+                    now_eval,
+                ) {
+                    hardware::ReconcileResult::Stable(actual)
+                    | hardware::ReconcileResult::Changed(actual) => {
+                        ctx.sched.clear_hardware_verification_request();
+                        if ctx.diag.last_decision.as_ref() != Some(&decision)
+                            || ctx.diag.last_hw_mode != Some(actual)
+                        {
+                            tracing::info!(?decision, ?desired_hw, ?actual, "State transition updated");
+                            ctx.diag.last_decision = Some(decision.clone());
+                            ctx.diag.last_hw_mode = Some(actual);
+                            if let Ok(mut hw) = diagnostics.hardware_state.write() {
+                                *hw = format!("{actual:?}");
+                            }
+                        } else if ctx
+                            .diag
+                            .last_heartbeat_log
+                            .is_none_or(|t| now_eval.duration_since(t) >= Duration::from_secs(300))
+                        {
+                            tracing::debug!(?decision, ?actual, "Heartbeat status check OK");
+                            ctx.diag.last_heartbeat_log = Some(now_eval);
                         }
                     }
+                    hardware::ReconcileResult::Skipped(actual) => {
+                        if ctx.diag.last_decision.as_ref() != Some(&decision)
+                            || ctx.diag.last_hw_mode != Some(actual)
+                        {
+                            tracing::info!(?decision, ?desired_hw, ?actual, "State transition updated");
+                            ctx.diag.last_decision = Some(decision.clone());
+                            ctx.diag.last_hw_mode = Some(actual);
+                            if let Ok(mut hw) = diagnostics.hardware_state.write() {
+                                *hw = format!("{actual:?}");
+                            }
+                        }
+                    }
+                    hardware::ReconcileResult::Deferred => {}
+                    hardware::ReconcileResult::Failed(error) => {
+                        ctx.sched.clear_hardware_verification_request();
+                        if let hardware::HardwareStatus::Fault { error: fault, .. } =
+                            ctx.hardware_track.charger.status
+                        {
+                            if ctx.diag.should_log_error(fault, now_eval) {
+                                tracing::warn!(?fault, error = %error, "Hardware reconciliation failed");
+                            }
+                        }
+                    }
                 }
-                hardware::ReconcileResult::Deferred => {}
-                hardware::ReconcileResult::Failed(error) => {
-                    ctx.sched.clear_hardware_verification_request();
 
-                    if let hardware::HardwareStatus::Fault { error: fault, .. } =
-                        ctx.hardware_track.charger.status
+                // 2. Fast charge release
+                if let hardware::CurrentReconcileResult::Failed(error) =
+                    hardware::reconcile_fast_charge(
+                        desired_hw,
+                        fast_charge_pol,
+                        &mut ctx.hardware_track,
+                        current_opts,
+                        now_eval,
+                    )
+                {
+                    if let hardware::FastChargeStatus::Fault { error: fault, .. } =
+                        ctx.hardware_track.fast_charge.status
                     {
                         if ctx.diag.should_log_error(fault, now_eval) {
-                            tracing::warn!(?fault, error = %error, "Hardware reconciliation failed");
+                            tracing::warn!(?fault, error = %error, "Fast charge bypass reconciliation failed");
+                        }
+                    }
+                }
+
+                // 3. Current limit reset
+                if let hardware::CurrentReconcileResult::Failed(error) = hardware::reconcile_current(
+                    desired_hw,
+                    current_reg,
+                    &mut ctx.hardware_track,
+                    current_opts,
+                    now_eval,
+                ) {
+                    if let hardware::CurrentLimitStatus::Fault { error: fault, .. } =
+                        ctx.hardware_track.current_limit.status
+                    {
+                        if ctx.diag.should_log_error(fault, now_eval) {
+                            tracing::warn!(?fault, error = %error, "Fast charge current limit reconciliation failed");
+                        }
+                    }
+                }
+            } else {
+                // 1. Current limit safe
+                if let hardware::CurrentReconcileResult::Failed(error) = hardware::reconcile_current(
+                    desired_hw,
+                    current_reg,
+                    &mut ctx.hardware_track,
+                    current_opts,
+                    now_eval,
+                ) {
+                    if let hardware::CurrentLimitStatus::Fault { error: fault, .. } =
+                        ctx.hardware_track.current_limit.status
+                    {
+                        if ctx.diag.should_log_error(fault, now_eval) {
+                            tracing::warn!(?fault, error = %error, "Fast charge current limit reconciliation failed");
+                        }
+                    }
+                }
+
+                // 2. Fast charge mode
+                if let hardware::CurrentReconcileResult::Failed(error) =
+                    hardware::reconcile_fast_charge(
+                        desired_hw,
+                        fast_charge_pol,
+                        &mut ctx.hardware_track,
+                        current_opts,
+                        now_eval,
+                    )
+                {
+                    if let hardware::FastChargeStatus::Fault { error: fault, .. } =
+                        ctx.hardware_track.fast_charge.status
+                    {
+                        if ctx.diag.should_log_error(fault, now_eval) {
+                            tracing::warn!(?fault, error = %error, "Fast charge bypass reconciliation failed");
+                        }
+                    }
+                }
+
+                // 3. Binary switch enable LAST
+                match hardware::reconcile(
+                    desired_hw,
+                    &mut ctx.hardware_track,
+                    ctx.has_distinct_bypass,
+                    opts,
+                    now_eval,
+                ) {
+                    hardware::ReconcileResult::Stable(actual)
+                    | hardware::ReconcileResult::Changed(actual) => {
+                        ctx.sched.clear_hardware_verification_request();
+                        if ctx.diag.last_decision.as_ref() != Some(&decision)
+                            || ctx.diag.last_hw_mode != Some(actual)
+                        {
+                            tracing::info!(?decision, ?desired_hw, ?actual, "State transition updated");
+                            ctx.diag.last_decision = Some(decision.clone());
+                            ctx.diag.last_hw_mode = Some(actual);
+                            if let Ok(mut hw) = diagnostics.hardware_state.write() {
+                                *hw = format!("{actual:?}");
+                            }
+                        } else if ctx
+                            .diag
+                            .last_heartbeat_log
+                            .is_none_or(|t| now_eval.duration_since(t) >= Duration::from_secs(300))
+                        {
+                            tracing::debug!(?decision, ?actual, "Heartbeat status check OK");
+                            ctx.diag.last_heartbeat_log = Some(now_eval);
+                        }
+                    }
+                    hardware::ReconcileResult::Skipped(actual) => {
+                        if ctx.diag.last_decision.as_ref() != Some(&decision)
+                            || ctx.diag.last_hw_mode != Some(actual)
+                        {
+                            tracing::info!(?decision, ?desired_hw, ?actual, "State transition updated");
+                            ctx.diag.last_decision = Some(decision.clone());
+                            ctx.diag.last_hw_mode = Some(actual);
+                            if let Ok(mut hw) = diagnostics.hardware_state.write() {
+                                *hw = format!("{actual:?}");
+                            }
+                        }
+                    }
+                    hardware::ReconcileResult::Deferred => {}
+                    hardware::ReconcileResult::Failed(error) => {
+                        ctx.sched.clear_hardware_verification_request();
+                        if let hardware::HardwareStatus::Fault { error: fault, .. } =
+                            ctx.hardware_track.charger.status
+                        {
+                            if ctx.diag.should_log_error(fault, now_eval) {
+                                tracing::warn!(?fault, error = %error, "Hardware reconciliation failed");
+                            }
                         }
                     }
                 }

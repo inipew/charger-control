@@ -40,6 +40,11 @@ impl HardwareFault {
     pub fn is_retryable(&self) -> bool {
         !matches!(self.retry_policy(), FaultRetryPolicy::Never)
     }
+
+    #[allow(dead_code)]
+    pub fn is_safety_fault(&self) -> bool {
+        matches!(self, Self::PermissionDenied | Self::ReadbackMismatch)
+    }
 }
 
 /// Status konvergensi antara desired state dan physical hardware truth.
@@ -98,7 +103,7 @@ impl HardwareObservation {
     }
 }
 
-/// Penjejak status domain binary charger actuator (ChargingEnabled / ChargingDisabled / Bypass).
+/// Penjejak status domain binary charger actuator (ChargingEnabled / ChargingDisabled).
 #[derive(Debug)]
 pub struct ChargerActuatorTrack {
     pub observation: HardwareObservation,
@@ -183,7 +188,10 @@ pub enum CurrentLimitStatus {
         target_ua: Option<u32>,
         started_at: Instant,
     },
-    Stable {
+    Verified {
+        applied_ua: Option<u32>,
+    },
+    Commanded {
         applied_ua: Option<u32>,
     },
     Fault {
@@ -193,10 +201,17 @@ pub enum CurrentLimitStatus {
     },
 }
 
+impl CurrentLimitStatus {
+    #[allow(dead_code)]
+    pub fn applied_ua(&self) -> Option<Option<u32>> {
+        match self {
+            Self::Verified { applied_ua } | Self::Commanded { applied_ua } => Some(*applied_ua),
+            _ => None,
+        }
+    }
+}
+
 /// Penjejak status domain pembatas arus (Fast Charge Current Regulation).
-///
-/// **Catatan**: `applied_limit_ua` mencatat *last successful write intent / actuation*,
-/// bukan physical sensor readback observasional (kecuali driver kernel mendukung sysfs readback).
 #[derive(Debug)]
 pub struct CurrentLimitTrack {
     pub applied_limit_ua: Option<u32>,
@@ -213,12 +228,18 @@ impl CurrentLimitTrack {
         }
     }
 
-    pub fn mark_applied(&mut self, target_ua: Option<u32>) {
+    pub fn mark_applied(&mut self, target_ua: Option<u32>, verified: bool) {
         self.applied_limit_ua = target_ua;
         self.reconcile_needed = false;
-        self.status = CurrentLimitStatus::Stable {
-            applied_ua: target_ua,
-        };
+        if verified {
+            self.status = CurrentLimitStatus::Verified {
+                applied_ua: target_ua,
+            };
+        } else {
+            self.status = CurrentLimitStatus::Commanded {
+                applied_ua: target_ua,
+            };
+        }
     }
 
     pub fn mark_fault(&mut self, error: HardwareFault, now: Instant) {
@@ -253,7 +274,9 @@ impl CurrentLimitTrack {
         match self.status {
             CurrentLimitStatus::Fault { .. } => ConvergenceState::Fault,
             CurrentLimitStatus::Reconciling { .. } => ConvergenceState::Reconciling,
-            CurrentLimitStatus::Stable { .. } => ConvergenceState::Converged,
+            CurrentLimitStatus::Verified { .. } | CurrentLimitStatus::Commanded { .. } => {
+                ConvergenceState::Converged
+            }
             CurrentLimitStatus::Unknown => {
                 if self.reconcile_needed {
                     ConvergenceState::Deferred
@@ -494,7 +517,6 @@ pub fn reconcile(
         }
         control::ActualHardwareMode::ChargingEnabled => control::set_charging(true),
         control::ActualHardwareMode::ChargingDisabled => control::set_charging(false),
-        control::ActualHardwareMode::Bypass => control::enter_bypass_mode(),
     };
 
     match write_res {
@@ -565,7 +587,7 @@ pub enum CurrentReconcileResult {
     Failed(ChargerError),
 }
 
-/// Rekonsiliasi batas arus pengisian daya ke sysfs secara idempotent, terisolasi, dan patuh retry backoff.
+/// Rekonsiliasi batas arus pengisian daya ke sysfs secara closed-loop, idempotent, terisolasi, dan patuh retry backoff.
 pub fn reconcile_current(
     desired_hw: DesiredHardwareState,
     target: super::decision::CurrentRegulation,
@@ -601,13 +623,13 @@ pub fn reconcile_current(
         return CurrentReconcileResult::Deferred;
     }
 
-    // 2. IDEMPOTENCY FIX:
-    // Jika status sudah Stable dan applied_limit_ua sudah sama persis dengan desired_ua,
-    // bersihkan flag reconcile_needed dan JANGAN tulis ulang ke sysfs!
+    // 2. IDEMPOTENCY & VERIFICATION CHECK:
+    // Jika status sudah Verified/Commanded dan applied_limit_ua sudah sama persis dengan desired_ua,
+    // bersihkan flag reconcile_needed dan JANGAN tulis ulang ke sysfs kecuali bypass requested.
     if !opts.bypass_retry_delay
         && matches!(
             track.current_limit.status,
-            CurrentLimitStatus::Stable { .. }
+            CurrentLimitStatus::Verified { .. } | CurrentLimitStatus::Commanded { .. }
         )
         && track.current_limit.applied_limit_ua == desired_ua
     {
@@ -625,7 +647,27 @@ pub fn reconcile_current(
     if let Some(ua) = desired_ua {
         match control::set_fast_charge_current(ua) {
             Ok(()) => {
-                track.current_limit.mark_applied(Some(ua));
+                // Closed-loop verification: read back if node exists
+                let readback = control::read_fast_charge_current();
+                let is_verified = match readback {
+                    Some(actual_ua) if actual_ua == ua => true,
+                    Some(actual_ua) => {
+                        tracing::warn!(
+                            target_ua = ua,
+                            actual_ua,
+                            "Current limit readback mismatch"
+                        );
+                        track
+                            .current_limit
+                            .mark_fault(HardwareFault::ReadbackMismatch, now);
+                        return CurrentReconcileResult::Failed(ChargerError::HardwareError(
+                            "Current limit readback mismatch",
+                        ));
+                    }
+                    None => false, // Readback node not available on this kernel; status is Commanded
+                };
+
+                track.current_limit.mark_applied(Some(ua), is_verified);
                 if prev_applied != Some(ua) {
                     CurrentReconcileResult::Changed(Some(ua))
                 } else {
@@ -649,17 +691,20 @@ pub fn reconcile_current(
         }
     } else {
         // Desired is Unconstrained (None / Max Hardware)
-        // HANYA tulis reset jika sebelumnya pernah dibatasi (is_some) atau status belum Stable(None)
+        // HANYA tulis reset jika sebelumnya pernah dibatasi (is_some) atau status belum Verified/Commanded(None)
         if track.current_limit.applied_limit_ua.is_some()
             || !matches!(
                 track.current_limit.status,
-                CurrentLimitStatus::Stable { applied_ua: None }
+                CurrentLimitStatus::Verified { applied_ua: None }
+                    | CurrentLimitStatus::Commanded { applied_ua: None }
             )
             || opts.bypass_retry_delay
         {
             match control::reset_fast_charge_current() {
                 Ok(()) => {
-                    track.current_limit.mark_applied(None);
+                    let readback = control::read_fast_charge_current();
+                    let is_verified = readback.is_some_and(|actual| actual >= 5_000_000);
+                    track.current_limit.mark_applied(None, is_verified);
                     if prev_applied.is_some() {
                         CurrentReconcileResult::Changed(None)
                     } else {
@@ -778,5 +823,31 @@ pub fn reconcile_fast_charge(
             track.fast_charge.reconcile_needed = false;
             CurrentReconcileResult::Stable(None)
         }
+    }
+}
+
+/// Global Safe Hardware State yang menjadi invariant keselamatan universal.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[allow(dead_code)]
+pub struct SafeHardwareState {
+    pub charge_path: control::ActualHardwareMode,
+    pub current_limit_ua: Option<u32>,
+    pub fast_charge: bool,
+}
+
+impl SafeHardwareState {
+    #[allow(dead_code)]
+    pub fn new() -> Self {
+        Self {
+            charge_path: control::ActualHardwareMode::ChargingDisabled,
+            current_limit_ua: Some(500_000),
+            fast_charge: false,
+        }
+    }
+}
+
+impl Default for SafeHardwareState {
+    fn default() -> Self {
+        Self::new()
     }
 }

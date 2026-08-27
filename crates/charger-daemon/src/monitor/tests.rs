@@ -1,4 +1,5 @@
 #[cfg(test)]
+#[allow(clippy::field_reassign_with_default, clippy::module_inception)]
 mod tests {
     use std::time::{Duration, Instant};
 
@@ -577,7 +578,7 @@ mod tests {
             }),
             now,
         );
-        let p1 = evaluate_policy(&observed, &config, &mut runtime, now);
+        let _p1 = evaluate_policy(&observed, &config, &mut runtime, now);
         assert!(matches!(
             runtime.charge_limit_state,
             ChargeLimitState::Grace { .. }
@@ -902,7 +903,7 @@ mod tests {
             }),
             now,
         );
-        let p0 = evaluate_policy(&observed, &config, &mut runtime, now);
+        let _p0 = evaluate_policy(&observed, &config, &mut runtime, now);
 
         let t5 = now + CHARGE_LIMIT_SUSPEND_DELAY;
         observed.update(
@@ -1159,7 +1160,7 @@ mod tests {
             }),
             now,
         );
-        let p = evaluate_policy(&observed, &config, &mut runtime, now);
+        let _p = evaluate_policy(&observed, &config, &mut runtime, now);
 
         let t5 = now + CHARGE_LIMIT_SUSPEND_DELAY;
         observed.update(
@@ -2016,7 +2017,7 @@ mod tests {
         let mut track = HardwareTrack::new();
 
         // 1. Initially mark_applied as 1.5A
-        track.current_limit.mark_applied(Some(1_500_000));
+        track.current_limit.mark_applied(Some(1_500_000), true);
         assert_eq!(track.current_limit.applied_limit_ua, Some(1_500_000));
 
         // 2. An event turns on reconcile_needed = true
@@ -2044,7 +2045,7 @@ mod tests {
         assert!(!track.current_limit.reconcile_needed);
 
         // 4. Test Unconstrained (desired = None)
-        track.current_limit.mark_applied(None);
+        track.current_limit.mark_applied(None, true);
         track.current_limit.reconcile_needed = true;
 
         let target_unconstrained = CurrentRegulation::Unconstrained;
@@ -2221,4 +2222,87 @@ mod tests {
             }
         );
     }
+
+    #[test]
+    fn test_safe_hardware_state_invariants() {
+        use crate::monitor::hardware::SafeHardwareState;
+
+        let safe = SafeHardwareState::new();
+        assert_eq!(
+            safe.charge_path,
+            charger_core::battery::control::ActualHardwareMode::ChargingDisabled
+        );
+        assert_eq!(safe.current_limit_ua, Some(500_000));
+        assert!(!safe.fast_charge);
+    }
+
+    #[test]
+    fn test_connection_state_predicates() {
+        let now = Instant::now();
+
+        let disconnected = ConnectionState::Disconnected;
+        assert!(!disconnected.is_present());
+        assert!(!disconnected.is_stable());
+        assert!(!disconnected.is_operational());
+
+        let attaching = ConnectionState::Attaching { since: now };
+        assert!(attaching.is_present());
+        assert!(!attaching.is_stable());
+        assert!(!attaching.is_operational());
+
+        let attached = ConnectionState::Attached;
+        assert!(attached.is_present());
+        assert!(attached.is_stable());
+        assert!(attached.is_operational());
+    }
+
+    #[test]
+    fn test_current_limit_verified_vs_commanded() {
+        use crate::monitor::hardware::{ConvergenceState, CurrentLimitStatus};
+
+        let mut track = HardwareTrack::new();
+        assert_eq!(track.current_limit.status, CurrentLimitStatus::Unknown);
+
+        // Mark Commanded
+        track.current_limit.mark_applied(Some(1_500_000), false);
+        assert!(matches!(
+            track.current_limit.status,
+            CurrentLimitStatus::Commanded {
+                applied_ua: Some(1_500_000)
+            }
+        ));
+        assert_eq!(track.current_limit.convergence(), ConvergenceState::Converged);
+
+        // Mark Verified
+        track.current_limit.mark_applied(Some(2_000_000), true);
+        assert!(matches!(
+            track.current_limit.status,
+            CurrentLimitStatus::Verified {
+                applied_ua: Some(2_000_000)
+            }
+        ));
+        assert_eq!(track.current_limit.convergence(), ConvergenceState::Converged);
+    }
+
+    #[test]
+    fn test_actual_hardware_mode_truth_variants() {
+        use charger_core::battery::control::ActualHardwareMode;
+
+        let enabled = ActualHardwareMode::ChargingEnabled;
+        assert!(enabled.is_known());
+        assert!(enabled.is_charging_enabled());
+        assert!(!enabled.is_charging_disabled());
+
+        let disabled = ActualHardwareMode::ChargingDisabled;
+        assert!(disabled.is_known());
+        assert!(!disabled.is_charging_enabled());
+        assert!(disabled.is_charging_disabled());
+
+        let inconsistent = ActualHardwareMode::Inconsistent;
+        assert!(!inconsistent.is_known());
+
+        let unknown = ActualHardwareMode::Unknown;
+        assert!(!unknown.is_known());
+    }
 }
+
