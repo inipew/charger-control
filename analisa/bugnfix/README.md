@@ -2,52 +2,86 @@
 
 Folder ini adalah **engineering specification** untuk hardening ChargerControl menuju production-grade Android charging daemon.
 
-Dokumen tidak hanya berisi TODO. Setiap requirement penting harus dapat ditelusuri:
+## 1. Dokumen ini harus actionable
+
+Dokumen 01–28 bukan sekadar style/template atau daftar TODO. Setiap dokumen harus menjelaskan behaviour secara teknis sampai dapat langsung dipakai sebagai dasar implementasi dan review code.
+
+Minimum depth setiap domain:
+
+```text
+CURRENT BEHAVIOUR
+    ↓
+CONCRETE BUG/RISK
+    ↓
+WHY IT IS WRONG
+    ↓
+EXECUTION FLOW / FAILURE FLOW
+    ↓
+TARGET SEMANTICS
+    ↓
+INVARIANTS
+    ↓
+IMPLEMENTATION CONTRACT
+    ↓
+RACE / CRASH / EDGE CASES
+    ↓
+TEST + FAULT INJECTION
+    ↓
+ACCEPTANCE CRITERIA
+    ↓
+DEFINITION OF DONE
+```
+
+Dokumen `analisa_10.md` di root adalah salah satu baseline reasoning: pembahasan harus mampu menunjuk state/flow yang salah, menjelaskan konsekuensinya, dan menunjukkan bentuk behaviour/code yang benar. Folder ini memperluas kedalaman tersebut ke seluruh domain.
+
+## 2. Traceability
+
+Setiap requirement penting harus dapat ditelusuri:
 
 ```text
 RISK/BUG
-  -> REQUIREMENT
-  -> INVARIANT
-  -> DESIGN
-  -> IMPLEMENTATION
-  -> TEST
-  -> RELEASE CRITERIA
+  → REQUIREMENT
+  → INVARIANT
+  → DESIGN
+  → IMPLEMENTATION
+  → TEST
+  → RELEASE CRITERIA
 ```
 
-## Urutan dokumen
+## 3. Urutan dokumen
 
 | File | Dokumen | Fokus |
 |---|---|---|
 | `01.md` | Master Remediation Specification | keseluruhan remediation dan target architecture |
-| `02.md` | Architecture Invariants | aturan/invariant yang tidak boleh dilanggar |
-| `03.md` | Policy & State Machine | state, transition, priority, hysteresis |
-| `04.md` | Hardware Control & Verification | controller, capability, partial write, verification |
-| `05.md` | Battery Sensor & Reader | sensor semantics, cached FD, presence, validation |
-| `06.md` | Ownership & Crash Recovery | journal, persistence, recovery |
-| `07.md` | Runtime & IPC | event loop, IPC, signal, shutdown, Netlink boundary |
-| `08.md` | Configuration & CLI | validation, atomic write, migration, reload |
-| `09.md` | Scheduler & Netlink | EMA, deadlines, backoff, power efficiency |
-| `10.md` | Testing & Release Gate | fault injection, invariant tests, release criteria |
-| `11.md` | Android/Vendor Deployment | Magisk, SELinux, vendor kernel, external actors |
-| `12.md` | Implementation Roadmap | urutan eksekusi dan Definition of Done |
-| `13.md` | Power Supply & Kernel Semantics | property semantics, units, uevent, sensor truth |
-| `14.md` | Hardware Capability & Vendor Profile | capability discovery, profile, vendor quirks |
-| `15.md` | Desired vs Applied vs Actual State | reconciliation dan external mutation |
-| `16.md` | Multi-Actor & Ownership Arbitration | Android/vendor/user/external writer arbitration |
-| `17.md` | Suspend, Resume & Doze | sleep, resume reconciliation, wakeup limitations |
-| `18.md` | Android & Magisk Lifecycle Contract | install, boot, restart, disable, update, rollback |
-| `19.md` | Security Threat Model | IPC, filesystem, TOCTOU, authorization |
-| `20.md` | Persistence & Filesystem Integrity | atomic state, journal, corruption, crash recovery |
-| `21.md` | Error Taxonomy & Recovery Policy | typed errors, retry, Unknown/Offline/Fault |
-| `22.md` | Temporal Correctness | monotonic time, stale events, generation, ordering |
-| `23.md` | Configuration Semantics | schema, validation, normalization, transactional reload |
-| `24.md` | CLI & IPC API Contract | protocol, idempotency, exit codes, authorization |
-| `25.md` | Operations & Troubleshooting Runbook | diagnostics, status, logs, recovery |
-| `26.md` | Android Compatibility Matrix | device/kernel/profile evidence dan support level |
-| `27.md` | Performance & Power Budget | CPU, wakeups, sysfs I/O, event storm |
-| `28.md` | Release Engineering | artifact, CI, upgrade, rollback, release gate |
+| `02.md` | Architecture Invariants | invariant + enforcement + traceability |
+| `03.md` | Policy & State Machine | state, precedence, transition, hysteresis, fault |
+| `04.md` | Hardware Control & Verification | transaction, ownership, partial write, readback |
+| `05.md` | Battery Sensor & Reader | raw sensor, unit/sign, cache, freshness |
+| `06.md` | Ownership & Crash Recovery | journal, atomicity, crash points, recovery |
+| `07.md` | Runtime & IPC | event loop, authorization, shutdown, concurrency |
+| `08.md` | Configuration & CLI | parse, validation, normalization, reload, API |
+| `09.md` | Scheduler & Netlink | debounce, reconnect, EMA, deadlines, wakeups |
+| `10.md` | Testing & Release Gate | matrix, fuzz, fault injection, real device |
+| `11.md` | Android/Vendor Deployment | Magisk, SELinux, vendor actors, boot |
+| `12.md` | Implementation Roadmap | phased implementation dan DoD |
+| `13.md` | Power Supply & Kernel Semantics | property availability, units, presence, status |
+| `14.md` | Hardware Capability & Vendor Profile | capability probing, profile, quirks |
+| `15.md` | Desired vs Applied vs Actual State | state model dan reconciliation |
+| `16.md` | Multi-Actor & Ownership Arbitration | external writers dan bounded convergence |
+| `17.md` | Suspend, Resume & Doze | missed deadlines, freshness, wakeup limitations |
+| `18.md` | Android & Magisk Lifecycle Contract | install, boot, crash, update, rollback |
+| `19.md` | Security Threat Model | IPC, filesystem, path safety, DoS |
+| `20.md` | Persistence & Filesystem Integrity | atomic state, journal, corruption |
+| `21.md` | Error Taxonomy & Recovery Policy | typed errors dan retry semantics |
+| `22.md` | Temporal Correctness | monotonic time, ordering, stale result |
+| `23.md` | Configuration Semantics | schema, default, migration, reload |
+| `24.md` | CLI & IPC API Contract | protocol, idempotency, timeout, exit codes |
+| `25.md` | Operations & Troubleshooting Runbook | diagnostics dan recovery procedure |
+| `26.md` | Android Compatibility Matrix | device/kernel/profile evidence |
+| `27.md` | Performance & Power Budget | CPU, memory, wakeup, I/O, log budget |
+| `28.md` | Release Engineering | CI, artifact, upgrade, rollback, release gate |
 
-## Architecture layers
+## 4. Architecture layers
 
 ```text
 Android / Kernel / Vendor
@@ -56,78 +90,52 @@ Android / Kernel / Vendor
 Power Supply + Hardware Profile
           |
           v
-Sensor Snapshot ---- Netlink Events
-          |                 |
-          +--------+--------+
-                   v
+Sensor Snapshot ← Netlink Events
+          |
+          v
              Decision Engine
                    |
-             Desired State
+                   v
+              Desired Intent
                    |
                    v
           Hardware Controller
-                   |
-          Ownership / Journal
-                   |
-                   v
-          Actual + Verification
-                   |
-                   +----> Reconciliation
+             |          |
+        Ownership    Verification
+             |          |
+             +----+-----+
+                  v
+             Actual State
+                  |
+                  v
+             Reconciliation
 ```
 
-## Core invariants
-
-Beberapa invariant lintas dokumen yang wajib dipertahankan:
+## 5. Core invariants
 
 - **Policy** memutuskan *what*, scheduler memutuskan *when*, controller memutuskan *how*.
 - Semua hardware mutation melewati satu controller/ownership boundary.
-- Desired state bukan actual state; successful write bukan verification.
+- `Desired != Applied != Actual != Verified`.
 - `Unknown != Offline != Fault`.
-- Netlink mempercepat reaction, tetapi polling/reconciliation menjaga correctness.
+- `Unmanaged` berarti no charging write.
+- `Fault` tetap dapat menghasilkan protective disable; jangan menyamakannya dengan Unmanaged.
+- Netlink mempercepat reaction, polling/reconciliation menjaga correctness.
 - Config invalid tidak boleh diam-diam menjadi default.
-- Persistence harus crash-safe dan memiliki recovery semantics.
-- IPC privileged harus least-privilege dan bounded.
-- Kernel/hardware safety selalu lebih tinggi daripada user-level charging policy.
+- Persistence harus crash-safe dan recovery-aware.
+- IPC privileged harus least-privilege dan resource-bounded.
+- External writer adalah kemungkinan normal; reconciliation harus bounded.
+- Kernel/hardware safety selalu lebih tinggi daripada userspace policy.
 - Tidak ada infinite retry/write-fight loop.
 
-## Dependency
+## 6. Source of truth
 
-```text
-01 Master
-  ↓
-02 Invariants
-  ↓
-03 Policy
-  ↓
-04 Hardware
-  ↓
-05 Sensors
-  ↓
-06 Ownership
-  ↓
-07 Runtime/IPC
-  ↓
-08 Config
-  ↓
-09 Scheduler/Netlink
-  ↓
-10 Testing
-  ↓
-11 Android validation
-  ↓
-12 Implementation
-  ↓
-13–28 Deep hardening / production contracts
-```
-
-## Source of truth
-
-- `01.md` = scope dan remediation master.
-- `02.md` = registry invariant arsitektur.
-- `03–09.md` = desain komponen inti.
-- `10.md` = proving tests dan release gate.
-- `11.md` = real-device/Android deployment constraints.
-- `12.md` = urutan implementasi.
-- `13–28.md` = hardening contracts yang memperjelas area yang sering menjadi sumber bug production.
+- `01.md` = master scope dan global remediation.
+- `02.md` = invariant registry.
+- `03–09.md` = core runtime/control design.
+- `10.md` = proving test dan release gate.
+- `11.md` = Android/vendor deployment contract.
+- `12.md` = implementation sequence.
+- `13–28.md` = deep hardening contracts.
+- `analisa_10.md` = baseline contoh audit state-machine yang konkret; bukan pengganti 01–28.
 
 Jika implementasi bertentangan dengan invariant, implementasi harus diperbaiki atau invariant diubah dengan alasan teknis yang terdokumentasi dan test yang membuktikan perubahan tersebut.
